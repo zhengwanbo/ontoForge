@@ -4,14 +4,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
 from app.core.database import get_db
 from app.core.auth import get_current_user
-from app.schemas.schemas import ApiResponse, DDLGenerateRequest, DDLExecuteRequest, DDLLogResponse
+from app.schemas.schemas import ApiResponse, DDLGenerateRequest, DDLExecuteRequest, DDLLogResponse, DDLStatementLogResponse
 from app.models.models import (
     SysDDLLog,
+    SysDDLStatementLog,
     SysDataSource,
     SysOntologyBlueprint,
     SysOntologyEntity,
     SysOntologyProperty,
     SysOntologyRelation,
+    SysRelationMapping,
     SysDomain,
     generate_id,
 )
@@ -51,6 +53,39 @@ def _sync_entity_deployment_status(
     for entity in entities:
         if _entity_object_name(entity) in actual_names:
             entity.status = "DEPLOYED"
+
+
+def _sync_relation_deployment_status(
+    db: Session,
+    domain_id: str,
+    target_source: SysDataSource,
+) -> None:
+    """Reflect whether each verified relation edge exists in the target schema."""
+    relations = db.query(SysOntologyRelation).options(
+        selectinload(SysOntologyRelation.relation_mapping),
+    ).filter(SysOntologyRelation.domain_id == domain_id).all()
+    edge_names = [
+        (relation.relation_table_name or "").strip().upper()
+        for relation in relations
+        if (relation.relation_table_name or "").strip().upper().startswith("ONTO_EDGE_")
+    ]
+    deployed = SourceDataService(db).get_remote_object_metadata(
+        source_id=target_source.source_id,
+        object_names=edge_names,
+        schema=target_source.schema_name,
+    )
+    actual_names = {(item.get("object_name") or "").upper() for item in (deployed.get("objects") or [])}
+    for relation in relations:
+        mapping = relation.relation_mapping
+        if not mapping:
+            continue
+        edge_name = (relation.relation_table_name or "").strip().upper()
+        if edge_name and edge_name in actual_names:
+            mapping.mapping_status = "DEPLOYED"
+        elif (mapping.join_condition or "").strip():
+            # A valid mapping exists but this target has no corresponding edge
+            # table, so the DDL page can make the redeployment requirement clear.
+            mapping.mapping_status = "STALE"
 
 
 def _serialize_blueprint_payload(blueprint: Optional[SysOntologyBlueprint]) -> Optional[dict]:
@@ -122,6 +157,18 @@ def _serialize_entity(entity) -> dict:
 
 def _serialize_relation(relation) -> dict:
     relation_mapping = getattr(relation, "relation_mapping", None)
+    mapping_status = getattr(relation_mapping, "mapping_status", None)
+    # Legacy records were marked PENDING because they lacked the now-retired
+    # edge_sql field, even when a complete physical Join had been saved.
+    # Present these correctly as needing deployment rather than configuration.
+    if (
+        relation_mapping
+        and mapping_status == "PENDING"
+        and (relation_mapping.source_table or "").strip()
+        and (relation_mapping.target_table or "").strip()
+        and (relation_mapping.join_condition or "").strip()
+    ):
+        mapping_status = "STALE"
     return {
         "relation_id": relation.relation_id,
         "domain_id": relation.domain_id,
@@ -138,7 +185,7 @@ def _serialize_relation(relation) -> dict:
             "target_table": relation_mapping.target_table,
             "join_condition": relation_mapping.join_condition,
             "edge_sql": relation_mapping.edge_sql,
-            "mapping_status": relation_mapping.mapping_status,
+            "mapping_status": mapping_status,
         } if relation_mapping else None,
     }
 
@@ -287,10 +334,23 @@ async def execute_ddl(
             execution_duration=duration
         )
         db.add(log)
+        db.flush()
+        for sequence_no, detail in enumerate(result.get("details") or [], start=1):
+            db.add(SysDDLStatementLog(
+                log_id=log.log_id,
+                sequence_no=sequence_no,
+                statement=detail.get("statement") or "",
+                status=detail.get("status") or "failed",
+                object_type=detail.get("object_type"),
+                object_name=detail.get("object_name"),
+                message=detail.get("message"),
+                error_message=detail.get("error"),
+            ))
 
         # Reconcile every entity against the target schema.  This also repairs
         # historical DRAFT/MAPPED rows when their ONTO_NODE_* table exists.
         _sync_entity_deployment_status(db, domain_id, target_source)
+        _sync_relation_deployment_status(db, domain_id, target_source)
 
         db.commit()
 
@@ -338,3 +398,28 @@ async def get_ddl_logs(
     ).model_dump() for l in logs]
 
     return ApiResponse(data=data)
+
+
+@router.get("/logs/{log_id}/details", response_model=ApiResponse)
+async def get_ddl_log_details(
+    log_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the persisted per-statement results for one DDL execution."""
+    log = db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="DDL 历史记录不存在")
+
+    details = db.query(SysDDLStatementLog).filter(
+        SysDDLStatementLog.log_id == log_id,
+    ).order_by(SysDDLStatementLog.sequence_no.asc()).all()
+    return ApiResponse(data=[DDLStatementLogResponse(
+        sequence_no=item.sequence_no,
+        statement=item.statement,
+        status=item.status,
+        object_type=item.object_type,
+        object_name=item.object_name,
+        message=item.message,
+        error_message=item.error_message,
+    ).model_dump() for item in details])

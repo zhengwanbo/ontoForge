@@ -131,6 +131,11 @@ class SysRelationMapping(Base):
     target_table = Column(String(100))
     join_condition = Column(String(500))
     edge_sql = Column(Text)
+    mapping_mode = Column(String(30), default="DIRECT")  # DIRECT / RELATION_TABLE
+    relation_table = Column(String(100))
+    relation_source_column = Column(String(100))
+    relation_target_column = Column(String(100))
+    edge_property_columns_json = Column(Text)
     mapping_status = Column(String(20), default="PENDING")
     mapped_by = Column(String(50))
     mapped_at = Column(DateTime)
@@ -275,6 +280,21 @@ class SysDDLLog(Base):
     executed_by = Column(String(50))
     executed_at = Column(DateTime, default=datetime.utcnow)
     execution_duration = Column(Float)  # seconds
+
+
+class SysDDLStatementLog(Base):
+    """One persisted result for each statement in a DDL execution."""
+    __tablename__ = "sys_ddl_statement_log"
+
+    statement_log_id = Column(String(50), primary_key=True, default=lambda: generate_id("ddls"))
+    log_id = Column(String(50), ForeignKey("sys_ddl_log.log_id"), nullable=False, index=True)
+    sequence_no = Column(Integer, nullable=False)
+    statement = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False)  # success / failed / skipped
+    object_type = Column(String(100))
+    object_name = Column(String(200))
+    message = Column(Text)
+    error_message = Column(Text)
 
 
 class SysOperationLog(Base):

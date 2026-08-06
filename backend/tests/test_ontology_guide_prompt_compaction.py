@@ -128,6 +128,43 @@ class OntologyGuidePromptCompactionTest(unittest.TestCase):
         self.assertEqual(name, "产生")
         self.assertLessEqual(len(name), 12)
 
+    def test_preserves_selected_warehouse_and_store_master_candidates(self) -> None:
+        schema = {
+            "tables": [
+                {
+                    "table_name": "WAREHOUSE",
+                    "primary_keys": ["WAREHOUSE_ID"],
+                    "columns": [
+                        {"column_name": "WAREHOUSE_ID", "data_type": "VARCHAR2(32)", "nullable": "N"},
+                        {"column_name": "WAREHOUSE_NAME", "data_type": "VARCHAR2(120)", "nullable": "N"},
+                    ],
+                },
+                {
+                    "table_name": "RETAIL_STORE",
+                    "primary_keys": ["STORE_ID"],
+                    "columns": [
+                        {"column_name": "STORE_ID", "data_type": "VARCHAR2(32)", "nullable": "N"},
+                        {"column_name": "STORE_NAME", "data_type": "VARCHAR2(120)", "nullable": "N"},
+                    ],
+                },
+                {
+                    "table_name": "STORE_LOG",
+                    "primary_keys": [],
+                    "columns": [{"column_name": "EVENT_TIME", "data_type": "DATE", "nullable": "N"}],
+                },
+            ]
+        }
+
+        candidates = self.guide_service._build_mandatory_master_entity_candidates(schema, [])
+        filtered = self.guide_service._filter_entity_candidates_by_design_document(
+            candidates,
+            {"included_entities": [{"entityName": "Unrelated"}]},
+        )
+
+        self.assertEqual(["Warehouse", "RetailStore"], [item["entityName"] for item in candidates])
+        self.assertEqual(["WAREHOUSE", "RETAIL_STORE"], [item["sourceHints"][0] for item in filtered])
+        self.assertEqual("warehouse_id", candidates[0]["properties"][0]["propertyName"])
+
 
 if __name__ == "__main__":
     unittest.main()

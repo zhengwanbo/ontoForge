@@ -110,6 +110,12 @@ const routes = [
             meta: { title: '本体图谱浏览', icon: 'View', parentMenu: '本体浏览管理' }
           },
           {
+            path: 'instances',
+            name: 'GraphInstances',
+            component: () => import('../views/browse/GraphInstanceBrowse.vue'),
+            meta: { title: '实例数据展示', icon: 'Share', parentMenu: '本体浏览管理' }
+          },
+          {
             path: 'graph-query',
             name: 'GraphDataQuery',
             component: () => import('../views/browse/GraphDataQuery.vue'),

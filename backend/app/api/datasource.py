@@ -6,7 +6,6 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.core.logging import get_logger
 from app.schemas.schemas import ApiResponse, DataSourceCreate, DataSourceUpdate, DataSourceResponse
-from sqlalchemy import or_
 from app.models.models import SysDataSource, SysDomain, generate_id
 
 router = APIRouter(prefix="/system/datasources", tags=["系统-数据源管理"])
@@ -70,12 +69,7 @@ async def list_data_sources(
         SysDomain.domain_id == SysDataSource.business_domain_id,
     )
     if business_domain_id:
-        query = query.filter(
-            or_(
-                SysDataSource.business_domain_id == business_domain_id,
-                SysDataSource.business_domain_id.is_(None),
-            )
-        )
+        query = query.filter(SysDataSource.business_domain_id == business_domain_id)
     sources = query.order_by(SysDataSource.created_at.desc()).all()
     data = [DataSourceResponse(
         source_id=source.source_id,

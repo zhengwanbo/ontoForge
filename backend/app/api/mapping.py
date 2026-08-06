@@ -12,7 +12,7 @@ from app.core.logging import get_logger
 from app.schemas.schemas import (
     ApiResponse, PropertyMappingCreate, PropertyMappingUpdate,
     PropertyMappingResponse, EntityMappingUpdate, RelationMappingCreate,
-    RelationMappingUpdate, EdgeSqlPreviewRequest, AutoMappingRequest, MappingConfirmRequest,
+    RelationMappingUpdate, EdgeSqlPreviewRequest, RelationJoinAnalyzeRequest, AutoMappingRequest, MappingConfirmRequest,
     BulkAutoMappingRequest, BulkMappingApplyRequest
 )
 from app.models.models import (
@@ -483,7 +483,13 @@ def _build_relation_mapping_draft(
     ).strip()
     if source_table and target_table and source_id_col and target_id_col:
         if source_table != target_table and not draft_join_condition:
-            common_join_keys = [key for key in ["VCM_ID", "MODULE_ID", "SENSOR_ID", "LENS_ID", "LOT", "BARCODE"] if key in source_columns and key in target_columns]
+            # Prefer shared business foreign keys before considering a node
+            # identifier.  In particular, a BottleCode's PRODUCT_ID describes
+            # its product relation while BOTTLE_ID only identifies the bottle.
+            common_join_keys = [key for key in [
+                "PRODUCT_ID", "BATCH_ID", "LINE_ID", "PACK_ID", "CASE_ID", "PALLET_ID",
+                "VCM_ID", "MODULE_ID", "SENSOR_ID", "LENS_ID", "LOT", "BARCODE",
+            ] if key in source_columns and key in target_columns]
             join_key = common_join_keys[0] if common_join_keys else (source_id_col if source_id_col == target_id_col and source_id_col in source_columns and source_id_col in target_columns else "")
             if join_key:
                 draft_join_condition = f"src.{join_key} = dst.{join_key}"
@@ -531,7 +537,9 @@ def _build_bulk_relation_mapping_result(
     target_vertex_table = str(target_node_mapping.get("node_table_name") or target_vertex.get("vertex_table") or "").strip().upper()
     source_key_property = str(source_node_mapping.get("key_property_name") or source_vertex.get("key_property") or "").strip()
     target_key_property = str(target_node_mapping.get("key_property_name") or target_vertex.get("key_property") or "").strip()
-    ready = bool(source_vertex_table and target_vertex_table and source_key_property and target_key_property)
+    join_condition = str(graph_relation_mapping.get("join_condition") or "").strip()
+    node_ready = bool(source_vertex_table and target_vertex_table and source_key_property and target_key_property)
+    ready = bool(node_ready and join_condition)
 
     return {
         "relation_id": relation.relation_id,
@@ -560,7 +568,18 @@ def _build_bulk_relation_mapping_result(
             "source_vertex_key_property": source_key_property,
             "target_vertex_table": target_vertex_table,
             "target_vertex_key_property": target_key_property,
-            "oracle_graph_ready": ready,
+            "oracle_graph_ready": node_ready,
+        },
+        "join_recommendation": {
+            "join_condition": join_condition,
+            "source_tables": graph_relation_mapping.get("source_tables") or [],
+            "design_reason": graph_relation_mapping.get("design_reason") or "",
+            "validated": bool(join_condition),
+            "message": (
+                "已确认业务 Join；完成 Join 后再投影两端节点主键为 SOURCE_ID / TARGET_ID。"
+                if join_condition else
+                "未找到满足“同名 ID 且至少一端为 PK”的可验证 Join，未推荐边关系。"
+            ),
         },
     }
 
@@ -631,7 +650,20 @@ def _is_property_mapping_ddl_ready(mapping: Optional[SysPropertyMapping]) -> boo
 def _is_relation_mapping_ddl_ready(mapping: Optional[SysRelationMapping]) -> bool:
     if not mapping:
         return False
-    return bool((mapping.edge_sql or "").strip())
+    # Edge tables are now generated from node tables, so an old edge_sql view
+    # is neither required nor sufficient.  A physical relation must name both
+    # source tables and provide an explicit join predicate.
+    if (mapping.mapping_mode or "DIRECT").upper() == "RELATION_TABLE":
+        return bool(
+            (mapping.relation_table or "").strip()
+            and (mapping.relation_source_column or "").strip()
+            and (mapping.relation_target_column or "").strip()
+        )
+    return bool(
+        (mapping.source_table or "").strip()
+        and (mapping.target_table or "").strip()
+        and (mapping.join_condition or "").strip()
+    )
 
 
 def _apply_mappings_for_entity(
@@ -785,12 +817,17 @@ def _apply_mapping_for_relation(
     mapping.target_table = mapping_payload.get("target_table") or None
     mapping.join_condition = mapping_payload.get("join_condition") or None
     mapping.edge_sql = mapping_payload.get("edge_sql") or None
+    mapping.mapping_mode = (mapping_payload.get("mapping_mode") or "DIRECT").upper()
+    mapping.relation_table = mapping_payload.get("relation_table") or None
+    mapping.relation_source_column = mapping_payload.get("relation_source_column") or None
+    mapping.relation_target_column = mapping_payload.get("relation_target_column") or None
+    mapping.edge_property_columns_json = mapping_payload.get("edge_property_columns_json") or None
     if mapping_payload.get("edge_table_name"):
         _set_relation_edge_table_name(db, relation, mapping_payload.get("edge_table_name"))
-    mapping.mapping_status = "CONFIRMED" if _is_relation_mapping_ddl_ready(mapping) else "PENDING"
+    mapping.mapping_status = "STALE" if _is_relation_mapping_ddl_ready(mapping) else "PENDING"
     mapping.mapped_by = current_user.get("username", "unknown")
     mapping.mapped_at = datetime.utcnow()
-    return 1 if mapping.mapping_status == "CONFIRMED" else 0
+    return 1 if mapping.mapping_status == "STALE" else 0
 
 
 def _apply_node_mapping_for_entity(
@@ -1688,6 +1725,134 @@ async def update_property_mapping(
 
 # ====== 关系映射 ======
 
+def _relation_entity_source_table(entity: SysOntologyEntity) -> str:
+    """Choose the dominant mapped table for a node entity."""
+    table_counts: Dict[str, int] = {}
+    for prop in entity.properties or []:
+        mapping = getattr(prop, "mapping", None)
+        table_name = (getattr(mapping, "source_table", None) or "").strip().upper()
+        if table_name:
+            table_counts[table_name] = table_counts.get(table_name, 0) + 1
+    return max(table_counts, key=table_counts.get) if table_counts else ""
+
+
+def _relation_join_candidates(
+    relation: SysOntologyRelation,
+    source_table: str,
+    target_table: str,
+    source_columns: set[str],
+    target_columns: set[str],
+    current_join: str = "",
+) -> List[Dict[str, Any]]:
+    """Produce explainable candidates from ontology mappings and field semantics.
+
+    This is deliberately conservative: matching property/source-column names is
+    evidence; two unrelated primary keys are not.
+    """
+    candidates: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+    def add(source_column: str, target_column: str, score: int, reason: str, kind: str):
+        src, dst = source_column.upper(), target_column.upper()
+        if src not in source_columns or dst not in target_columns:
+            return
+        key = (src, dst)
+        current = candidates.get(key)
+        if current and current["semantic_score"] >= score:
+            return
+        candidates[key] = {
+            "source_column": src,
+            "target_column": dst,
+            "join_condition": f"src.{src} = dst.{dst}",
+            "semantic_score": score,
+            "reason": reason,
+            "candidate_type": kind,
+        }
+
+    # Retain a user-entered simple equality as a candidate so it is validated
+    # against real data rather than trusted blindly.
+    match = re.fullmatch(r"\s*(?:src\.)?([A-Za-z][A-Za-z0-9_$#]*)\s*=\s*(?:dst\.)?([A-Za-z][A-Za-z0-9_$#]*)\s*", current_join or "")
+    if match:
+        add(match.group(1), match.group(2), 120, "当前已填写的 Join，待以真实数据复核", "CURRENT")
+
+    # Structured supply-chain identity relation.  This mirrors the DDL layer,
+    # but exposes the decision early in the mapping workflow.
+    pair = ((relation.source_entity.entity_name or "").upper(), (relation.target_entity.entity_name or "").upper())
+    if pair == ("BOTTLECODE", "PRODUCT"):
+        add("PRODUCT_ID", "PRODUCT_ID", 115, "瓶码的 PRODUCT_ID 是指向产品的业务外键", "DOMAIN_RULE")
+
+    source_props = { (prop.property_name or "").strip().upper(): prop for prop in (relation.source_entity.properties or []) }
+    target_props = { (prop.property_name or "").strip().upper(): prop for prop in (relation.target_entity.properties or []) }
+    for property_name in set(source_props).intersection(target_props):
+        source_prop, target_prop = source_props[property_name], target_props[property_name]
+        source_mapping, target_mapping = getattr(source_prop, "mapping", None), getattr(target_prop, "mapping", None)
+        source_column = (getattr(source_mapping, "source_column", None) or property_name).strip().upper()
+        target_column = (getattr(target_mapping, "source_column", None) or property_name).strip().upper()
+        if property_name.endswith(("_ID", "_CODE", "_NO")):
+            add(source_column, target_column, 100, f"两端本体属性“{property_name}”语义一致，且属于业务标识字段", "ONTOLOGY_PROPERTY")
+        else:
+            add(source_column, target_column, 70, f"两端本体属性“{property_name}”名称一致", "SAME_NAME")
+
+    # Last-resort table recognition: only identical foreign-key-like columns,
+    # never SOURCE_PK = TARGET_PK with different names.
+    for column in source_columns.intersection(target_columns):
+        if column.endswith(("_ID", "_CODE", "_NO")):
+            add(column, column, 60, f"源表与目标表均存在业务标识字段“{column}”", "TABLE_SCHEMA")
+
+    return sorted(candidates.values(), key=lambda item: item["semantic_score"], reverse=True)
+
+
+@router.post("/relations/{relation_id}/join-analysis", response_model=ApiResponse)
+async def analyze_relation_join(
+    relation_id: str,
+    req: RelationJoinAnalyzeRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Recommend and verify Join pairs before a relation mapping is saved."""
+    from app.services.source_data_service import SourceDataService
+
+    relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
+    if not relation or not relation.source_entity or not relation.target_entity:
+        raise HTTPException(status_code=404, detail="关系或两端本体对象不存在")
+
+    source_table = (req.source_table or _relation_entity_source_table(relation.source_entity)).strip().upper()
+    target_table = (req.target_table or _relation_entity_source_table(relation.target_entity)).strip().upper()
+    if not source_table or not target_table:
+        raise HTTPException(status_code=400, detail="请先选择源节点和目标节点的来源表，再识别关联条件")
+
+    service = SourceDataService(db)
+    try:
+        source_detail = service.get_remote_table_detail(req.source_id, source_table, req.schema, sample_limit=1)
+        target_detail = service.get_remote_table_detail(req.source_id, target_table, req.schema, sample_limit=1)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取关联表结构：{exc}")
+    source_columns = {(item.get("column_name") or "").upper() for item in (source_detail.get("columns") or [])}
+    target_columns = {(item.get("column_name") or "").upper() for item in (target_detail.get("columns") or [])}
+    candidates = _relation_join_candidates(
+        relation, source_table, target_table, source_columns, target_columns, req.join_condition or ""
+    )[:req.max_candidates]
+    for candidate in candidates:
+        try:
+            profile = service.profile_remote_join(
+                req.source_id, source_table, candidate["source_column"], target_table, candidate["target_column"], req.schema
+            )
+            candidate["verification"] = profile
+            candidate["status"] = "VERIFIED" if profile["valid"] else "NO_MATCH"
+            candidate["confidence"] = "HIGH" if profile["valid"] and candidate["semantic_score"] >= 90 else ("MEDIUM" if profile["valid"] else "LOW")
+        except Exception as exc:
+            candidate["verification"] = {"valid": False, "error": str(exc)}
+            candidate["status"] = "UNVERIFIED"
+            candidate["confidence"] = "LOW"
+
+    candidates.sort(key=lambda item: (item["status"] == "VERIFIED", item["semantic_score"]), reverse=True)
+    return ApiResponse(data={
+        "relation_id": relation_id,
+        "source_table": source_table,
+        "target_table": target_table,
+        "candidates": candidates,
+        "analysis_hint": "候选由已映射本体属性、表字段语义和结构化领域规则生成；只有实际命中数据的候选才可确认。",
+    })
+
 @router.get("/relations/{relation_id}/mapping", response_model=ApiResponse)
 async def get_relation_mapping(
     relation_id: str,
@@ -1713,6 +1878,11 @@ async def get_relation_mapping(
         "target_table": mapping.target_table if mapping and mapping.target_table else draft.get("target_table", ""),
         "join_condition": mapping.join_condition if mapping and mapping.join_condition else draft.get("join_condition", ""),
         "edge_sql": mapping.edge_sql if mapping and mapping.edge_sql else draft.get("edge_sql", ""),
+        "mapping_mode": mapping.mapping_mode if mapping and mapping.mapping_mode else "DIRECT",
+        "relation_table": mapping.relation_table if mapping else "",
+        "relation_source_column": mapping.relation_source_column if mapping else "",
+        "relation_target_column": mapping.relation_target_column if mapping else "",
+        "edge_property_columns_json": mapping.edge_property_columns_json if mapping else "",
         "mapping_status": mapping.mapping_status if mapping else ("SUGGESTED" if draft.get("edge_sql") or draft.get("join_condition") or draft.get("source_table") else "PENDING"),
         "mapped_by": mapping.mapped_by if mapping else None,
         "mapped_at": mapping.mapped_at.isoformat() if mapping and mapping.mapped_at else None,
@@ -1740,7 +1910,11 @@ async def create_relation_mapping(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
-    has_mapping_content = _is_relation_mapping_ddl_ready(req)  # type: ignore[arg-type]
+    has_mapping_content = (
+        bool(req.relation_table and req.relation_source_column and req.relation_target_column)
+        if (req.mapping_mode or "DIRECT").upper() == "RELATION_TABLE"
+        else bool(req.source_table and req.target_table and req.join_condition)
+    )
     mapping = SysRelationMapping(
         mapping_id=generate_id("rmap"),
         relation_id=relation_id,
@@ -1748,7 +1922,12 @@ async def create_relation_mapping(
         target_table=req.target_table,
         join_condition=req.join_condition,
         edge_sql=req.edge_sql,
-        mapping_status="CONFIRMED" if has_mapping_content else "PENDING"
+        mapping_mode=(req.mapping_mode or "DIRECT").upper(),
+        relation_table=req.relation_table,
+        relation_source_column=req.relation_source_column,
+        relation_target_column=req.relation_target_column,
+        edge_property_columns_json=req.edge_property_columns_json,
+        mapping_status="STALE" if has_mapping_content else "PENDING"
     )
     db.add(mapping)
     _set_relation_edge_table_name(db, relation, req.edge_table_name)
@@ -1782,7 +1961,7 @@ async def update_relation_mapping(
         setattr(mapping, field, value)
     mapping.mapped_by = current_user.get("username", "unknown")
     mapping.mapped_at = datetime.utcnow()
-    mapping.mapping_status = "CONFIRMED" if _is_relation_mapping_ddl_ready(mapping) else "PENDING"
+    mapping.mapping_status = "STALE" if _is_relation_mapping_ddl_ready(mapping) else "PENDING"
     db.commit()
     return ApiResponse(message="关系映射已更新")
 

@@ -1,4 +1,5 @@
 docs/
+database/
 backend/.env
 backend/.DS_Store
 .DS_Store

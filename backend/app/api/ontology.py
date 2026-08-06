@@ -15,7 +15,7 @@ from app.schemas.schemas import (
 from app.models.models import (
     SysOntologyEntity, SysOntologyProperty, SysOntologyRelation,
     SysDomain, SysEntityMapping, SysPropertyMapping, SysRelationMapping,
-    SysOntologyBlueprint, SysMappingTask, SysDDLLog, generate_id
+    SysOntologyBlueprint, SysMappingTask, SysDDLLog, SysDDLStatementLog, generate_id
 )
 import json
 import re
@@ -614,6 +614,18 @@ async def clear_domain_ontology_data(
     ddl_logs = db.query(SysDDLLog).filter(
         SysDDLLog.domain_id == domain_id
     ).all()
+    ddl_log_ids = [item.log_id for item in ddl_logs]
+    ddl_statement_log_count = db.query(SysDDLStatementLog).filter(
+        SysDDLStatementLog.log_id.in_(ddl_log_ids)
+    ).count() if ddl_log_ids else 0
+    if ddl_log_ids:
+        # Use a separate, immediate SQL DELETE rather than relying on the ORM
+        # unit-of-work ordering.  SysDDLStatementLog has no ORM relationship
+        # to SysDDLLog, so Oracle can otherwise receive the parent delete first.
+        db.query(SysDDLStatementLog).filter(
+            SysDDLStatementLog.log_id.in_(ddl_log_ids)
+        ).delete(synchronize_session=False)
+        db.flush()
     property_count = db.query(SysOntologyProperty).join(
         SysOntologyEntity,
         SysOntologyProperty.entity_id == SysOntologyEntity.entity_id
@@ -679,6 +691,7 @@ async def clear_domain_ontology_data(
             "deleted_blueprints": len(blueprints),
             "deleted_mapping_tasks": len(mapping_tasks),
             "deleted_ddl_logs": len(ddl_logs),
+            "deleted_ddl_statement_logs": ddl_statement_log_count,
             **drop_result,
         }
     )

@@ -31,6 +31,7 @@ class DDLService:
             )
         blueprint_package = self._load_latest_blueprint(domain.domain_id)
         template_statements = self._generate_template_ddl(domain, entities, relations)
+        relation_warnings = self._collect_relation_mapping_warnings(relations, entities)
 
         # Try LLM generation first
         llm_service = LLMService(self.db)
@@ -69,6 +70,7 @@ class DDLService:
             "full_ddl": "\n\n".join([s["sql"] for s in ddl_statements]),
             "entity_count": len(entities),
             "relation_count": len(relations),
+            "relation_warnings": relation_warnings,
             "blueprint_id": blueprint_package.get("blueprint_id") if blueprint_package else None,
             "blueprint_version": blueprint_package.get("blueprint_version") if blueprint_package else None,
         }
@@ -722,13 +724,28 @@ CREATE OR REPLACE VIEW {view_name} AS
         source_table = source_entity.table_name or f"ONTO_NODE_{source_entity.entity_name.upper()}"
         target_table = target_entity.table_name or f"ONTO_NODE_{target_entity.entity_name.upper()}"
         relation_mapping = relation.relation_mapping
-        join_condition = self._build_relation_join_condition(
-            relation,
-            source_entity,
-            target_entity,
-            source_key,
-            target_key,
-        )
+        mapping_mode = (getattr(relation_mapping, "mapping_mode", None) or "DIRECT").upper()
+        if mapping_mode == "RELATION_TABLE":
+            relation_table = (getattr(relation_mapping, "relation_table", None) or "").strip().upper()
+            relation_source_column = (getattr(relation_mapping, "relation_source_column", None) or "").strip().upper()
+            relation_target_column = (getattr(relation_mapping, "relation_target_column", None) or "").strip().upper()
+            if not all(self._is_safe_ddl_identifier(value) for value in (relation_table, relation_source_column, relation_target_column)):
+                return None
+            join_condition = f"src.{source_key} = rel.{relation_source_column} AND rel.{relation_target_column} = dst.{target_key}"
+            from_clause = (
+                f"FROM {relation_table} rel\n"
+                f"JOIN {source_table} src ON src.{source_key} = rel.{relation_source_column}\n"
+                f"JOIN {target_table} dst ON rel.{relation_target_column} = dst.{target_key}"
+            )
+        else:
+            join_condition = self._build_relation_join_condition(
+                relation,
+                source_entity,
+                target_entity,
+                source_key,
+                target_key,
+            )
+            from_clause = f"FROM {source_table} src\nJOIN {target_table} dst ON {join_condition}" if join_condition else ""
         # A relation can be part of the conceptual ontology before its edge
         # mapping is complete.  Do not emit an invalid CTAS which would make a
         # whole deployment fail; it will be included once its mapping refers to
@@ -749,8 +766,7 @@ SELECT
     dst.{target_key} AS TARGET_ID,
     '{safe_name}' AS RELATION_NAME,
     '{safe_desc}' AS RELATION_DESC
-FROM {source_table} src
-JOIN {target_table} dst ON {join_condition};
+{from_clause};
 
 ALTER TABLE {rel_table}
 ADD CONSTRAINT PK_{rel_table[:95]} PRIMARY KEY (EDGE_ID);
@@ -758,6 +774,34 @@ ADD CONSTRAINT PK_{rel_table[:95]} PRIMARY KEY (EDGE_ID);
 COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
 
         return ddl
+
+    def _collect_relation_mapping_warnings(
+        self,
+        relations: List[SysOntologyRelation],
+        entities: List[SysOntologyEntity],
+    ) -> List[Dict[str, str]]:
+        """Return relations that intentionally cannot be deployed as edges yet.
+
+        A conceptual ontology relation is not sufficient evidence for a physical
+        edge.  The condition must reference projected columns in both node
+        objects.  Keeping this information in the generation response makes a
+        missing edge visible instead of silently fabricating a PK-to-PK join.
+        """
+        entity_by_id = {entity.entity_id: entity for entity in entities}
+        warnings: List[Dict[str, str]] = []
+        for relation in relations:
+            source_entity = entity_by_id.get(relation.source_entity_id)
+            target_entity = entity_by_id.get(relation.target_entity_id)
+            if not source_entity or not target_entity:
+                continue
+            if self._relation_join_is_deployable(relation, source_entity, target_entity):
+                continue
+            warnings.append({
+                "relation_id": relation.relation_id,
+                "relation_name": relation.relation_name or relation.relation_id,
+                "message": "缺少可验证的关联条件，未生成边表；请在数据映射中确认两端节点字段的 Join 条件。",
+            })
+        return warnings
 
     def _relation_join_is_deployable(
         self,
@@ -767,6 +811,12 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
     ) -> bool:
         source_key = self._get_entity_primary_key(source_entity)
         target_key = self._get_entity_primary_key(target_entity)
+        relation_mapping = relation.relation_mapping
+        if (getattr(relation_mapping, "mapping_mode", None) or "DIRECT").upper() == "RELATION_TABLE":
+            return bool(
+                source_key and target_key
+                and all(self._is_safe_ddl_identifier((getattr(relation_mapping, field, None) or "").strip().upper()) for field in ("relation_table", "relation_source_column", "relation_target_column"))
+            )
         return bool(
             source_key
             and target_key
@@ -801,7 +851,10 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
         if canonical_join and self._relation_join_columns_exist(canonical_join, source_entity, target_entity):
             return canonical_join
         if not join_condition:
-            return f"src.{source_key} = dst.{target_key}"
+            # Primary keys identify an instance *inside* their own node table;
+            # they do not prove that two different node types are related.
+            # Never infer a cross-node relation by equating unrelated PKs.
+            return None
 
         normalized = self._normalize_relation_join_condition(
             join_condition,
@@ -824,6 +877,10 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
             (target_entity.entity_name or "").strip().upper(),
         )
         joins = {
+            # 金鼎仙泉供应链：瓶码实例保留自身 BOTTLE_ID 作为节点主键，
+            # 通过外键 PRODUCT_ID 指向产品节点。SOURCE_ID 仍应是 BOTTLE_ID，
+            # 只有 Join 谓词使用 PRODUCT_ID。
+            ("BOTTLECODE", "PRODUCT"): "src.PRODUCT_ID = dst.PRODUCT_ID",
             ("PRODUCTUNIT", "PRODUCTMODEL"): (
                 "src.MODEL = dst.MODEL_CODE "
                 "AND NVL(TRIM(UPPER(src.CONFIG)), '~') = NVL(dst.CONFIG_NAME_STD, '~')"
@@ -1051,12 +1108,52 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
         connection = None
         cursor = None
         results = []
+        blocked_edge_tables: set[str] = set()
         try:
             connection = source_service._connect_to_oracle(target_source)
             cursor = connection.cursor()
             for stmt in statements:
                 # Oracle drivers expect executable SQL without a SQL*Plus terminator.
                 stmt = stmt.strip().rstrip(";").strip()
+
+                edge_table = self._get_edge_table_name(stmt)
+                if edge_table and edge_table in blocked_edge_tables:
+                    results.append({
+                        "statement": stmt,
+                        "status": "skipped",
+                        "message": "关联条件未命中数据，关联边表未创建",
+                        **self._describe_ddl_statement(stmt),
+                    })
+                    continue
+
+                # The generated property graph declares all validated edge
+                # tables.  If any one of them has zero real matches, do not
+                # create a graph whose definition points at a missing table.
+                # It will be regenerated after the relation mappings are fixed.
+                if blocked_edge_tables and re.match(r"(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?PROPERTY\s+GRAPH\b", stmt):
+                    results.append({
+                        "statement": stmt,
+                        "status": "skipped",
+                        "message": "存在未命中实例的关系边，未创建属性图；请修正关系映射后重新生成并执行 DDL",
+                        **self._describe_ddl_statement(stmt),
+                    })
+                    continue
+
+                # Node CTAS statements are executed before edge CTAS statements.
+                # Verify every generated edge against the actual target database
+                # before creating it, so an empty or erroneous join never enters
+                # the property graph as a seemingly valid relationship.
+                edge_preflight = self._preflight_edge_join(cursor, stmt)
+                if edge_preflight is not None and edge_preflight["matched_count"] == 0:
+                    blocked_edge_tables.add(edge_preflight["edge_table"])
+                    results.append({
+                        "statement": stmt,
+                        "status": "skipped",
+                        "message": "关联条件未命中任何实例，未创建边表",
+                        "relation_match_count": 0,
+                        **self._describe_ddl_statement(stmt),
+                    })
+                    continue
 
                 # Oracle does not support DROP ... IF EXISTS.  Probe the target
                 # dictionary first so an initial deployment never reports the
@@ -1112,6 +1209,51 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
             "failed": failed_count,
             "skipped": skipped_count,
             "details": results
+        }
+
+    def _get_edge_table_name(self, statement: str) -> str:
+        """Return a generated ONTO_EDGE table referenced by one DDL statement."""
+        match = re.search(r"(?i)\b(?:CREATE\s+TABLE|ALTER\s+TABLE|COMMENT\s+ON\s+TABLE)\s+(ONTO_EDGE_[A-Z0-9_$#]+)\b", statement or "")
+        return match.group(1).upper() if match else ""
+
+    def _preflight_edge_join(self, cursor, statement: str) -> Optional[Dict[str, Any]]:
+        """Count matches for generated edge CTAS statements before deployment.
+
+        The extractor deliberately accepts only the CTAS shape emitted by
+        ``_generate_relation_table_ddl`` and safe Oracle identifiers.  Other
+        user-authored DDL is left untouched.
+        """
+        direct_pattern = re.compile(
+            r"(?is)^\s*CREATE\s+TABLE\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
+            r"SELECT\b.*?\bFROM\s+([A-Z][A-Z0-9_$#]*)\s+src\s+"
+            r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+dst\s+ON\s+(.+?)\s*$"
+        )
+        relation_table_pattern = re.compile(
+            r"(?is)^\s*CREATE\s+TABLE\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
+            r"SELECT\b.*?\b(FROM\s+([A-Z][A-Z0-9_$#]*)\s+rel\s+"
+            r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+src\s+ON\s+(.+?)\s+"
+            r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+dst\s+ON\s+(.+?))\s*$"
+        )
+        direct_match = direct_pattern.match(statement or "")
+        if direct_match:
+            edge_table, source_table, target_table, join_condition = direct_match.groups()
+            from_clause = f"FROM {source_table} src JOIN {target_table} dst ON {join_condition}"
+        else:
+            relation_match = relation_table_pattern.match(statement or "")
+            if not relation_match:
+                return None
+            edge_table, from_clause, relation_table, source_table, source_join, target_table, target_join = relation_match.groups()
+            join_condition = f"{source_join} {target_join}"
+        # The condition has already been validated against node properties at
+        # generation time.  This second syntactic guard protects execution when
+        # a script was manually edited in the DDL editor.
+        if not re.fullmatch(r"[\w\s().,'=<>!+*/|&:-]+", join_condition):
+            return None
+        cursor.execute(f"SELECT COUNT(*) {from_clause}")
+        row = cursor.fetchone()
+        return {
+            "edge_table": edge_table.upper(),
+            "matched_count": int(row[0]) if row and row[0] is not None else 0,
         }
 
     def _is_missing_ddl_object_error(self, exc: Exception, statement: str) -> bool:

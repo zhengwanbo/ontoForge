@@ -369,9 +369,9 @@
 
         <el-card class="summary-card" shadow="never">
           <template #header><span>Oracle 26ai 本体关系实现</span></template>
-          <el-empty
+            <el-empty
             v-if="!result?.relations?.length"
-            description="执行全域映射后，这里会按本体关系展示边表如何通过两端节点表的唯一主键建立连接。"
+            description="执行全域映射后，这里会展示已通过业务 Join 校验的本体关系边表建议。"
             :image-size="76"
           />
           <el-table v-else :data="result.relations" border stripe size="small">
@@ -385,20 +385,47 @@
             <el-table-column label="SOURCE 本体节点表" min-width="230">
               <template #default="{ row }">
                 <div>{{ row.source_entity_display_name || row.source_entity_name || '-' }}</div>
-                <code>{{ row.oracle_edge?.source_vertex_table || '?' }}.{{ row.oracle_edge?.source_vertex_key_property || '?' }}（唯一 PK） → SOURCE_ID</code>
+                <code>{{ row.oracle_edge?.source_vertex_table || '?' }}.{{ row.oracle_edge?.source_vertex_key_property || '?' }}（节点 PK） → SOURCE_ID</code>
               </template>
             </el-table-column>
             <el-table-column label="DESTINATION 本体节点表" min-width="230">
               <template #default="{ row }">
                 <div>{{ row.target_entity_display_name || row.target_entity_name || '-' }}</div>
-                <code>{{ row.oracle_edge?.target_vertex_table || '?' }}.{{ row.oracle_edge?.target_vertex_key_property || '?' }}（唯一 PK） → TARGET_ID</code>
+                <code>{{ row.oracle_edge?.target_vertex_table || '?' }}.{{ row.oracle_edge?.target_vertex_key_property || '?' }}（节点 PK） → TARGET_ID</code>
+              </template>
+            </el-table-column>
+            <el-table-column label="实际业务 Join" min-width="270">
+              <template #default="{ row }">
+                <code v-if="row.join_recommendation?.join_condition">{{ row.join_recommendation.join_condition }}</code>
+                <span v-else class="relation-join-warning">待人工确认</span>
+                <div class="relation-join">{{ row.join_recommendation?.message }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="关系来源模式" min-width="330">
+              <template #default="{ row }">
+                <el-radio-group v-model="row.mapping_mode" size="small">
+                  <el-radio-button value="DIRECT">直接 Join</el-radio-button>
+                  <el-radio-button value="RELATION_TABLE">关系表模式</el-radio-button>
+                </el-radio-group>
+                <template v-if="row.mapping_mode === 'RELATION_TABLE'">
+                  <el-select v-model="row.relation_table" size="small" filterable placeholder="选择关系证据表" style="width: 100%; margin-top: 8px">
+                    <el-option v-for="table in sourceTables" :key="table.table_name" :label="table.comments ? `${table.table_name}（${table.comments}）` : table.table_name" :value="table.table_name" />
+                  </el-select>
+                  <div class="relation-mode-fields">
+                    <el-input v-model="row.relation_source_column" size="small" placeholder="关系表 → 源节点字段，如 BOTTLE_ID" />
+                    <el-input v-model="row.relation_target_column" size="small" placeholder="关系表 → 目标节点字段，如 PACK_ID" />
+                  </div>
+                  <div class="relation-join">关系表连接两端节点后，分别投影节点 PK 为 SOURCE_ID、TARGET_ID。</div>
+                </template>
+                <div v-else class="relation-join">{{ row.join_recommendation?.join_condition || '请先生成或确认直接 Join 建议' }}</div>
               </template>
             </el-table-column>
             <el-table-column label="边关系表实现" min-width="300">
               <template #default="{ row }">
                 <div><strong>{{ row.edge_table_name || '待生成边关系表' }}</strong></div>
-                <div class="relation-join">EDGE_ID 为边唯一标识；SOURCE_ID、TARGET_ID 分别引用两端节点表的唯一 PK。</div>
-                <div class="relation-join">完整建表及边关系 SQL 将在 DDL 生成中提供。</div>
+                <div class="relation-join">先按“实际业务 Join”关联数据，再将两端节点 PK 投影为 SOURCE_ID、TARGET_ID。</div>
+                <div class="relation-join">{{ row.join_recommendation?.design_reason || '完整建表及边关系 SQL 将在 DDL 生成中提供。' }}</div>
+                <el-button type="primary" link size="small" :loading="relationSavingId === row.relation_id" @click="saveRelationMode(row)">保存关系配置</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -542,6 +569,7 @@ const domains = ref<any[]>([])
 const entities = ref<any[]>([])
 const dataSources = ref<any[]>([])
 const schemaOptions = ref<string[]>([])
+const sourceTables = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const result = ref<any>(null)
 const latestBlueprint = ref<any>(null)
@@ -567,6 +595,7 @@ const compareVisible = ref(false)
 const compareResult = ref<any>(null)
 const activeTaskId = ref('')
 const activeTaskDetail = ref<any>(null)
+const relationSavingId = ref('')
 let taskPollingTimer: number | null = null
 
 const form = ref({
@@ -697,6 +726,19 @@ const loadSchemas = async () => {
   } catch (e) {}
 }
 
+const loadSourceTables = async () => {
+  if (!form.value.source_id || !form.value.schema) {
+    sourceTables.value = []
+    return
+  }
+  try {
+    const res = await sourceApi.getRemoteTables(form.value.source_id, { schema: form.value.schema })
+    sourceTables.value = res.data?.tables || res.data || []
+  } catch (e) {
+    sourceTables.value = []
+  }
+}
+
 const loadModels = async () => {
   try {
     const res = await systemApi.getLLMConfigs()
@@ -724,6 +766,7 @@ const loadLatestBlueprint = async () => {
 const loadAll = async () => {
   await loadDomains()
   await Promise.all([loadEntities(), loadDataSources(), loadModels(), loadLatestBlueprint()])
+  await loadSourceTables()
   await loadHistory()
   syncActiveTaskFromHistory()
 }
@@ -745,6 +788,7 @@ const handleDomainChange = async () => {
 const handleSourceChange = async () => {
   form.value.schema = ''
   await loadSchemas()
+  await loadSourceTables()
 }
 
 const generateMappings = async (autoApply = false) => {
@@ -805,6 +849,38 @@ const applySelectedMappings = async () => {
   pendingApplyMode.value = 'SELECTED'
   pendingApplyEntityIds.value = [...selectedApplicableEntityIds.value]
   openApplyPreview(selectedApplicableEntityIds.value)
+}
+
+const saveRelationMode = async (row: any) => {
+  if (!row?.relation_id) return
+  const mappingMode = row.mapping_mode || 'DIRECT'
+  if (mappingMode === 'RELATION_TABLE' && (!row.relation_table?.trim() || !row.relation_source_column?.trim() || !row.relation_target_column?.trim())) {
+    ElMessage.warning('请完整填写关系证据表及其指向源、目标节点的字段')
+    return
+  }
+  relationSavingId.value = row.relation_id
+  const payload = {
+    edge_table_name: row.edge_table_name || null,
+    source_table: row.source_table || row.join_recommendation?.source_tables?.[0] || null,
+    target_table: row.target_table || row.join_recommendation?.source_tables?.[1] || null,
+    join_condition: mappingMode === 'DIRECT' ? (row.join_recommendation?.join_condition || null) : null,
+    edge_sql: null,
+    mapping_mode: mappingMode,
+    relation_table: mappingMode === 'RELATION_TABLE' ? row.relation_table.trim() : null,
+    relation_source_column: mappingMode === 'RELATION_TABLE' ? row.relation_source_column.trim() : null,
+    relation_target_column: mappingMode === 'RELATION_TABLE' ? row.relation_target_column.trim() : null,
+  }
+  try {
+    const existing = await mappingApi.getRelationMapping(row.relation_id)
+    if (existing.data?.mapping_id) await mappingApi.updateRelationMapping(row.relation_id, payload)
+    else await mappingApi.createRelationMapping(row.relation_id, payload)
+    row.mapping_mode = mappingMode
+    ElMessage.success(`已保存关系「${row.relation_name || row.relation_id}」的${mappingMode === 'RELATION_TABLE' ? '关系表模式' : '直接 Join 模式'}`)
+  } catch (e: any) {
+    ElMessage.error(e?.message || '保存关系配置失败')
+  } finally {
+    relationSavingId.value = ''
+  }
 }
 
 const applyEntities = async (entityIds: string[]) => {
@@ -1257,6 +1333,19 @@ watch(() => appStore.currentDomainId, async (value) => {
   syncActiveTaskFromHistory()
 })
 
+watch(() => form.value.schema, () => {
+  loadSourceTables()
+})
+
+watch(result, (value) => {
+  ;(value?.relations || []).forEach((row: any) => {
+    row.mapping_mode ||= 'DIRECT'
+    row.relation_table ||= ''
+    row.relation_source_column ||= ''
+    row.relation_target_column ||= ''
+  })
+}, { immediate: true })
+
 watch(() => form.value.mapping_instruction, (value: string) => {
   localStorage.setItem('bulkMappingInstruction', value)
 })
@@ -1563,6 +1652,15 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
   color: #516b82;
   line-height: 1.5;
+}
+.relation-mode-fields {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+.relation-join-warning {
+  color: #c45656;
+  font-weight: 600;
 }
 .preview-relation-section {
   margin-top: 16px;

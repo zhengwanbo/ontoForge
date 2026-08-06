@@ -61,6 +61,30 @@ def ensure_llm_config_columns():
 
 ensure_llm_config_columns()
 
+
+def ensure_relation_mapping_columns():
+    inspector = inspect(engine)
+    try:
+        columns = {item["name"].lower() for item in inspector.get_columns("sys_relation_mapping")}
+    except Exception:
+        columns = set()
+    if not columns:
+        return
+    additions = {
+        "mapping_mode": "VARCHAR2(30)",
+        "relation_table": "VARCHAR2(100)",
+        "relation_source_column": "VARCHAR2(100)",
+        "relation_target_column": "VARCHAR2(100)",
+        "edge_property_columns_json": "CLOB",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE sys_relation_mapping ADD {name} {definition}"))
+
+
+ensure_relation_mapping_columns()
+
 # Check if admin user exists, create if not
 from sqlalchemy.orm import Session
 from app.core.database import SessionLocal

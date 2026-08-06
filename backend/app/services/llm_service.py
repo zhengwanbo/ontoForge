@@ -41,6 +41,48 @@ class LLMService:
     def __init__(self, db: Session):
         self.db = db
 
+    @staticmethod
+    def _build_verified_direct_relation_candidates(
+        ontology_entities: List[Dict[str, Any]],
+        ontology_relations: List[Dict[str, Any]],
+        entity_mapping_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Derive direct FK→PK joins before asking the LLM to design edges."""
+        entities_by_id = {str(item.get("entity_id") or ""): item for item in ontology_entities}
+        mappings_by_entity = {str(item.get("entity_id") or ""): item.get("mappings") or [] for item in entity_mapping_results}
+        candidates: List[Dict[str, Any]] = []
+        for relation in ontology_relations:
+            source_id, target_id = str(relation.get("source_entity_id") or ""), str(relation.get("target_entity_id") or "")
+            source_entity, target_entity = entities_by_id.get(source_id) or {}, entities_by_id.get(target_id) or {}
+            source_pk = {str(prop.get("property_name") or "").upper() for prop in source_entity.get("properties") or [] if prop.get("is_primary_key")}
+            target_pk = {str(prop.get("property_name") or "").upper() for prop in target_entity.get("properties") or [] if prop.get("is_primary_key")}
+            source_mappings = mappings_by_entity.get(source_id, [])
+            target_mappings = mappings_by_entity.get(target_id, [])
+            for source_mapping in source_mappings:
+                source_column = str(source_mapping.get("sourceColumn") or source_mapping.get("source_column") or "").upper()
+                source_property = str(source_mapping.get("matchedPropertyName") or source_mapping.get("propertyName") or "").upper()
+                if not source_column.endswith("ID"):
+                    continue
+                for target_mapping in target_mappings:
+                    target_column = str(target_mapping.get("sourceColumn") or target_mapping.get("source_column") or "").upper()
+                    target_property = str(target_mapping.get("matchedPropertyName") or target_mapping.get("propertyName") or "").upper()
+                    if source_column != target_column or not target_column:
+                        continue
+                    if source_property not in source_pk and target_property not in target_pk:
+                        continue
+                    candidate = {
+                        "relation_id": relation.get("relation_id"),
+                        "source_table": str(source_mapping.get("sourceTable") or source_mapping.get("source_table") or "").upper(),
+                        "target_table": str(target_mapping.get("sourceTable") or target_mapping.get("source_table") or "").upper(),
+                        "source_column": source_column,
+                        "target_column": target_column,
+                        "join_condition": f"src.{source_column} = dst.{target_column}",
+                        "reason": "两端已映射字段同名，且至少一端对应本体主键（FK→PK 直接关联）",
+                    }
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+        return candidates
+
     def _get_config_by_id(self, config_id: Optional[str]) -> Optional[SysLLMConfig]:
         """按 ID 获取启用的大模型配置"""
         if not config_id:
@@ -399,6 +441,11 @@ class LLMService:
             }
             for item in entity_mapping_results
         ]
+        direct_relation_candidates = self._build_verified_direct_relation_candidates(
+            ontology_entities,
+            ontology_relations,
+            entity_mapping_results,
+        )
         blueprint = blueprint_context or {}
         prompt_payload = {
             "domain": domain_context,
@@ -406,6 +453,7 @@ class LLMService:
             "ontology_relations": ontology_relations,
             "source_tables": compact_source_tables,
             "property_mapping_candidates": compact_entity_results,
+            "verified_direct_relation_candidates": direct_relation_candidates,
             "blueprint_context": {
                 "rule_summary": blueprint.get("rule_summary") or {},
                 "table_roles": blueprint.get("table_roles") or blueprint.get("source_role_bindings") or [],
@@ -419,12 +467,15 @@ class LLMService:
 1. 每个本体对象对应一个稳定命名的节点表；节点表由源表通过 SELECT、JOIN、UNION ALL、DISTINCT 或 GROUP BY 构建。
 2. 节点 SELECT 必须输出稳定且唯一的本体 KEY，并输出该本体对象的全部属性列；派生对象允许用拼接键、聚合或事件展开构建。
 3. 每个本体关系对应一张边表；边 SELECT 必须输出稳定唯一的 EDGE_ID、SOURCE_ID、TARGET_ID，且两端值必须分别等于源节点和目标节点的 KEY。
-4. 边必须根据本体对象之间的关系语义设计，不能只因为两个源表存在同名字段就武断建边。
-5. 节点 SQL 和边 SQL 都只返回 SELECT / WITH 查询体，不要包含 CREATE、ALTER、DROP、COMMENT 或结尾分号。
-6. 默认使用 TABLE 构建方式，以便下一步 CTAS 后增加 PRIMARY KEY；仅在明确需要实时视图时使用 VIEW。
-7. Oracle 对象名和输出列别名使用大写英文下划线；SQL 必须可执行。
-8. 不得虚构输入中不存在的源表或源字段。
-9. 返回严格 JSON，不要输出 Markdown。"""
+4. 边必须根据本体对象之间的关系语义设计。JOIN 条件必须使用源、目标表中实际存在且能够匹配数据的业务关联列；严禁把不同含义的两端主键直接写成 JOIN。
+5. 对于直接等值关联，优先选择两端同名的 `*_ID` 字段，并且该字段在源或目标本体对象中至少一端是主键（典型模式：子表外键 PRODUCT_ID = 产品表主键 PRODUCT_ID）。
+6. `SOURCE_ID`、`TARGET_ID` 是图边端点，分别输出源、目标节点的主键；它们不是 JOIN 推断依据。必须先用业务关联列完成 JOIN，再投影两端节点主键。
+7. 若不存在可证明的关联列，不要虚构边 SQL；返回空 joinCondition/edgeSql，并在 designReason 中说明“待人工确认”。
+8. 节点 SQL 和边 SQL 都只返回 SELECT / WITH 查询体，不要包含 CREATE、ALTER、DROP、COMMENT 或结尾分号。
+9. 默认使用 TABLE 构建方式，以便下一步 CTAS 后增加 PRIMARY KEY；仅在明确需要实时视图时使用 VIEW。
+10. Oracle 对象名和输出列别名使用大写英文下划线；SQL 必须可执行。
+11. 不得虚构输入中不存在的源表或源字段。
+12. 返回严格 JSON，不要输出 Markdown。"""
         extra_instruction = (mapping_instruction or "").strip()
         user_prompt = f"""请根据完整本体、对象关系、源表结构和初步属性候选，一次性设计节点表与边表的源数据映射。
 
@@ -462,6 +513,8 @@ class LLMService:
 }}
 
 必须覆盖输入中的每一个本体对象和每一条本体关系。节点表名、边表名、节点 KEY 和关系方向必须前后一致；keyOutputColumn 必须就是 nodeSql 中 keyPropertyName 对应的输出列别名。
+关系输出必须在 designReason 中明确写出“关联列”和“两端节点主键投影”。不得使用 `src.<源PK> = dst.<目标PK>` 作为不同实体之间的 Join。
+当输入 `verified_direct_relation_candidates` 包含当前 relationId 的候选时，必须优先且原样使用该候选的 joinCondition；这是已由系统根据属性映射验证的 FK→PK 关系，不得遗漏或替换。
 {f"额外业务映射指令：{extra_instruction}" if extra_instruction else ""}"""
 
         raw_output = await self.call_llm(system_prompt, user_prompt, config)
@@ -470,6 +523,8 @@ class LLMService:
             parsed,
             ontology_entities=ontology_entities,
             ontology_relations=ontology_relations,
+            entity_mapping_results=entity_mapping_results,
+            verified_direct_relation_candidates=direct_relation_candidates,
         )
         return {
             **normalized,
@@ -483,6 +538,8 @@ class LLMService:
         *,
         ontology_entities: List[Dict[str, Any]],
         ontology_relations: List[Dict[str, Any]],
+        entity_mapping_results: Optional[List[Dict[str, Any]]] = None,
+        verified_direct_relation_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             return {"entity_mappings": [], "relation_mappings": []}
@@ -497,6 +554,20 @@ class LLMService:
             for item in ontology_entities
             if item.get("entity_name")
         }
+        # The relationship validator needs the actual source columns selected
+        # during property mapping, not just conceptual property names.
+        mapped_columns_by_entity: Dict[str, Dict[str, str]] = {}
+        for mapping_result in entity_mapping_results or []:
+            entity_id = str(mapping_result.get("entity_id") or "").strip()
+            if not entity_id:
+                continue
+            column_map: Dict[str, str] = {}
+            for mapping in mapping_result.get("mappings") or []:
+                property_name = str(mapping.get("matchedPropertyName") or mapping.get("propertyName") or "").strip().upper()
+                source_column = str(mapping.get("sourceColumn") or mapping.get("source_column") or "").strip().upper()
+                if property_name and source_column:
+                    column_map[source_column] = property_name
+            mapped_columns_by_entity[entity_id] = column_map
         normalized_entities: List[Dict[str, Any]] = []
         seen_entity_ids = set()
         for item in payload.get("entityMappings") or payload.get("entity_mappings") or []:
@@ -548,6 +619,12 @@ class LLMService:
             ): item
             for item in ontology_relations
         }
+        verified_candidates_by_relation: Dict[str, List[Dict[str, Any]]] = {}
+        for candidate in verified_direct_relation_candidates or []:
+            relation_id = str(candidate.get("relation_id") or "").strip()
+            join_condition = str(candidate.get("join_condition") or "").strip()
+            if relation_id and join_condition:
+                verified_candidates_by_relation.setdefault(relation_id, []).append(candidate)
         normalized_relations: List[Dict[str, Any]] = []
         seen_relation_ids = set()
         for item in payload.get("relationMappings") or payload.get("relation_mappings") or []:
@@ -568,7 +645,31 @@ class LLMService:
                 continue
             edge_sql = self._normalize_readonly_mapping_sql(item.get("edgeSql") or item.get("edge_sql"))
             upper_edge_sql = edge_sql.upper()
-            if not edge_sql or not all(re.search(rf"\bAS\s+{column}\b", upper_edge_sql) for column in ["EDGE_ID", "SOURCE_ID", "TARGET_ID"]):
+            if edge_sql and not all(re.search(rf"\bAS\s+{column}\b", upper_edge_sql) for column in ["EDGE_ID", "SOURCE_ID", "TARGET_ID"]):
+                edge_sql = ""
+            join_condition = self._normalize_relation_join_condition(
+                item.get("joinCondition") or item.get("join_condition"),
+                source_entity=entity_by_id.get(str(relation.get("source_entity_id") or "")),
+                target_entity=entity_by_id.get(str(relation.get("target_entity_id") or "")),
+                source_mapped_columns=mapped_columns_by_entity.get(str(relation.get("source_entity_id") or ""), {}),
+                target_mapped_columns=mapped_columns_by_entity.get(str(relation.get("target_entity_id") or ""), {}),
+            )
+            verified_candidates = verified_candidates_by_relation.get(relation_id) or []
+            if verified_candidates:
+                # Deterministic metadata evidence outranks an omitted or
+                # hallucinated LLM Join.  This prevents a clear
+                # ProductionBatch.PRODUCT_ID -> Product.PRODUCT_ID relation
+                # from disappearing from the global mapping recommendation.
+                join_condition = str(verified_candidates[0]["join_condition"])
+            # If enough entity metadata is present, reject an LLM relation
+            # that did not prove the actual join pair.  Legacy callers without
+            # property context retain their existing compatibility behavior.
+            source_entity = entity_by_id.get(str(relation.get("source_entity_id") or "")) or {}
+            target_entity = entity_by_id.get(str(relation.get("target_entity_id") or "")) or {}
+            has_property_context = bool(source_entity.get("properties") and target_entity.get("properties"))
+            if has_property_context and not join_condition:
+                continue
+            if not edge_sql and not join_condition:
                 continue
             seen_relation_ids.add(relation_id)
             normalized_relations.append({
@@ -580,16 +681,90 @@ class LLMService:
                     item.get("edgeTableName") or item.get("edge_table_name"),
                     fallback=f"ONTO_EDGE_{relation.get('relation_name') or relation_id}",
                 ),
-                "source_tables": self._normalize_source_table_names(item.get("sourceTables") or item.get("source_tables") or []),
-                "join_condition": str(item.get("joinCondition") or item.get("join_condition") or "").strip(),
+                "source_tables": self._normalize_source_table_names(
+                    item.get("sourceTables") or item.get("source_tables") or
+                    [item.get("source_table") for item in verified_candidates if item.get("source_table")]
+                ),
+                "join_condition": join_condition,
                 "edge_sql": edge_sql,
-                "design_reason": str(item.get("designReason") or item.get("design_reason") or "").strip(),
+                "design_reason": str(item.get("designReason") or item.get("design_reason") or "").strip() or (
+                    str(verified_candidates[0].get("reason") or "") if verified_candidates else ""
+                ),
+            })
+
+        # The model may omit a relationship despite having a deterministic
+        # FK→PK candidate.  Surface that candidate anyway so the global
+        # mapping result remains complete and reviewable.
+        for relation_id, candidates in verified_candidates_by_relation.items():
+            if relation_id in seen_relation_ids or not candidates:
+                continue
+            relation = relation_by_id.get(relation_id)
+            if not relation:
+                continue
+            candidate = candidates[0]
+            seen_relation_ids.add(relation_id)
+            normalized_relations.append({
+                "relation_id": relation_id,
+                "relation_name": relation.get("relation_name") or "",
+                "source_entity_id": relation.get("source_entity_id") or "",
+                "target_entity_id": relation.get("target_entity_id") or "",
+                "edge_table_name": self._normalize_oracle_object_name(
+                    fallback=f"ONTO_EDGE_{relation.get('relation_name') or relation_id}",
+                    value=None,
+                ),
+                "source_tables": self._normalize_source_table_names([candidate.get("source_table")]),
+                "join_condition": candidate["join_condition"],
+                "edge_sql": "",
+                "design_reason": candidate.get("reason") or "",
             })
 
         return {
             "entity_mappings": normalized_entities,
             "relation_mappings": normalized_relations,
         }
+
+    def _normalize_relation_join_condition(
+        self,
+        value: Any,
+        *,
+        source_entity: Optional[Dict[str, Any]],
+        target_entity: Optional[Dict[str, Any]],
+        source_mapped_columns: Dict[str, str],
+        target_mapped_columns: Dict[str, str],
+    ) -> str:
+        """Accept only a proven direct foreign-key/primary-key equality.
+
+        The relationship recommendation is intentionally narrower than free-form
+        SQL: a shared ID name must be present on both mapped nodes and must be a
+        PK for at least one endpoint.  Complex relations stay pending for the
+        later relation-table workflow instead of being fabricated by the LLM.
+        """
+        condition = str(value or "").strip().rstrip(";")
+        match = re.fullmatch(
+            r"(?i)\s*(?:src\.)?([A-Za-z][A-Za-z0-9_$#]*)\s*=\s*(?:dst\.)?([A-Za-z][A-Za-z0-9_$#]*)\s*",
+            condition,
+        )
+        if not match:
+            return ""
+        source_column, target_column = match.group(1).upper(), match.group(2).upper()
+        if source_column != target_column or not source_column.endswith("ID"):
+            return ""
+        source_property = source_mapped_columns.get(source_column, source_column)
+        target_property = target_mapped_columns.get(target_column, target_column)
+        source_pk = {
+            str(item.get("property_name") or "").upper()
+            for item in (source_entity or {}).get("properties") or []
+            if item.get("is_primary_key")
+        }
+        target_pk = {
+            str(item.get("property_name") or "").upper()
+            for item in (target_entity or {}).get("properties") or []
+            if item.get("is_primary_key")
+        }
+        if source_pk or target_pk:
+            if source_property not in source_pk and target_property not in target_pk:
+                return ""
+        return f"src.{source_column} = dst.{target_column}"
 
     def _normalize_readonly_mapping_sql(self, value: Any) -> str:
         sql = str(value or "").strip().rstrip(";").strip()
@@ -1180,9 +1355,10 @@ class LLMService:
 1. 优先阅读“高层本体/图谱设计文档”，并把它视为本次实体范围的第一约束。
 2. 再结合业务摘要、规则摘要（如有）、表角色识别结果，以及当前批次源表结构补充实体细节。
 3. 只生成设计文档中明确纳入首期范围的实体，除非某个缺失实体是支撑这些核心实体落地所必需的最小补充对象。
-4. 优先抽取稳定业务实体，不要把纯中间宽表直接当成业务实体。
-5. 为每个候选实体给出必要核心属性，属性数量保持克制。
-6. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
+4. 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的表是默认主数据实体；即使设计文档遗漏，也必须生成对应候选。
+5. 优先抽取稳定业务实体，不要把纯中间宽表直接当成业务实体。
+6. 为每个候选实体给出必要核心属性，属性数量保持克制。
+7. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
 
 输出格式：
 {
@@ -1396,8 +1572,9 @@ class LLMService:
 1. 先阅读业务摘要，识别本次最小可行域（MVP）/ 首次切实可行范围。
 2. 再结合规则摘要（如有）、表角色识别和源表结构，决定本次首期到底应该构建哪些实体、哪些关系。
 3. 本次输出的是高层设计文档，不是最终落库对象清单；重点是定义“做什么”和“先不做什么”。
-4. 设计必须切实可行，范围克制，避免因为源表很多或字段很多而扩张。
-5. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
+4. 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的已选业务主数据表，必须纳入 included_entities；不得静默省略。
+5. 设计必须切实可行，范围克制，避免因为源表很多或字段很多而扩张。
+6. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
 
 输出格式：
 {
@@ -1450,6 +1627,7 @@ class LLMService:
 - 如果 rule_summary.has_concrete_rule_data = true，应把这些规则数据视为缺陷识别依据，明确首期缺陷识别范围与相关对象，不要仅停留在通用对象层。
 - included_relations 中的 relationName 必须使用中文、简短的关系谓词（优先 2～6 个字），不要重复两端实体名称；完整说明写入 reason。不要使用 hasXxx / belongsTo / occursOn / camelCase / snake_case 之类英文关系名。
 - 如果某些对象理论上有价值但首期不必要，应放入 excluded_or_deferred。
+- 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的已选业务表属于默认主数据实体，必须列入 included_entities。
 - 返回严格 JSON。"""
 
         result_text = await self.call_llm(

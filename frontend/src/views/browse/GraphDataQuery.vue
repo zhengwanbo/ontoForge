@@ -39,7 +39,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { domainApi, sourceApi } from '../../api'
 import { useAppStore } from '../../stores/app'
@@ -87,6 +87,14 @@ const loadSchemas = async () => { if (!sourceId.value) { schemas.value = []; ret
 const handleDomainChange = async () => { const domain = domains.value.find(item => item.domain_id === domainId.value); appStore.setCurrentDomain(domainId.value, domain?.domain_name || ''); result.value = null; sourceId.value = ''; schema.value = ''; await loadSources() }
 const handleSourceChange = async () => { result.value = null; await loadSchemas() }
 const executeQuery = async () => { if (!canExecute.value) return; executing.value = true; try { const res = await sourceApi.executeGraphQuery({ domain_id: domainId.value, source_id: sourceId.value, schema: schema.value || undefined, graph_sql: graphSql.value, row_limit: rowLimit.value }); result.value = res.data; ElMessage.success(`查询完成，返回 ${res.data?.rows?.length || 0} 行`) } catch (_) {} finally { executing.value = false } }
+watch(() => appStore.currentDomainId, async (currentDomainId) => {
+  if (currentDomainId === domainId.value) return
+  domainId.value = currentDomainId || ''
+  result.value = null
+  sourceId.value = ''
+  schema.value = ''
+  await loadSources()
+})
 onMounted(async () => { await loadDomains(); if (domainId.value) await loadSources() })
 </script>
 

@@ -591,6 +591,7 @@
             <el-select
               v-model="guideForm.generation_strategy"
               class="guide-toolbar-item"
+              @change="handleGuideGenerationStrategyChange"
             >
               <el-option label="结构化领域生成" value="structured_domain_pipeline" />
               <el-option label="LLM自由生成" value="llm_first" />
@@ -598,11 +599,18 @@
             <el-select
               v-model="guideForm.business_scenario"
               clearable
-              placeholder="业务场景"
+              placeholder="业务目标"
               class="guide-toolbar-item"
             >
-              <el-option label="SFR根因分析" value="SFR_ROOTCAUSE" />
-              <el-option label="缺陷分析" value="DEFECT_ANALYSIS" />
+              <el-option
+                v-if="guideForm.generation_strategy === 'llm_first'"
+                label="通用规则"
+                value="GENERAL_RULES"
+              />
+              <template v-else>
+                <el-option label="SFR根因分析" value="SFR_ROOTCAUSE" />
+                <el-option label="缺陷分析" value="DEFECT_ANALYSIS" />
+              </template>
             </el-select>
             <div class="guide-panel-hint guide-toolbar-item" style="grid-column: span 2;">
               结构化领域生成会优先执行问卷/DDL/规则数据的结构化分析，再生成 canonical 本体与标准化视图计划。
@@ -1270,6 +1278,11 @@ const createEmptyGuideForm = () => ({
   overwrite_existing: false
 })
 const guideForm = reactive(createEmptyGuideForm())
+const handleGuideGenerationStrategyChange = (strategy: string) => {
+  guideForm.business_scenario = strategy === 'llm_first'
+    ? 'GENERAL_RULES'
+    : 'SFR_ROOTCAUSE'
+}
 const selectedGuideTableBindings = computed<GuideTableBinding[]>(() =>
   guideForm.relation_tables.map(tableName => ({
     table_name: tableName,
@@ -2664,7 +2677,7 @@ const clearOntologyData = async () => {
     naturalAdjustPreview.value = null
     await loadGraphData()
     ElMessage.success(
-      `已清空：实体 ${res.data?.deleted_entities || 0} 个、属性 ${res.data?.deleted_properties || 0} 个、关系 ${res.data?.deleted_relations || 0} 条、实体映射 ${res.data?.deleted_entity_mappings || 0} 个、属性映射 ${res.data?.deleted_property_mappings || 0} 个、关系映射 ${res.data?.deleted_relation_mappings || 0} 个、设计包 ${res.data?.deleted_blueprints || 0} 个、映射任务 ${res.data?.deleted_mapping_tasks || 0} 个、DDL日志 ${res.data?.deleted_ddl_logs || 0} 个；已删除图 ${res.data?.dropped_graphs || 0} 个、视图 ${res.data?.dropped_views || 0} 个、表 ${res.data?.dropped_tables || 0} 个`
+      `已清空：实体 ${res.data?.deleted_entities || 0} 个、属性 ${res.data?.deleted_properties || 0} 个、关系 ${res.data?.deleted_relations || 0} 条、实体映射 ${res.data?.deleted_entity_mappings || 0} 个、属性映射 ${res.data?.deleted_property_mappings || 0} 个、关系映射 ${res.data?.deleted_relation_mappings || 0} 个、设计包 ${res.data?.deleted_blueprints || 0} 个、映射任务 ${res.data?.deleted_mapping_tasks || 0} 个、DDL日志 ${res.data?.deleted_ddl_logs || 0} 个、执行明细 ${res.data?.deleted_ddl_statement_logs || 0} 条；已删除图 ${res.data?.dropped_graphs || 0} 个、视图 ${res.data?.dropped_views || 0} 个、表 ${res.data?.dropped_tables || 0} 个`
     )
   } catch (e) {
   } finally {

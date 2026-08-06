@@ -71,6 +71,13 @@
             <template #default="{ row }">{{ entityNameMap[row.target_entity_id] || row.target_entity_id }}</template>
           </el-table-column>
           <el-table-column prop="relation_type" label="类型" width="130" />
+          <el-table-column label="关联状态" width="120">
+            <template #default="{ row }">
+              <el-tag :type="relationMappingStatusType(row.relation_mapping?.mapping_status)" size="small">
+                {{ relationMappingStatusLabel(row.relation_mapping?.mapping_status) }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="relation_table_name" label="关系表/边表" min-width="180" show-overflow-tooltip />
           <el-table-column prop="relation_desc" label="说明" min-width="220" show-overflow-tooltip />
         </el-table>
@@ -101,9 +108,18 @@
       style="margin-bottom: 12px"
     >
       <template #title>
-        当前 DDL 生成遵循“源数据驱动”原则：实体使用已确认的属性映射或 `entity_mapping.view_sql`；关系由两端本体节点表的唯一主键生成 `EDGE_ID / SOURCE_ID / TARGET_ID` 边表，并优先采用已保存的 Join 条件。
+        当前 DDL 生成遵循“源数据驱动”原则：实体使用已确认的属性映射或 `entity_mapping.view_sql`；关系必须具有经字段校验的 Join 条件，绝不会用两端主键猜测关联。执行边表前还会校验实际关联命中数，零命中关系不会进入图谱。
       </template>
     </el-alert>
+
+    <el-alert
+      v-if="relationWarnings.length"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 12px"
+      :title="`有 ${relationWarnings.length} 条关系缺少可验证 Join，未生成边表：${relationWarnings.map(item => item.relation_name).join('、')}`"
+    />
 
     <div v-if="ddlContent" class="ddl-content">
       <div class="ddl-stats">
@@ -217,9 +233,15 @@
         <el-table-column prop="executed_by" label="执行人" width="100" />
         <el-table-column prop="execution_duration" label="耗时(秒)" width="80" />
         <el-table-column prop="error_message" label="错误信息" min-width="200" />
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="viewHistorySql(row)">查看 SQL</el-button>
+            <el-button
+              v-if="row.execution_result !== 'GENERATED'"
+              link
+              type="primary"
+              @click="viewHistoryExecution(row)"
+            >执行明细</el-button>
             <el-button link :disabled="!row.ddl_content" @click="loadHistorySql(row)">载入</el-button>
           </template>
         </el-table-column>
@@ -233,11 +255,35 @@
         <el-button type="primary" :disabled="!selectedHistorySql?.ddl_content" @click="loadHistorySql(selectedHistorySql)">载入当前编辑器</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="historyExecutionVisible" :title="historyExecutionTitle" width="1080px" top="5vh">
+      <el-alert :closable="false" show-icon style="margin-bottom: 14px" type="info">
+        <template #title>
+          共 {{ historyExecutionDetails.length }} 条：成功 {{ historyExecutionSummary.success }}，失败 {{ historyExecutionSummary.failed }}，跳过 {{ historyExecutionSummary.skipped }}
+        </template>
+      </el-alert>
+      <el-empty v-if="!historyExecutionDetails.length" description="该历史记录未保存逐条执行明细；只有本次功能发布后的 DDL 执行会保留此信息。" />
+      <el-table v-else :data="historyExecutionDetails" border stripe size="small" max-height="560">
+        <el-table-column type="expand">
+          <template #default="{ row }"><pre class="execution-sql">{{ row.statement }};</pre></template>
+        </el-table-column>
+        <el-table-column prop="sequence_no" label="#" width="65" />
+        <el-table-column prop="object_type" label="对象类型" width="130" />
+        <el-table-column prop="object_name" label="对象名称" min-width="180" />
+        <el-table-column label="执行结果" width="100">
+          <template #default="{ row }"><el-tag :type="executionStatusType(row.status)" size="small">{{ executionStatusLabel(row.status) }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="说明 / 错误" min-width="300">
+          <template #default="{ row }">{{ row.error_message || row.message || (row.status === 'success' ? '执行成功' : '-') }}</template>
+        </el-table-column>
+      </el-table>
+      <template #footer><el-button type="primary" @click="historyExecutionVisible = false">关闭</el-button></template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { domainApi, ddlApi, sourceApi } from '../../api'
 import { useAppStore } from '../../stores/app'
@@ -250,6 +296,7 @@ const ontologyRelations = ref<any[]>([])
 const latestBlueprint = ref<any>(null)
 const ddlContent = ref('')
 const ddlStatements = ref<any[]>([])
+const relationWarnings = ref<any[]>([])
 const ddlStats = ref<any>({ entityCount: 0, relationCount: 0, blueprintVersion: '' })
 const ddlLogs = ref<any[]>([])
 const targetDataSources = ref<any[]>([])
@@ -262,6 +309,9 @@ const executionResult = ref<any>(null)
 const logsDialogVisible = ref(false)
 const historySqlVisible = ref(false)
 const selectedHistorySql = ref<any>(null)
+const historyExecutionVisible = ref(false)
+const selectedHistoryExecution = ref<any>(null)
+const historyExecutionDetails = ref<any[]>([])
 const executeForm = ref({ target_source_id: '', execute_mode: 'all', skip_existing: false })
 
 const entityNameMap = computed<Record<string, string>>(() => {
@@ -314,11 +364,34 @@ const ddlHistoryStatusType = (status: string) => ({
 
 const executionStatusLabel = (status: string) => ({ success: '成功', failed: '失败', skipped: '已跳过' }[status] || status)
 const executionStatusType = (status: string) => ({ success: 'success', failed: 'danger', skipped: 'warning' }[status] || 'info')
+const relationMappingStatusLabel = (status?: string) => ({
+  DEPLOYED: '已部署',
+  STALE: '待重新部署',
+  CONFIRMED: '已确认',
+  PENDING: '待配置'
+}[status || ''] || '待配置')
+const relationMappingStatusType = (status?: string) => ({
+  DEPLOYED: 'success',
+  STALE: 'warning',
+  CONFIRMED: 'info',
+  PENDING: 'danger'
+}[status || ''] || 'danger')
 
 const historySqlTitle = computed(() => {
   if (!selectedHistorySql.value) return 'DDL SQL'
   return `${ddlHistoryStatusLabel(selectedHistorySql.value.execution_result)} DDL SQL · ${selectedHistorySql.value.executed_at || ''}`
 })
+
+const historyExecutionTitle = computed(() => {
+  if (!selectedHistoryExecution.value) return 'DDL 历史执行明细'
+  return `DDL 历史执行明细 · ${selectedHistoryExecution.value.executed_at || ''}`
+})
+
+const historyExecutionSummary = computed(() => ({
+  success: historyExecutionDetails.value.filter(item => item.status === 'success').length,
+  failed: historyExecutionDetails.value.filter(item => item.status === 'failed').length,
+  skipped: historyExecutionDetails.value.filter(item => item.status === 'skipped').length,
+}))
 
 const loadDomains = async () => {
   try {
@@ -374,9 +447,12 @@ const loadTargetDataSources = async () => {
 }
 
 const handleDomainChange = async () => {
+  const domain = domains.value.find(item => item.domain_id === currentDomainId.value)
+  appStore.setCurrentDomain(currentDomainId.value, domain?.domain_name || '')
   ddlContent.value = ''
   ddlStatements.value = []
   ddlStats.value = { entityCount: 0, relationCount: 0, blueprintVersion: '' }
+  relationWarnings.value = []
   executeForm.value.target_source_id = ''
   await Promise.all([reloadDomainContext(), loadTargetDataSources()])
 }
@@ -399,6 +475,7 @@ const generateDDL = async () => {
     const res = await ddlApi.generate(currentDomainId.value)
     ddlContent.value = res.data?.full_ddl || ''
     ddlStatements.value = res.data?.ddl_statements || []
+    relationWarnings.value = res.data?.relation_warnings || []
     ddlStats.value = {
       entityCount: res.data?.entity_count || 0,
       relationCount: res.data?.relation_count || 0,
@@ -432,6 +509,18 @@ const showLogsDialog = () => {
 const viewHistorySql = (row: any) => {
   selectedHistorySql.value = row
   historySqlVisible.value = true
+}
+
+const viewHistoryExecution = async (row: any) => {
+  selectedHistoryExecution.value = row
+  historyExecutionDetails.value = []
+  try {
+    const res = await ddlApi.getLogDetails(row.log_id)
+    historyExecutionDetails.value = res.data || []
+    historyExecutionVisible.value = true
+  } catch (e: any) {
+    ElMessage.error(e?.message || '加载历史执行明细失败')
+  }
 }
 
 const loadHistorySql = (row: any) => {
@@ -471,6 +560,17 @@ const executeDDL = async () => {
     executeLoading.value = false
   }
 }
+
+watch(() => appStore.currentDomainId, async (domainId) => {
+  if (domainId === currentDomainId.value) return
+  currentDomainId.value = domainId || ''
+  ddlContent.value = ''
+  ddlStatements.value = []
+  ddlStats.value = { entityCount: 0, relationCount: 0, blueprintVersion: '' }
+  relationWarnings.value = []
+  executeForm.value.target_source_id = ''
+  await Promise.all([reloadDomainContext(), loadTargetDataSources()])
+})
 
 onMounted(async () => {
   await loadDomains()

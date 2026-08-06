@@ -4,7 +4,7 @@
       <div>
         <div class="eyebrow">ONTOLOGY GRAPH</div>
         <h2>本体图谱浏览</h2>
-        <p>图中的顶点和关系直接读取自所选 Oracle 数据源的 Property Graph 视图。</p>
+        <p>图中的顶点和关系直接读取自当前业务分析域下所选 Oracle 数据源的 Property Graph 视图。</p>
       </div>
       <div class="header-actions">
         <el-select v-model="selectedSourceId" placeholder="选择 Oracle 数据源" filterable @change="handleSourceChange">
@@ -109,7 +109,7 @@
         <template v-if="selectedNode">
           <div class="detail-heading">
             <span class="detail-color" :style="{ background: selectedNode.color || (selectedNode.buildType === 'VIEW' ? '#0ea5e9' : '#10b981') }"></span>
-            <div><h3>{{ selectedNode.displayName || selectedNode.name }}</h3><code>{{ selectedNode.name }}</code></div>
+            <div><h3>{{ selectedNode.displayName || selectedNode.name }}</h3><code>{{ selectedNode.technicalName || selectedNode.name }}</code></div>
           </div>
           <div class="detail-tags">
             <el-tag effect="plain">{{ selectedNode.buildType }}</el-tag>
@@ -117,6 +117,7 @@
           </div>
           <dl class="detail-info">
             <div><dt>对象表</dt><dd><code>{{ selectedNode.tableName || '待生成' }}</code></dd></div>
+            <div><dt>本体名称</dt><dd>{{ selectedNode.entityName || selectedNode.name }}</dd></div>
             <div><dt>关系数量</dt><dd>{{ connectedRelationCount }}</dd></div>
             <div class="full"><dt>业务描述</dt><dd>{{ selectedNode.desc || '暂无描述' }}</dd></div>
           </dl>
@@ -137,10 +138,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { FullScreen, Minus, Plus, Refresh } from '@element-plus/icons-vue'
 import { graphApi, sourceApi } from '../../api'
+import { useAppStore } from '../../stores/app'
 
+const appStore = useAppStore()
+const currentDomainId = computed(() => appStore.currentDomainId)
 const selectedSourceId = ref('')
 const selectedGraphName = ref('')
 const sourceDataSources = ref<any[]>([])
@@ -164,7 +168,7 @@ const edgeLabelWidth = (edge: any) => Math.max(54, Math.min(136, String(edge.nam
 
 const loadSourceDataSources = async () => {
   try {
-    const res = await sourceApi.listDataSources()
+    const res = await sourceApi.listDataSources(currentDomainId.value || undefined)
     sourceDataSources.value = (res.data || []).filter((source: any) => (source.db_type || '').toLowerCase() === 'oracle')
     if (!sourceDataSources.value.some(source => source.source_id === selectedSourceId.value)) {
       selectedSourceId.value = sourceDataSources.value.find(source => source.is_default === 'Y')?.source_id || ''
@@ -201,9 +205,9 @@ const restorePositions = (nodes: any[]) => {
 const persistPositions = () => { try { localStorage.setItem(positionStorageKey(), JSON.stringify(Object.fromEntries(graphNodes.value.map(node => [node.id, node.position])))) } catch (_) {} }
 
 const loadGraphData = async () => {
-  if (!selectedSourceId.value) { graphNodes.value = []; graphEdges.value = []; availableGraphs.value = []; return }
+  if (!currentDomainId.value || !selectedSourceId.value) { graphNodes.value = []; graphEdges.value = []; availableGraphs.value = []; return }
   try {
-    const res = await graphApi.getOntologyBrowseGraph(selectedSourceId.value, selectedGraphName.value)
+    const res = await graphApi.getOntologyBrowseGraph(selectedSourceId.value, selectedGraphName.value, currentDomainId.value)
     availableGraphs.value = res.data?.graphs || []
     if (!availableGraphs.value.some((graph: any) => graph.graph_name === selectedGraphName.value)) {
       selectedGraphName.value = res.data?.graph_name || ''
@@ -218,6 +222,17 @@ const loadGraphData = async () => {
     requestAnimationFrame(fitView)
   } catch (_) { graphDeploymentWarning.value = '' }
 }
+
+watch(() => appStore.currentDomainId, async () => {
+  selectedSourceId.value = ''
+  selectedGraphName.value = ''
+  availableGraphs.value = []
+  graphNodes.value = []
+  graphEdges.value = []
+  selectedNode.value = null
+  await loadSourceDataSources()
+  if (selectedSourceId.value) await loadGraphData()
+})
 
 const getCanvasPoint = (event: PointerEvent | WheelEvent) => {
   const rect = graphCanvasRef.value?.getBoundingClientRect()

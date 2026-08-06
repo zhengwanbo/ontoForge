@@ -83,6 +83,10 @@
             <el-icon><View /></el-icon>
             <span>本体图谱浏览</span>
           </el-menu-item>
+          <el-menu-item index="/browse/instances">
+            <el-icon><Share /></el-icon>
+            <span>实例数据展示</span>
+          </el-menu-item>
           <el-menu-item index="/browse/graph-query">
             <el-icon><Connection /></el-icon>
             <span>图数据查询</span>

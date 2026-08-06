@@ -27,6 +27,18 @@
     </div>
 
     <div v-if="currentEntityId" class="mapping-content">
+      <el-alert
+        v-if="manualReviewPropertyCount || manualReviewRelationCount"
+        class="manual-review-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+      >
+        <template #title>
+          当前实体有 {{ manualReviewPropertyCount }} 个属性、{{ manualReviewRelationCount }} 条关系需要人工确认
+        </template>
+        <div>请优先补齐缺失来源、核对低置信度建议，并确认关系 Join 或关系表字段后再生成 DDL。</div>
+      </el-alert>
       <el-card class="mapping-graph-card">
         <template #header>
           <span>映射结果预览</span>
@@ -129,6 +141,7 @@
           <div class="card-header">
             <span>属性映射配置</span>
             <div class="header-actions">
+              <el-checkbox v-model="showOnlyManualReview">仅显示待人工确认（{{ manualReviewPropertyCount }}）</el-checkbox>
               <el-button size="small" @click="addManualProperty">
                 新增属性
               </el-button>
@@ -144,7 +157,7 @@
           <span>已准备映射 {{ mappedCount }} / {{ totalPropertyCount }} 个属性</span>
         </div>
 
-        <el-table :data="mappingTable" row-key="local_id" border stripe size="small">
+        <el-table :data="visibleMappingRows" :row-class-name="mappingRowClassName" row-key="local_id" border stripe size="small">
           <el-table-column label="属性来源" width="110">
             <template #default="{ row }">
               <el-tag size="small" :type="row.property_id ? 'success' : 'warning'">
@@ -230,8 +243,9 @@
           <el-table-column prop="mapping_status" label="状态" width="100">
             <template #default="{ row }">
               <el-tag :type="mappingStatusTagType(row.mapping_status)" size="small">
-                {{ row.mapping_status }}
+                {{ mappingStatusLabel(row.mapping_status) }}
               </el-tag>
+              <div v-if="needsPropertyReview(row)" class="manual-review-hint">{{ propertyReviewReason(row) }}</div>
             </template>
           </el-table-column>
           <el-table-column prop="property_desc" label="属性说明" min-width="180">
@@ -263,6 +277,7 @@
               <span class="relation-card-hint">先展示本体节点之间的关系，再配置该关系如何由源数据实现</span>
             </div>
             <div class="header-actions">
+              <el-checkbox v-model="showOnlyManualReview">仅显示待人工确认（{{ manualReviewRelationCount }}）</el-checkbox>
               <el-button size="small" @click="applyAllRelationDrafts">
                 采用全部草案
               </el-button>
@@ -273,7 +288,7 @@
           </div>
         </template>
 
-        <el-table :data="relationMappingTable" row-key="relation_id" border stripe size="small">
+        <el-table :data="visibleRelationRows" :row-class-name="relationRowClassName" row-key="relation_id" border stripe size="small">
           <el-table-column prop="source_entity_name" label="本体源节点" min-width="170">
             <template #default="{ row }">
               <div class="ontology-node">
@@ -290,8 +305,10 @@
               <div class="relation-config-title">{{ row.relation_name || '未命名关系' }}</div>
               <div class="relation-config-meta">
                 <el-tag size="small" effect="plain">{{ row.relation_type || 'ASSOCIATION' }}</el-tag>
+                <el-tag v-if="needsRelationReview(row)" size="small" type="warning">待人工确认</el-tag>
                 <span v-if="row.blueprint_version">Blueprint v{{ row.blueprint_version }}</span>
               </div>
+              <div v-if="needsRelationReview(row)" class="manual-review-hint">{{ relationReviewReason(row) }}</div>
             </template>
           </el-table-column>
           <el-table-column label="英文边表名" min-width="230">
@@ -313,7 +330,18 @@
           </el-table-column>
           <el-table-column label="源数据实现" min-width="390">
             <template #default="{ row }">
-              <div class="relation-source-implementation">
+              <el-radio-group v-model="row.mapping_mode" size="small" style="margin-bottom: 8px">
+                <el-radio-button value="DIRECT">直接 Join</el-radio-button>
+                <el-radio-button value="RELATION_TABLE">关系表模式</el-radio-button>
+              </el-radio-group>
+              <template v-if="row.mapping_mode === 'RELATION_TABLE'">
+                <div class="relation-source-implementation">
+                  <label class="relation-source-field"><span>关系证据表</span><el-select v-model="row.relation_table" size="small" filterable><el-option v-for="t in sourceTables" :key="`rel-${row.relation_id}-${t.table_name}`" :label="t.table_name" :value="t.table_name" /></el-select></label>
+                  <label class="relation-source-field"><span>关系表 → 源节点字段</span><el-input v-model="row.relation_source_column" size="small" placeholder="如 BOTTLE_ID" /></label>
+                  <label class="relation-source-field"><span>关系表 → 目标节点字段</span><el-input v-model="row.relation_target_column" size="small" placeholder="如 PACK_ID" /></label>
+                </div>
+              </template>
+              <div v-if="row.mapping_mode !== 'RELATION_TABLE'" class="relation-source-implementation">
                 <label class="relation-source-field">
                   <span>源节点来源表</span>
                   <el-select v-model="row.source_table" size="small" placeholder="选择源节点来源表" filterable>
@@ -341,12 +369,32 @@
           </el-table-column>
           <el-table-column prop="join_condition" label="关系实现 Join 条件" min-width="240">
             <template #default="{ row }">
-              <el-input v-model="row.join_condition" size="small" type="textarea" :rows="3" placeholder="如：src.vcm_id = dst.vcm_id" />
+              <div v-if="row.mapping_mode === 'RELATION_TABLE'" class="join-candidate-meta">由关系表连接：src 节点主键 ← relation.{{ row.relation_source_column || '?' }}；relation.{{ row.relation_target_column || '?' }} → dst 节点主键</div>
+              <div v-if="row.join_candidates?.length" class="join-candidate-list">
+                <div v-for="candidate in row.join_candidates" :key="candidate.join_condition" class="join-candidate-item">
+                  <div class="join-candidate-main">
+                    <code>{{ candidate.join_condition }}</code>
+                    <el-tag size="small" :type="joinCandidateTagType(candidate.status)">{{ joinCandidateStatusLabel(candidate.status) }}</el-tag>
+                    <el-button
+                      link
+                      type="primary"
+                      size="small"
+                      :disabled="candidate.status !== 'VERIFIED'"
+                      @click="applyJoinCandidate(row, candidate)"
+                    >采用</el-button>
+                  </div>
+                  <div class="join-candidate-meta">
+                    命中 {{ candidate.verification?.matched_count ?? 0 }} · 源覆盖 {{ formatCoverage(candidate.verification?.source_coverage) }} · {{ candidate.reason }}
+                  </div>
+                </div>
+              </div>
+              <el-input v-if="row.mapping_mode !== 'RELATION_TABLE'" v-model="row.join_condition" size="small" type="textarea" :rows="3" placeholder="如：src.vcm_id = dst.vcm_id" />
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="90" fixed="right">
+          <el-table-column label="操作" width="120" fixed="right">
             <template #default="{ row }">
               <div class="row-actions">
+                <el-button size="small" type="success" link :loading="row.join_analysis_loading" @click="analyzeJoin(row)">识别 Join</el-button>
                 <el-button size="small" type="primary" link :disabled="!hasRelationDraft(row)" @click="applyRelationDraft(row)">
                   采用草案
                 </el-button>
@@ -363,7 +411,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute } from 'vue-router'
 import { domainApi, entityApi, graphApi, mappingApi, propertyApi, sourceApi } from '../../api'
@@ -442,11 +490,17 @@ interface RelationMappingRow {
   join_condition: string
   edge_sql: string
   mapping_status: string
+  mapping_mode: string
+  relation_table: string
+  relation_source_column: string
+  relation_target_column: string
   draft_source_table?: string
   draft_target_table?: string
   draft_join_condition?: string
   draft_edge_sql?: string
   blueprint_version?: number | string
+  join_candidates?: any[]
+  join_analysis_loading?: boolean
 }
 
 const appStore = useAppStore()
@@ -473,6 +527,7 @@ const schemaLoading = ref(false)
 const sourceTableLoading = ref(false)
 const saveLoading = ref(false)
 const relationSaveLoading = ref(false)
+const showOnlyManualReview = ref(false)
 const lastSavedSnapshot = ref('')
 
 const mappedCount = computed(() => mappingTable.value.filter(row => row.source_table && row.source_column).length)
@@ -488,6 +543,36 @@ const currentEntityRows = computed(() => mappingTable.value)
 const currentEntityMappedRows = computed(() => mappingTable.value.filter(row => row.source_table && row.source_column))
 const currentEntityPendingCount = computed(() => Math.max(mappingTable.value.length - currentEntityMappedRows.value.length, 0))
 const relatedEdges = computed(() => mappingEdges.value.filter(edge => edge.source === currentEntityId.value || edge.target === currentEntityId.value))
+const needsPropertyReview = (row: MappingRow) => {
+  const confidence = (row.confidence || '').toUpperCase()
+  // “待确认”只反映无法落地或低可信的实际问题；全域映射已确认的
+  // SUGGESTED/STALE 状态不应在管理页被重复要求人工确认。
+  return !row.source_table || !row.source_column || confidence === 'LOW'
+}
+const propertyReviewReason = (row: MappingRow) => {
+  if (!row.source_table || !row.source_column) return '缺少源表或源字段'
+  if ((row.confidence || '').toUpperCase() === 'LOW') return '低置信度建议，需核对字段语义'
+  return ''
+}
+const needsRelationReview = (row: RelationMappingRow) => {
+  const mode = (row.mapping_mode || 'DIRECT').toUpperCase()
+  if (mode === 'RELATION_TABLE') {
+    return !row.relation_table || !row.relation_source_column || !row.relation_target_column
+  }
+  return !row.source_table || !row.target_table || !row.join_condition
+}
+const relationReviewReason = (row: RelationMappingRow) => {
+  if ((row.mapping_mode || 'DIRECT').toUpperCase() === 'RELATION_TABLE') return '请补齐关系证据表及其两端关联字段'
+  if (!row.source_table || !row.target_table) return '缺少两端节点来源表'
+  if (!row.join_condition) return '缺少已验证的业务 Join 条件'
+  return ''
+}
+const manualReviewPropertyCount = computed(() => mappingTable.value.filter(needsPropertyReview).length)
+const manualReviewRelationCount = computed(() => relationMappingTable.value.filter(needsRelationReview).length)
+const visibleMappingRows = computed(() => showOnlyManualReview.value ? mappingTable.value.filter(needsPropertyReview) : mappingTable.value)
+const visibleRelationRows = computed(() => showOnlyManualReview.value ? relationMappingTable.value.filter(needsRelationReview) : relationMappingTable.value)
+const mappingRowClassName = ({ row }: { row: MappingRow }) => needsPropertyReview(row) ? 'manual-review-row' : ''
+const relationRowClassName = ({ row }: { row: RelationMappingRow }) => needsRelationReview(row) ? 'manual-review-row' : ''
 const currentEntitySourceTables = computed(() => Array.from(new Set(
   mappingTable.value
     .filter(row => row.source_table && row.source_column && ['DIRECT', 'COMPUTED'].includes((row.mapping_type || '').toUpperCase()))
@@ -529,6 +614,14 @@ const mappingStatusTagType = (status: string) => {
   if (status === 'SUGGESTED') return 'info'
   return 'warning'
 }
+
+const mappingStatusLabel = (status: string) => ({
+  CONFIRMED: '已确认',
+  PENDING: '待补齐',
+  SUGGESTED: '待确认',
+  STALE: '需更新DDL',
+  REJECTED: '已拒绝'
+}[status] || status || '待补齐')
 
 const confidenceTagType = (confidence: string) => {
   if (confidence === 'HIGH') return 'success'
@@ -742,6 +835,10 @@ const loadRelationMappings = async () => {
         join_condition: mapping?.join_condition || '',
         edge_sql: mapping?.edge_sql || '',
         mapping_status: mapping?.mapping_status || 'PENDING',
+        mapping_mode: mapping?.mapping_mode || 'DIRECT',
+        relation_table: mapping?.relation_table || '',
+        relation_source_column: mapping?.relation_source_column || '',
+        relation_target_column: mapping?.relation_target_column || '',
         draft_source_table: mapping?.draft?.source_table || '',
         draft_target_table: mapping?.draft?.target_table || '',
         draft_join_condition: mapping?.draft?.join_condition || '',
@@ -765,6 +862,10 @@ const loadRelationMappings = async () => {
       join_condition: '',
       edge_sql: '',
       mapping_status: 'PENDING',
+      mapping_mode: 'DIRECT',
+      relation_table: '',
+      relation_source_column: '',
+      relation_target_column: '',
       draft_source_table: '',
       draft_target_table: '',
       draft_join_condition: '',
@@ -803,6 +904,45 @@ const applyAllRelationDrafts = () => {
     }
   })
   if (applied) ElMessage.success(`已采用 ${applied} 条关系草案`)
+}
+
+const joinCandidateStatusLabel = (status: string) => ({ VERIFIED: '已验证', NO_MATCH: '零命中', UNVERIFIED: '未验证' }[status] || status)
+const joinCandidateTagType = (status: string) => ({ VERIFIED: 'success', NO_MATCH: 'danger', UNVERIFIED: 'warning' }[status] || 'info')
+const formatCoverage = (value: unknown) => `${Math.round(Number(value || 0) * 100)}%`
+
+const applyJoinCandidate = (row: RelationMappingRow, candidate: any) => {
+  if (candidate?.status !== 'VERIFIED') return
+  row.join_condition = candidate.join_condition
+  row.mapping_status = 'SUGGESTED'
+  ElMessage.success(`已采用已验证的 Join：${candidate.join_condition}`)
+}
+
+const analyzeJoin = async (row: RelationMappingRow) => {
+  if (!selectedSourceId.value) {
+    ElMessage.warning('请先选择数据库连接')
+    return
+  }
+  if (!row.source_table || !row.target_table) {
+    ElMessage.warning('请先选择源节点和目标节点的来源表')
+    return
+  }
+  row.join_analysis_loading = true
+  try {
+    const res = await mappingApi.analyzeRelationJoin(row.relation_id, {
+      source_id: selectedSourceId.value,
+      schema: selectedSchema.value || undefined,
+      source_table: row.source_table,
+      target_table: row.target_table,
+      join_condition: row.join_condition || undefined
+    })
+    const candidates = res.data?.candidates || []
+    row.join_candidates = candidates
+    if (!candidates.length) ElMessage.warning('未找到可验证的 Join 候选，请检查属性映射或来源表')
+  } catch (e: any) {
+    ElMessage.error(e?.message || 'Join 识别失败')
+  } finally {
+    row.join_analysis_loading = false
+  }
 }
 
 const loadMappingGraph = async () => {
@@ -1057,8 +1197,14 @@ const saveRelationMappings = async () => {
         row.edge_table_name.trim() ||
         row.source_table.trim() ||
         row.target_table.trim() ||
-        row.join_condition.trim()
+        row.join_condition.trim() ||
+        row.relation_table.trim()
       )
+      const relationTableReady = row.mapping_mode === 'RELATION_TABLE' && row.relation_table.trim() && row.relation_source_column.trim() && row.relation_target_column.trim()
+      if (row.mapping_mode === 'RELATION_TABLE' && !relationTableReady) {
+        ElMessage.warning(`请完整配置关系「${row.relation_name || row.relation_id}」的关系表及两端字段`)
+        return
+      }
       if (!hasMappingContent) {
         row.mapping_status = 'PENDING'
         continue
@@ -1069,7 +1215,11 @@ const saveRelationMappings = async () => {
         source_table: row.source_table.trim() || null,
         target_table: row.target_table.trim() || null,
         join_condition: row.join_condition.trim() || null,
-        mapping_status: 'SUGGESTED'
+        mapping_status: 'SUGGESTED',
+        mapping_mode: row.mapping_mode,
+        relation_table: row.relation_table.trim() || null,
+        relation_source_column: row.relation_source_column.trim() || null,
+        relation_target_column: row.relation_target_column.trim() || null,
       }
       if (row.mapping_id) {
         await mappingApi.updateRelationMapping(row.relation_id, payload)
@@ -1086,6 +1236,27 @@ const saveRelationMappings = async () => {
     relationSaveLoading.value = false
   }
 }
+
+watch(() => appStore.currentDomainId, async (domainId) => {
+  if (domainId === currentDomainId.value) return
+  currentDomainId.value = domainId || ''
+  currentEntityId.value = ''
+  selectedSourceId.value = ''
+  selectedSchema.value = ''
+  mappingTable.value = []
+  mappingNodes.value = []
+  mappingEdges.value = []
+  if (!currentDomainId.value) {
+    entities.value = []
+    dataSources.value = []
+    return
+  }
+  await Promise.all([loadEntities(), loadDataSources(), loadMappingGraph()])
+  if (entities.value.length) {
+    currentEntityId.value = entities.value[0].entity_id
+    await handleEntityChange()
+  }
+})
 
 onMounted(async () => {
   await loadDomains()
@@ -1355,6 +1526,21 @@ onMounted(async () => {
   font-weight: 400;
 }
 
+.manual-review-alert {
+  margin-bottom: 14px;
+}
+
+.manual-review-hint {
+  margin-top: 6px;
+  color: #a36a00;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+:deep(.el-table .manual-review-row > td.el-table__cell) {
+  background: #fff8e6 !important;
+}
+
 .ontology-node {
   padding: 10px 12px;
   border: 1px solid #dfe9f3;
@@ -1411,6 +1597,41 @@ onMounted(async () => {
 
 .relation-source-field :deep(.el-select) {
   width: 100%;
+}
+
+.join-candidate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.join-candidate-item {
+  padding: 7px 8px;
+  border: 1px solid #dfe9f3;
+  border-radius: 6px;
+  background: #f8fbff;
+}
+
+.join-candidate-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.join-candidate-main code {
+  flex: 1;
+  min-width: 0;
+  color: #245b89;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.join-candidate-meta {
+  margin-top: 5px;
+  color: #6a7d91;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 @media (max-width: 960px) {

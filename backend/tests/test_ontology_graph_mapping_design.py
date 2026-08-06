@@ -110,6 +110,70 @@ class OntologyGraphMappingDesignTest(unittest.TestCase):
         self.assertEqual(normalized["entity_mappings"], [])
         self.assertEqual(normalized["relation_mappings"], [])
 
+    def test_rejects_different_primary_keys_and_accepts_shared_fk_pk_join(self) -> None:
+        entities = [
+            {
+                "entity_id": "bottle",
+                "entity_name": "BottleCode",
+                "properties": [
+                    {"property_name": "bottle_id", "is_primary_key": True},
+                    {"property_name": "product_id", "is_primary_key": False},
+                ],
+            },
+            {
+                "entity_id": "product",
+                "entity_name": "Product",
+                "properties": [{"property_name": "product_id", "is_primary_key": True}],
+            },
+        ]
+        relations = [{
+            "relation_id": "belongs",
+            "relation_name": "归属",
+            "source_entity_id": "bottle",
+            "target_entity_id": "product",
+        }]
+        base_edge_sql = "SELECT 1 AS EDGE_ID, 1 AS SOURCE_ID, 2 AS TARGET_ID FROM DUAL"
+        payload = {"relationMappings": [
+            {"relationId": "belongs", "joinCondition": "src.BOTTLE_ID = dst.PRODUCT_ID", "edgeSql": base_edge_sql},
+            {"relationId": "belongs", "joinCondition": "src.PRODUCT_ID = dst.PRODUCT_ID", "edgeSql": base_edge_sql},
+        ]}
+
+        normalized = self.llm_service._normalize_ontology_property_graph_mapping(
+            payload,
+            ontology_entities=entities,
+            ontology_relations=relations,
+            entity_mapping_results=[
+                {"entity_id": "bottle", "mappings": [{"propertyName": "bottle_id", "sourceColumn": "BOTTLE_ID"}, {"propertyName": "product_id", "sourceColumn": "PRODUCT_ID"}]},
+                {"entity_id": "product", "mappings": [{"propertyName": "product_id", "sourceColumn": "PRODUCT_ID"}]},
+            ],
+        )
+
+        self.assertEqual(1, len(normalized["relation_mappings"]))
+        self.assertEqual("src.PRODUCT_ID = dst.PRODUCT_ID", normalized["relation_mappings"][0]["join_condition"])
+
+    def test_injects_verified_fk_pk_candidate_when_llm_omits_relation(self) -> None:
+        entities = [
+            {"entity_id": "batch", "entity_name": "ProductionBatch", "properties": [{"property_name": "batch_id", "is_primary_key": True}, {"property_name": "product_id", "is_primary_key": False}]},
+            {"entity_id": "product", "entity_name": "Product", "properties": [{"property_name": "product_id", "is_primary_key": True}]},
+        ]
+        relations = [{"relation_id": "batch_product", "relation_name": "对应", "source_entity_id": "batch", "target_entity_id": "product"}]
+        mapping_results = [
+            {"entity_id": "batch", "mappings": [{"propertyName": "product_id", "sourceTable": "PRODUCTION_BATCH", "sourceColumn": "PRODUCT_ID"}]},
+            {"entity_id": "product", "mappings": [{"propertyName": "product_id", "sourceTable": "PRODUCT", "sourceColumn": "PRODUCT_ID"}]},
+        ]
+        candidates = self.llm_service._build_verified_direct_relation_candidates(entities, relations, mapping_results)
+        normalized = self.llm_service._normalize_ontology_property_graph_mapping(
+            {"relationMappings": []},
+            ontology_entities=entities,
+            ontology_relations=relations,
+            entity_mapping_results=mapping_results,
+            verified_direct_relation_candidates=candidates,
+        )
+
+        self.assertEqual("src.PRODUCT_ID = dst.PRODUCT_ID", candidates[0]["join_condition"])
+        self.assertEqual(1, len(normalized["relation_mappings"]))
+        self.assertEqual("src.PRODUCT_ID = dst.PRODUCT_ID", normalized["relation_mappings"][0]["join_condition"])
+
     def test_ddl_matches_reference_ctas_primary_key_edge_and_graph_pattern(self) -> None:
         unit = SysOntologyEntity(
             entity_id="ent_unit",

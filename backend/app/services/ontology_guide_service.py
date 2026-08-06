@@ -193,6 +193,11 @@ class OntologyGuideService:
             history_case_sources=history_case_sources,
         )
 
+        # LLM 自由生成不使用任何领域场景模板；固定为通用规则，避免旧的
+        # SFR 根因/缺陷场景标签造成“已切换生成策略但仍使用领域目标”的歧义。
+        if normalized_generation_strategy == "llm_first":
+            guide_context["business_scenario"] = "GENERAL_RULES"
+
         if normalized_generation_strategy == "structured_domain_pipeline":
             return await self._generate_with_structured_domain_pipeline(
                 domain_id=domain_id,
@@ -635,7 +640,15 @@ class OntologyGuideService:
                 semantic_patterns=chunk_patterns,
             )
             entity_candidate_results.extend(chunk_results)
-        raw_entity_candidates = self._merge_entity_candidate_results(entity_candidate_results)
+        # 仓库、门店等主数据是供应链分析的稳定锚点。即使 LLM 将首期
+        # 范围收敛到交易或过程对象，也不能把这类已选且有稳定主键的表静默丢弃。
+        mandatory_master_entities = self._build_mandatory_master_entity_candidates(
+            selected_table_schema=selected_table_schema,
+            table_roles=table_roles,
+        )
+        raw_entity_candidates = self._merge_entity_candidate_results(
+            entity_candidate_results + ([{"entity_candidates": mandatory_master_entities}] if mandatory_master_entities else [])
+        )
         entity_candidates = self._filter_entity_candidates_by_design_document(
             raw_entity_candidates,
             ontology_design_document,
@@ -733,6 +746,7 @@ class OntologyGuideService:
                 "context_window_tokens": runtime_limits.get("context_window_tokens"),
                 "raw_entity_candidate_count": len(raw_entity_candidates),
                 "filtered_entity_candidate_count": len(entity_candidates),
+                "mandatory_master_entity_count": len(mandatory_master_entities),
                 "raw_relation_candidate_count": len(raw_relation_candidates),
                 "filtered_relation_candidate_count": len(relation_candidates),
             },
@@ -2440,6 +2454,81 @@ class OntologyGuideService:
             return second_level
         return first_level if first_level in order else "MEDIUM"
 
+    def _build_mandatory_master_entity_candidates(
+        self,
+        selected_table_schema: Dict[str, Any],
+        table_roles: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return deterministic candidates for selected warehouse/store master tables."""
+        role_by_table = {
+            (item.get("table_name") or "").strip().upper(): (item.get("source_role") or "").strip().lower()
+            for item in table_roles
+            if isinstance(item, dict)
+        }
+        candidates: List[Dict[str, Any]] = []
+        for table in selected_table_schema.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            table_name = (table.get("table_name") or "").strip().upper()
+            if not table_name or not any(token in table_name for token in ("WAREHOUSE", "STORE", "RETAIL")):
+                continue
+            primary_keys = [str(item).strip().upper() for item in (table.get("primary_keys") or []) if str(item).strip()]
+            if not primary_keys:
+                continue
+            columns = [item for item in (table.get("columns") or []) if isinstance(item, dict) and item.get("column_name")]
+            column_by_name = {(item.get("column_name") or "").strip().upper(): item for item in columns}
+            primary_key = primary_keys[0]
+            if primary_key not in column_by_name:
+                continue
+            entity_name = self._master_entity_name_from_table(table_name)
+            display_name = "仓库" if "WAREHOUSE" in table_name else ("零售门店" if "RETAIL" in table_name else "门店")
+            selected_columns = [column_by_name[primary_key]]
+            for column in columns:
+                column_name = (column.get("column_name") or "").strip().upper()
+                if column_name == primary_key or len(selected_columns) >= 8:
+                    continue
+                if any(token in column_name for token in ("NAME", "CODE", "TYPE", "ADDRESS", "REGION", "CITY", "STATUS")):
+                    selected_columns.append(column)
+            properties = [
+                {
+                    "propertyName": self._property_name_from_column(column.get("column_name") or ""),
+                    "propertyDisplayName": (column.get("comments") or column.get("column_name") or "").strip(),
+                    "propertyDesc": f"来自主数据表 {table_name} 的 {column.get('column_name')}",
+                    "dataType": (column.get("data_type") or "VARCHAR2").strip().upper(),
+                    "isPrimaryKey": "Y" if (column.get("column_name") or "").strip().upper() in primary_keys else "N",
+                    "isNullable": (column.get("nullable") or "Y").strip().upper()[:1] or "Y",
+                    "sourceTable": table_name,
+                    "sourceColumn": (column.get("column_name") or "").strip().upper(),
+                    "sourceDataType": (column.get("data_type") or "VARCHAR2").strip().upper(),
+                    "mappingType": "DIRECT",
+                    "formula": None,
+                }
+                for column in selected_columns
+            ]
+            candidates.append({
+                "entityName": entity_name,
+                "entityDisplayName": display_name,
+                "entityDesc": f"由业务主数据表 {table_name} 直接映射的{display_name}实体。",
+                "candidateLevel": "HIGH",
+                "buildType": "TABLE",
+                "sourceHints": [table_name],
+                "sourceRoles": [role_by_table.get(table_name) or "entity_master"],
+                "properties": properties,
+                "mandatory_master_entity": True,
+            })
+        return candidates
+
+    @staticmethod
+    def _master_entity_name_from_table(table_name: str) -> str:
+        ignored = {"DIM", "DIMENSION", "TB", "TBL", "MST", "MASTER"}
+        tokens = [item for item in re.split(r"[^A-Z0-9]+", table_name.upper()) if item and item not in ignored]
+        return "".join(token.title() for token in tokens) or "MasterData"
+
+    @staticmethod
+    def _property_name_from_column(column_name: str) -> str:
+        tokens = [item.lower() for item in re.split(r"[^A-Za-z0-9]+", str(column_name or "")) if item]
+        return "_".join(tokens) or "id"
+
     def _filter_entity_candidates_by_design_document(
         self,
         entity_candidates: List[Dict[str, Any]],
@@ -2457,7 +2546,8 @@ class OntologyGuideService:
             return entity_candidates
         filtered = [
             item for item in entity_candidates
-            if (item.get("entityName") or "").strip().lower() in allowed_names
+            if item.get("mandatory_master_entity")
+            or (item.get("entityName") or "").strip().lower() in allowed_names
         ]
         logger.info(
             "Guide entity candidates filtered by design document: before=%s after=%s allowed=%s",

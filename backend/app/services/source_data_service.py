@@ -4,7 +4,6 @@ from typing import Optional, List, Dict, Any
 import re
 import time
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
 from app.core.logging import get_logger
 from app.models.models import SysOperationLog, SysDataSource, SysDomain, generate_id
 
@@ -155,12 +154,7 @@ class SourceDataService:
             .filter(SysDataSource.is_active == "Y")
         )
         if domain_id:
-            query = query.filter(
-                or_(
-                    SysDataSource.business_domain_id == domain_id,
-                    SysDataSource.business_domain_id.is_(None),
-                )
-            )
+            query = query.filter(SysDataSource.business_domain_id == domain_id)
         sources = query.order_by(SysDataSource.is_default.desc(), SysDataSource.created_at.desc()).all()
         return [
             {
@@ -1045,6 +1039,58 @@ class SourceDataService:
 
         return self._run_with_remote_retry(source, f"preview_remote_select_sql:{source_id}", action)
 
+    def profile_remote_join(
+        self,
+        source_id: str,
+        source_table: str,
+        source_column: str,
+        target_table: str,
+        target_column: str,
+        schema: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return real-data evidence for one simple source-to-target join."""
+        identifiers = [source_table, source_column, target_table, target_column]
+        if not all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_$#]{0,127}", (item or "").strip()) for item in identifiers):
+            raise ValueError("关联表名和字段名只能使用 Oracle 标识符")
+        source = self._get_data_source(source_id)
+        src_table, src_column, dst_table, dst_column = [item.strip().upper() for item in identifiers]
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "join_profile_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            profile_sql = f"""
+                SELECT
+                    (SELECT COUNT(*) FROM {src_table} src WHERE src.{src_column} IS NOT NULL) AS SOURCE_NON_NULL_COUNT,
+                    (SELECT COUNT(*) FROM {dst_table} dst WHERE dst.{dst_column} IS NOT NULL) AS TARGET_NON_NULL_COUNT,
+                    (SELECT COUNT(*) FROM {src_table} src JOIN {dst_table} dst ON src.{src_column} = dst.{dst_column}) AS MATCHED_COUNT,
+                    (SELECT COUNT(*) FROM {src_table} src WHERE src.{src_column} IS NOT NULL AND EXISTS (SELECT 1 FROM {dst_table} dst WHERE dst.{dst_column} = src.{src_column})) AS MATCHED_SOURCE_RECORD_COUNT,
+                    (SELECT COUNT(*) FROM {dst_table} dst WHERE dst.{dst_column} IS NOT NULL AND EXISTS (SELECT 1 FROM {src_table} src WHERE src.{src_column} = dst.{dst_column})) AS MATCHED_TARGET_RECORD_COUNT,
+                    (SELECT COUNT(DISTINCT src.{src_column}) FROM {src_table} src JOIN {dst_table} dst ON src.{src_column} = dst.{dst_column}) AS MATCHED_SOURCE_KEY_COUNT,
+                    (SELECT COUNT(DISTINCT dst.{dst_column}) FROM {src_table} src JOIN {dst_table} dst ON src.{src_column} = dst.{dst_column}) AS MATCHED_TARGET_KEY_COUNT
+                FROM dual
+            """
+            self._execute_remote_sql(cursor, source, profile_sql)
+            row = self._fetchone_logged(cursor, source, "join_profile") or (0, 0, 0, 0, 0, 0, 0)
+            source_count, target_count, matched, matched_source_records, matched_target_records, matched_source_keys, matched_target_keys = [int(value or 0) for value in row]
+            return {
+                "source_non_null_count": source_count,
+                "target_non_null_count": target_count,
+                "matched_count": matched,
+                "matched_source_record_count": matched_source_records,
+                "matched_target_record_count": matched_target_records,
+                "matched_source_key_count": matched_source_keys,
+                "matched_target_key_count": matched_target_keys,
+                "source_coverage": round(matched_source_records / source_count, 4) if source_count else 0,
+                "target_coverage": round(matched_target_records / target_count, 4) if target_count else 0,
+                "valid": matched > 0,
+                "schema": owner,
+            }
+
+        return self._run_with_remote_retry(source, f"profile_remote_join:{source_id}:{src_table}:{dst_table}", action)
+
     def execute_remote_graph_query(
         self,
         source_id: str,
@@ -1091,6 +1137,206 @@ class SourceDataService:
             }
 
         return self._run_with_remote_retry(source, f"execute_remote_graph_query:{source_id}", action)
+
+    def get_remote_property_graph_instances(
+        self,
+        source_id: str,
+        graph_name: str,
+        node_id: str,
+        property_name: Optional[str] = None,
+        operator: str = "contains",
+        value: Optional[str] = None,
+        row_limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Query deployed graph backing tables and return an instance subgraph.
+
+        Object and column identifiers are selected exclusively from Property Graph
+        metadata; only condition values are supplied by the caller as binds.
+        """
+        source = self._get_data_source(source_id)
+        topology = self.get_remote_property_graph_topology(source_id, graph_name, source.schema_name)
+        node = next((item for item in (topology.get("nodes") or []) if item.get("id") == node_id), None)
+        if not node:
+            raise ValueError("所选本体节点不属于当前 Property Graph")
+        table_name = str(node.get("tableName") or "")
+        if "." not in table_name:
+            raise ValueError("无法识别本体节点的底层对象表")
+        owner, raw_table_name = table_name.rsplit(".", 1)
+        columns = node.get("properties") or []
+        column_names = {str(item.get("property_name") or "").upper() for item in columns}
+        key_column = next(
+            (str(item.get("property_name") or "").upper() for item in columns if item.get("is_primary_key") == "Y"),
+            "",
+        )
+        if not key_column:
+            raise ValueError("所选本体节点未配置主键，无法展示实例关系")
+        selected_column = str(property_name or "").upper()
+        if selected_column and selected_column not in column_names:
+            raise ValueError("查询条件字段不属于所选本体节点")
+        normalized_operator = str(operator or "contains").lower()
+        if normalized_operator not in {"equals", "contains", "greater_than", "less_than"}:
+            raise ValueError("不支持的查询条件操作符")
+        limit = max(1, min(int(row_limit or 50), 100))
+        safe_owner = self._quote_identifier(owner)
+        safe_table = self._quote_identifier(raw_table_name)
+        where_sql = ""
+        binds: Dict[str, Any] = {}
+        if selected_column and str(value or "").strip():
+            safe_column = self._quote_identifier(selected_column)
+            if normalized_operator == "equals":
+                where_sql = f" WHERE {safe_column} = :condition_value"
+                binds["condition_value"] = value
+            elif normalized_operator == "contains":
+                where_sql = f" WHERE UPPER(TO_CHAR({safe_column})) LIKE UPPER(:condition_value)"
+                binds["condition_value"] = f"%{value}%"
+            elif normalized_operator == "greater_than":
+                where_sql = f" WHERE {safe_column} > :condition_value"
+                binds["condition_value"] = value
+            else:
+                where_sql = f" WHERE {safe_column} < :condition_value"
+                binds["condition_value"] = value
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, f"SELECT * FROM {safe_owner}.{safe_table}{where_sql} FETCH FIRST {limit} ROWS ONLY", binds)
+            result_columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = [
+                {result_columns[index]: self._normalize_cell_value(cell) for index, cell in enumerate(row)}
+                for row in self._fetchall_logged(cursor, source, "property_graph_instances")
+            ]
+            key_values = [row.get(key_column) for row in rows if row.get(key_column) is not None]
+            instance_nodes = [
+                {
+                    "id": f"{node_id}:{key_value}", "node_id": node_id,
+                    "label": node.get("displayName") or node.get("name"),
+                    "instance_label": self._instance_label(row, key_column), "properties": row,
+                    "selected": True,
+                }
+                for row, key_value in ((row, row.get(key_column)) for row in rows)
+                if key_value is not None
+            ]
+            instance_edges: List[Dict[str, Any]] = []
+            instance_index = {item["id"] for item in instance_nodes}
+            node_by_id = {item.get("id"): item for item in (topology.get("nodes") or [])}
+            if key_values:
+                bind_names = []
+                edge_binds: Dict[str, Any] = {}
+                for index, key_value in enumerate(key_values):
+                    bind_name = f"key_{index}"
+                    bind_names.append(f":{bind_name}")
+                    edge_binds[bind_name] = key_value
+                for edge in topology.get("edges") or []:
+                    is_source = edge.get("source") == node_id
+                    is_target = edge.get("target") == node_id
+                    if not (is_source or is_target):
+                        continue
+                    edge_table = str(edge.get("relationTableName") or "")
+                    if not edge_table:
+                        continue
+                    safe_edge_table = self._quote_identifier(edge_table.rsplit(".", 1)[-1])
+                    key_side = "SOURCE_ID" if is_source else "TARGET_ID"
+                    self._execute_remote_sql(
+                        cursor, source,
+                        f"SELECT SOURCE_ID, TARGET_ID FROM {safe_owner}.{safe_edge_table} WHERE {key_side} IN ({', '.join(bind_names)}) FETCH FIRST {limit * 3} ROWS ONLY",
+                        edge_binds,
+                    )
+                    for source_id, target_id in self._fetchall_logged(cursor, source, "property_graph_instance_edges"):
+                        local_value, remote_value = (source_id, target_id) if is_source else (target_id, source_id)
+                        local_id = f"{node_id}:{local_value}"
+                        remote_node_id = edge.get("target") if is_source else edge.get("source")
+                        remote_id = f"{remote_node_id}:{remote_value}"
+                        if local_id not in instance_index:
+                            continue
+                        if remote_id not in instance_index:
+                            remote_node = node_by_id.get(remote_node_id) or {}
+                            instance_nodes.append({
+                                "id": remote_id, "node_id": remote_node_id,
+                                "label": remote_node.get("displayName") or remote_node.get("name") or "关联节点",
+                                "instance_label": str(remote_value), "properties": {}, "selected": False,
+                            })
+                            instance_index.add(remote_id)
+                        instance_edges.append({
+                            "id": f"{edge.get('id')}:{source_id}:{target_id}", "source": f"{edge.get('source')}:{source_id}",
+                            "target": f"{edge.get('target')}:{target_id}", "edge_id": edge.get("id"), "label": edge.get("name") or "关联",
+                        })
+            return {"graph_name": topology.get("graph_name"), "node": node, "rows": rows, "nodes": instance_nodes, "edges": instance_edges}
+
+        return self._run_with_remote_retry(source, f"get_property_graph_instances:{source_id}:{graph_name}", action)
+
+    def get_remote_property_graph_instance_lineage(
+        self, source_id: str, graph_name: str, node_id: str, instance_key: str, max_depth: int = 12,
+    ) -> Dict[str, Any]:
+        """Expand one instance across all reachable upstream/downstream graph entities."""
+        source = self._get_data_source(source_id)
+        topology = self.get_remote_property_graph_topology(source_id, graph_name, source.schema_name)
+        nodes_by_id = {item.get("id"): item for item in topology.get("nodes") or []}
+        if node_id not in nodes_by_id:
+            raise ValueError("所选实例不属于当前 Property Graph")
+        depth_limit = max(1, min(int(max_depth or 12), 20))
+
+        def key_column(node: Dict[str, Any]) -> str:
+            return next((str(item.get("property_name") or "").upper() for item in node.get("properties") or [] if item.get("is_primary_key") == "Y"), "")
+
+        def action(_connection, cursor):
+            pending = [(node_id, instance_key, 0)]
+            visited = set()
+            result_nodes: List[Dict[str, Any]] = []
+            result_edges: List[Dict[str, Any]] = []
+            node_ids = set()
+            edge_ids = set()
+            while pending and len(visited) < 400:
+                current_node_id, current_key, depth = pending.pop(0)
+                visit_key = (current_node_id, str(current_key))
+                if visit_key in visited:
+                    continue
+                visited.add(visit_key)
+                current_node = nodes_by_id.get(current_node_id) or {}
+                current_table = str(current_node.get("tableName") or "")
+                current_pk = key_column(current_node)
+                if not current_pk or "." not in current_table:
+                    continue
+                owner, table = current_table.rsplit(".", 1)
+                self._execute_remote_sql(
+                    cursor, source,
+                    f"SELECT * FROM {self._quote_identifier(owner)}.{self._quote_identifier(table)} WHERE {self._quote_identifier(current_pk)} = :instance_key FETCH FIRST 1 ROWS ONLY",
+                    {"instance_key": current_key},
+                )
+                column_names = [desc[0] for desc in cursor.description] if cursor.description else []
+                row = self._fetchone_logged(cursor, source, "property_graph_lineage_node")
+                properties = {column_names[index]: self._normalize_cell_value(value) for index, value in enumerate(row)} if row else {}
+                visual_id = f"{current_node_id}:{current_key}"
+                if visual_id not in node_ids:
+                    result_nodes.append({"id": visual_id, "node_id": current_node_id, "label": current_node.get("displayName") or current_node.get("name"), "instance_label": self._instance_label(properties, current_pk), "properties": properties, "selected": current_node_id == node_id and str(current_key) == str(instance_key)})
+                    node_ids.add(visual_id)
+                if depth >= depth_limit:
+                    continue
+                for edge in topology.get("edges") or []:
+                    is_source = edge.get("source") == current_node_id
+                    is_target = edge.get("target") == current_node_id
+                    if not (is_source or is_target):
+                        continue
+                    edge_table = str(edge.get("relationTableName") or "")
+                    if not edge_table:
+                        continue
+                    side = "SOURCE_ID" if is_source else "TARGET_ID"
+                    self._execute_remote_sql(cursor, source, f"SELECT SOURCE_ID, TARGET_ID FROM {self._quote_identifier(owner)}.{self._quote_identifier(edge_table.rsplit('.', 1)[-1])} WHERE {side} = :instance_key FETCH FIRST 100 ROWS ONLY", {"instance_key": current_key})
+                    for source_key, target_key in self._fetchall_logged(cursor, source, "property_graph_lineage_edges"):
+                        next_node_id, next_key = (edge.get("target"), target_key) if is_source else (edge.get("source"), source_key)
+                        relation_id = f"{edge.get('id')}:{source_key}:{target_key}"
+                        if relation_id not in edge_ids:
+                            result_edges.append({"id": relation_id, "edge_id": edge.get("id"), "source": f"{edge.get('source')}:{source_key}", "target": f"{edge.get('target')}:{target_key}", "label": edge.get("name") or "关联"})
+                            edge_ids.add(relation_id)
+                        if (next_node_id, str(next_key)) not in visited:
+                            pending.append((next_node_id, next_key, depth + 1))
+            return {"graph_name": topology.get("graph_name"), "nodes": result_nodes, "edges": result_edges, "max_depth": depth_limit}
+        return self._run_with_remote_retry(source, f"get_property_graph_lineage:{source_id}:{graph_name}", action)
+
+    @staticmethod
+    def _instance_label(row: Dict[str, Any], key_column: str) -> str:
+        preferred = ["NAME", "CODE", "NO", "NUMBER", "ID"]
+        for column_name, cell in row.items():
+            if column_name.upper() != key_column and any(token in column_name.upper() for token in preferred) and cell is not None:
+                return str(cell)
+        return str(row.get(key_column) or "实例")
 
     async def generate_remote_table_comment_suggestions(
         self,
@@ -1226,12 +1472,7 @@ class SourceDataService:
     def _get_default_data_source(self, domain_id: Optional[str] = None) -> Optional[SysDataSource]:
         query = self.db.query(SysDataSource).filter(SysDataSource.is_active == "Y")
         if domain_id:
-            query = query.filter(
-                or_(
-                    SysDataSource.business_domain_id == domain_id,
-                    SysDataSource.business_domain_id.is_(None),
-                )
-            )
+            query = query.filter(SysDataSource.business_domain_id == domain_id)
         return query.order_by(SysDataSource.is_default.desc(), SysDataSource.created_at.desc()).first()
 
     def _score_table_for_mapping(

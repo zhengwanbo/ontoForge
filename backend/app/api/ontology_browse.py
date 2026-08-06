@@ -2,15 +2,70 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
-from app.schemas.schemas import ApiResponse, CommentsUpdateRequest, SourceDataQueryRequest, SourceDataResponse
+from app.schemas.schemas import ApiResponse, CommentsUpdateRequest, SourceDataQueryRequest, SourceDataResponse, GraphInstanceQueryRequest, GraphInstanceLineageRequest
 from app.models.models import SysDataSource, SysOntologyEntity, SysOntologyRelation, SysOntologyProperty, SysDomain
 from app.services.source_data_service import SourceDataService
 
 router = APIRouter(prefix="/ontology", tags=["本体浏览管理"])
 
+
+def _normalize_object_name(value: str | None) -> str:
+    """Compare Oracle object names regardless of owner, quoting, or case."""
+    normalized = str(value or "").strip().replace('"', "").upper()
+    return normalized.rsplit(".", 1)[-1]
+
+
+def _enrich_topology_display_names(
+    topology: dict,
+    entities: list[SysOntologyEntity],
+    relations: list[SysOntologyRelation],
+) -> dict:
+    """Use platform ontology metadata as the display layer for deployed graphs."""
+    entity_by_table: dict[str, SysOntologyEntity] = {}
+    for entity in entities:
+        candidates = [entity.table_name]
+        if entity.entity_name:
+            candidates.extend([
+                f"ONTO_NODE_{entity.entity_name.upper()}",
+                f"ONTO_NODE_{entity.entity_name.upper()}_V",
+            ])
+        for table_name in candidates:
+            normalized = _normalize_object_name(table_name)
+            if normalized:
+                entity_by_table[normalized] = entity
+
+    relation_by_table = {
+        _normalize_object_name(relation.relation_table_name): relation
+        for relation in relations
+        if _normalize_object_name(relation.relation_table_name)
+    }
+
+    for node in topology.get("nodes") or []:
+        entity = entity_by_table.get(_normalize_object_name(node.get("tableName")))
+        if not entity:
+            continue
+        technical_name = node.get("displayName") or node.get("name")
+        node["displayName"] = entity.entity_display_name or entity.entity_name or technical_name
+        node["technicalName"] = technical_name
+        node["entityId"] = entity.entity_id
+        node["entityName"] = entity.entity_name
+
+    for edge in topology.get("edges") or []:
+        relation = relation_by_table.get(_normalize_object_name(edge.get("relationTableName")))
+        if not relation:
+            continue
+        technical_name = edge.get("name") or edge.get("relationTableName")
+        edge["name"] = relation.relation_name or relation.relation_type or technical_name
+        edge["technicalName"] = technical_name
+        edge["relationId"] = relation.relation_id
+
+    return topology
+
+
 @router.get("/graph", response_model=ApiResponse)
 async def get_ontology_graph(
     source_id: str = Query(..., description="执行 DDL 的目标对象数据库"),
+    domain_id: str = Query(..., description="当前全局业务分析域"),
     graph_name: str | None = Query(default=None, description="Oracle Property Graph 名称"),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
@@ -24,6 +79,8 @@ async def get_ontology_graph(
         raise HTTPException(status_code=400, detail="目标对象数据库不存在或未启用")
     if (source.db_type or "").lower() != "oracle":
         raise HTTPException(status_code=400, detail="本体图谱浏览当前仅支持 Oracle 数据源")
+    if source.business_domain_id != domain_id:
+        raise HTTPException(status_code=400, detail="目标对象数据库不属于当前业务分析域")
     try:
         topology = SourceDataService(db).get_remote_property_graph_topology(
             source_id=source_id,
@@ -34,7 +91,59 @@ async def get_ontology_graph(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"读取 Oracle Property Graph 元数据失败: {str(exc)}")
+    entity_query = db.query(SysOntologyEntity)
+    relation_query = db.query(SysOntologyRelation)
+    if source.business_domain_id:
+        entity_query = entity_query.filter(SysOntologyEntity.domain_id == source.business_domain_id)
+        relation_query = relation_query.filter(SysOntologyRelation.domain_id == source.business_domain_id)
+    # 部分历史数据源尚未绑定分析域。此时仍可根据已部署节点/边表的
+    # 精确名称反查平台元数据，让图谱浏览显示中文名；未命中的对象保留
+    # Oracle 原始 Label，不会被错误覆盖。
+    topology = _enrich_topology_display_names(
+        topology,
+        entity_query.all(),
+        relation_query.all(),
+    )
     return ApiResponse(data=topology)
+
+
+@router.post("/graph/instances", response_model=ApiResponse)
+async def query_ontology_graph_instances(
+    req: GraphInstanceQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    source = db.query(SysDataSource).filter(
+        SysDataSource.source_id == req.source_id,
+        SysDataSource.is_active == "Y",
+    ).first()
+    if not source or source.business_domain_id != req.domain_id:
+        raise HTTPException(status_code=400, detail="目标对象数据库不属于当前业务分析域")
+    try:
+        data = SourceDataService(db).get_remote_property_graph_instances(
+            source_id=req.source_id, graph_name=req.graph_name, node_id=req.node_id,
+            property_name=req.property_name, operator=req.operator, value=req.value,
+            row_limit=req.row_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取图谱实例失败: {str(exc)}")
+    return ApiResponse(data=data)
+
+
+@router.post("/graph/instances/lineage", response_model=ApiResponse)
+async def query_ontology_graph_instance_lineage(req: GraphInstanceLineageRequest, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    source = db.query(SysDataSource).filter(SysDataSource.source_id == req.source_id, SysDataSource.is_active == "Y").first()
+    if not source or source.business_domain_id != req.domain_id:
+        raise HTTPException(status_code=400, detail="目标对象数据库不属于当前业务分析域")
+    try:
+        data = SourceDataService(db).get_remote_property_graph_instance_lineage(req.source_id, req.graph_name, req.node_id, req.instance_key, req.max_depth)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取图谱实例链路失败: {str(exc)}")
+    return ApiResponse(data=data)
 
 
 @router.put("/tables/{table_name}/comments", response_model=ApiResponse)

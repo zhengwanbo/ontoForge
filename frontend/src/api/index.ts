@@ -123,8 +123,10 @@ export const relationApi = {
 // ====== Graph API ======
 export const graphApi = {
   getOntologyGraph: (domainId: string) => api.get(`/domains/${domainId}/graph`),
-  getOntologyBrowseGraph: (sourceId: string, graphName?: string) =>
-    api.get('/ontology/graph', { params: { source_id: sourceId, graph_name: graphName || undefined } }),
+  getOntologyBrowseGraph: (sourceId: string, graphName: string | undefined, domainId: string) =>
+    api.get('/ontology/graph', { params: { source_id: sourceId, graph_name: graphName || undefined, domain_id: domainId } }),
+  queryOntologyGraphInstances: (data: any) => api.post('/ontology/graph/instances', data),
+  queryOntologyGraphInstanceLineage: (data: any) => api.post('/ontology/graph/instances/lineage', data),
   clearOntologyData: (domainId: string) => api.delete(`/domains/${domainId}/ontology-data`),
   generateOntologyGuide: (domainId: string, data: any) => api.post(`/domains/${domainId}/guide/generate`, data, {
     timeout: 900000
@@ -177,6 +179,7 @@ export const mappingApi = {
   getPropertyMappings: (entityId: string) => api.get(`/mapping/entities/${entityId}/mappings`),
   updatePropertyMapping: (propertyId: string, data: any) => api.put(`/mapping/properties/${propertyId}/mapping`, data),
   getRelationMapping: (relationId: string) => api.get(`/mapping/relations/${relationId}/mapping`),
+  analyzeRelationJoin: (relationId: string, data: any) => api.post(`/mapping/relations/${relationId}/join-analysis`, data),
   createRelationMapping: (relationId: string, data: any) => api.post(`/mapping/relations/${relationId}/mapping`, data),
   updateRelationMapping: (relationId: string, data: any) => api.put(`/mapping/relations/${relationId}/mapping`, data),
   previewRelationEdgeSql: (data: any) => api.post('/mapping/relations/edge-sql/preview', data),
@@ -200,7 +203,8 @@ export const ddlApi = {
     timeout: 300000
   }),
   execute: (domainId: string, data: any) => api.post(`/ddl/domains/${domainId}/execute`, data),
-  getLogs: (domainId?: string) => api.get('/ddl/logs', { params: { domain_id: domainId } })
+  getLogs: (domainId?: string) => api.get('/ddl/logs', { params: { domain_id: domainId } }),
+  getLogDetails: (logId: string) => api.get(`/ddl/logs/${logId}/details`)
 }
 
 // ====== Browse API ======

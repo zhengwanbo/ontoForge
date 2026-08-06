@@ -241,6 +241,11 @@ class RelationMappingCreate(BaseModel):
     target_table: Optional[str] = None
     join_condition: Optional[str] = None
     edge_sql: Optional[str] = None
+    mapping_mode: str = "DIRECT"
+    relation_table: Optional[str] = None
+    relation_source_column: Optional[str] = None
+    relation_target_column: Optional[str] = None
+    edge_property_columns_json: Optional[str] = None
 
 
 class RelationMappingUpdate(BaseModel):
@@ -250,6 +255,11 @@ class RelationMappingUpdate(BaseModel):
     join_condition: Optional[str] = None
     edge_sql: Optional[str] = None
     mapping_status: Optional[str] = None
+    mapping_mode: Optional[str] = None
+    relation_table: Optional[str] = None
+    relation_source_column: Optional[str] = None
+    relation_target_column: Optional[str] = None
+    edge_property_columns_json: Optional[str] = None
 
 
 class EdgeSqlPreviewRequest(BaseModel):
@@ -257,6 +267,15 @@ class EdgeSqlPreviewRequest(BaseModel):
     schema: Optional[str] = None
     edge_sql: str
     sample_limit: int = 5
+
+
+class RelationJoinAnalyzeRequest(BaseModel):
+    source_id: str
+    schema: Optional[str] = None
+    source_table: Optional[str] = None
+    target_table: Optional[str] = None
+    join_condition: Optional[str] = None
+    max_candidates: int = Field(default=8, ge=1, le=20)
 
 
 # ====== 分析流程 ======
@@ -454,12 +473,42 @@ class DDLLogResponse(BaseModel):
     execution_duration: Optional[float] = None
 
 
+class DDLStatementLogResponse(BaseModel):
+    sequence_no: int
+    statement: str
+    status: str
+    object_type: Optional[str] = None
+    object_name: Optional[str] = None
+    message: Optional[str] = None
+    error_message: Optional[str] = None
+
+
 class GraphQueryRequest(BaseModel):
     domain_id: str
     source_id: str
     schema: Optional[str] = None
     graph_sql: str
     row_limit: int = Field(default=200, ge=1, le=1000)
+
+
+class GraphInstanceQueryRequest(BaseModel):
+    domain_id: str
+    source_id: str
+    graph_name: str
+    node_id: str
+    property_name: Optional[str] = None
+    operator: str = "contains"  # equals / contains / greater_than / less_than
+    value: Optional[str] = None
+    row_limit: int = Field(default=50, ge=1, le=100)
+
+
+class GraphInstanceLineageRequest(BaseModel):
+    domain_id: str
+    source_id: str
+    graph_name: str
+    node_id: str
+    instance_key: str
+    max_depth: int = Field(default=12, ge=1, le=20)
 
 
 # ====== 源数据 ======
