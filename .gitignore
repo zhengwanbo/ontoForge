@@ -1,0 +1,14 @@
+backend/.env
+backend/.DS_Store
+.DS_Store
+backend/ontology_platform.db
+.tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+backend/.venv*/
+frontend/node_modules/
+frontend/dist/
+backend/.DS_Store
+.DS_Store
