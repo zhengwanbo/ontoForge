@@ -17,17 +17,48 @@ ontoForge 将制造现场的源数据、业务语义、本体模型和 Oracle Pr
 - **智能体构建**：围绕业务域、数据源和 Property Graph 创建、管理及测试智能体技能。
 - **平台管理**：提供登录鉴权、用户管理、LLM 配置、数据源连通性测试与操作日志。
 
-## 架构
+## 前后端技术架构
+
+### 前端：交互与可视化层
+
+`frontend/` 是基于 Vue 3 的单页应用，负责业务建模、映射编辑、图谱可视化和系统配置等交互。
+
+| 模块 | 实现与职责 |
+| --- | --- |
+| 页面与组件 | Vue 3 SFC + TypeScript；`src/views/` 按源数据、业务建模、映射、DDL、图谱浏览、智能体和系统管理分组 |
+| 路由与权限 | Vue Router；路由守卫根据浏览器中的 JWT 判断登录态 |
+| 状态与界面 | Pinia 管理共享状态，Element Plus 提供管理端 UI 组件 |
+| 图与编辑器 | Vue Flow 展示/编辑图谱关系，CodeMirror 用于 SQL 编辑与预览 |
+| 服务访问 | Axios 统一封装；浏览器请求使用相对路径 `/api/v1`，自动附带 `Authorization: Bearer <JWT>` |
+
+### 后端：领域服务与接口层
+
+`backend/` 是 FastAPI 服务，向前端提供 REST API，并编排本体、映射、DDL、图查询和智能体等领域能力。
+
+| 模块 | 实现与职责 |
+| --- | --- |
+| API | `app/api/` 按业务域拆分路由，统一挂载在 `/api/v1` |
+| 服务 | `app/services/` 实现本体生成、数据映射、DDL 生成/执行、源数据访问、LLM 调用和智能体技能逻辑 |
+| 数据模型 | SQLAlchemy 管理平台元数据；Pydantic 负责请求、响应与校验模型 |
+| 安全与运行 | JWT 鉴权、bcrypt 密码哈希、CORS、请求日志；Uvicorn 作为 ASGI 服务进程 |
+
+### 数据与集成层
+
+- **Oracle 平台库**：保存业务域、本体、映射、DDL 日志、用户和系统配置等平台元数据。
+- **Oracle 源数据与 Property Graph**：读取制造源表；根据已确认映射生成节点/边并部署 Property Graph；图谱浏览从 Oracle `ALL_PG_*` 数据字典视图读取拓扑。
+- **LLM 服务**：由系统管理中的 LLM 配置接入，用于对象标注、本体引导和映射辅助；密钥应仅保存在数据库或受控环境配置中。
+
+### 运行时调用链
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ Vue 3 + TypeScript + Vite + Element Plus                    │
+│ 浏览器：Vue 3 + TypeScript + Vite + Element Plus             │
 │ 业务建模 │ 数据映射 │ 图谱浏览/查询 │ 智能体 │ 系统管理       │
 └───────────────────────────┬─────────────────────────────────┘
-                            │ HTTP / JSON
+                            │ /api/v1 · HTTP / JSON · JWT
 ┌───────────────────────────▼─────────────────────────────────┐
-│ FastAPI + SQLAlchemy + Pydantic                              │
-│ 本体 │ 映射 │ DDL │ Oracle Property Graph │ LLM │ 鉴权       │
+│ FastAPI：路由 │ 服务 │ SQLAlchemy │ Pydantic │ 鉴权           │
+│ 本体 │ 映射 │ DDL │ Oracle Property Graph │ LLM             │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -45,7 +76,7 @@ ontoForge 将制造现场的源数据、业务语义、本体模型和 Oracle Pr
 | 数据库 | Oracle Database、python-oracledb、Oracle Property Graph |
 | AI 集成 | OpenAI Python SDK（通过平台 LLM 配置使用） |
 
-## 快速开始
+## 本地运行：前后端联调
 
 ### 前置条件
 
@@ -53,7 +84,13 @@ ontoForge 将制造现场的源数据、业务语义、本体模型和 Oracle Pr
 - Node.js 20+
 - 可访问的 Oracle 数据库；如使用图谱浏览，需要目标库支持 Oracle Property Graph
 
-### 1. 配置后端
+### 1. 准备 Oracle 数据库
+
+请先准备一个可访问的 Oracle 服务，并确保运行平台的账号具有创建和读取平台元数据所需的权限。图谱浏览还需要当前数据源账号能够读取 `ALL_PG_*` Property Graph 数据字典视图。
+
+> 不建议使用 DBA 或生产超级管理员账号作为日常应用连接账号。
+
+### 2. 配置并启动后端
 
 ```sh
 cd backend
@@ -76,9 +113,13 @@ CORS_ORIGINS=["http://localhost:5173"]
 uvicorn app.main:app --reload
 ```
 
-默认地址为 `http://127.0.0.1:8000`；健康检查接口为 `GET /health`，OpenAPI 文档为 `http://127.0.0.1:8000/api/v1/docs`。
+后端启动后会监听 `http://127.0.0.1:8000`：
 
-### 2. 启动前端
+- 健康检查：`GET http://127.0.0.1:8000/health`
+- OpenAPI 文档：`http://127.0.0.1:8000/api/v1/docs`
+- API 基础路径：`http://127.0.0.1:8000/api/v1`
+
+### 3. 配置并启动前端
 
 另开一个终端：
 
@@ -88,9 +129,24 @@ npm install
 npm run dev
 ```
 
-打开 Vite 输出的本地地址（通常为 `http://localhost:5173`）。
+前端默认运行在 `http://localhost:5173`。Vite 已配置开发代理：
 
-### 3. 推荐使用流程
+```text
+浏览器 http://localhost:5173/api/v1/*
+  └─ Vite 开发服务器代理
+       └─ http://localhost:8000/api/v1/*
+```
+
+因此，本地开发时无需在前端另行设置 API 地址；请保持后端运行在 `8000` 端口。若修改后端端口，则同步修改 `frontend/vite.config.ts` 中 `/api` 的代理目标，并将新前端地址加入后端 `CORS_ORIGINS`。
+
+### 4. 联调检查
+
+1. 在浏览器打开 `http://localhost:5173`，应进入登录页。
+2. 使用本地初始化账号登录后，浏览系统管理、业务对象构建等页面。
+3. 打开浏览器开发者工具的 Network 面板，确认接口请求为 `/api/v1/...` 且返回 2xx。
+4. 如访问失败，先检查 `http://127.0.0.1:8000/health`，再检查 Oracle 连接串、用户权限和前端代理端口。
+
+### 5. 推荐使用流程
 
 1. 在“系统管理”配置 Oracle 数据源和 LLM 服务。
 2. 在“源数据管理”查看和标注数据对象。
