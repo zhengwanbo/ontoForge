@@ -4,12 +4,12 @@
       <div>
         <div class="banner-title">智能体测试</div>
         <div class="banner-desc">
-          选择已构建的 skill、目标本体对象数据库和 graph 表，验证 agent 是否能按既定业务流程完成数据准备、分析判断和输出动作。
+          选择技能管理中上传的 Skill 和目标数据源，以对话方式让 Agent 按 Skill 规则检索并分析数据；全过程与 SQL 可展开查看。
         </div>
       </div>
       <el-alert
-        title="当前测试为流程驱动验证"
-        description="系统会结合 skill 模板、流程节点、本体对象和 graph 表结构，生成执行轨迹、字段匹配和输出建议。"
+        title="当前测试为 Agent + 上传 Skill 执行"
+        description="Agent 会自动选择最相关的数据对象，仅执行受限只读采样 SQL，并将 Skill 加载、选表、数据检索和分析过程完整回放。"
         type="info"
         :closable="false"
         show-icon
@@ -21,14 +21,14 @@
         <template #header><span>测试配置</span></template>
 
         <el-form :model="form" label-width="96px">
-          <el-form-item label="分析域" required>
+          <el-form-item label="分析域">
             <el-select v-model="currentDomainId" placeholder="选择分析域" @change="handleDomainChange">
               <el-option v-for="item in domains" :key="item.domain_id" :label="item.domain_name" :value="item.domain_id" />
             </el-select>
           </el-form-item>
-          <el-form-item label="选择技能" required>
-            <el-select v-model="form.skill_id" placeholder="选择已构建 skill" filterable @change="handleSkillChange">
-              <el-option v-for="item in skills" :key="item.skill_id" :label="item.skill_name" :value="item.skill_id" />
+          <el-form-item label="上传 Skill" required>
+            <el-select v-model="form.managed_skill_id" placeholder="选择技能管理中上传的 Skill" filterable>
+              <el-option v-for="item in managedSkills" :key="item.managed_skill_id" :label="item.skill_name" :value="item.managed_skill_id" />
             </el-select>
           </el-form-item>
           <el-form-item label="测试模型" required>
@@ -47,186 +47,164 @@
             </el-select>
           </el-form-item>
           <el-form-item label="Schema">
-            <el-select v-model="form.schema" placeholder="选择 Schema" filterable clearable @change="loadTables">
+            <el-select v-model="form.schema" placeholder="选择 Schema（可选）" filterable clearable>
               <el-option v-for="item in schemas" :key="item" :label="item" :value="item" />
             </el-select>
           </el-form-item>
-          <el-form-item label="Graph 表" required>
-            <el-select v-model="form.graph_table" placeholder="选择 graph 表" filterable>
-              <el-option v-for="item in graphTables" :key="item.table_name" :label="formatTableLabel(item)" :value="item.table_name" />
-            </el-select>
+          <el-form-item label="读取记录数">
+            <el-input-number v-model="form.sample_limit" :min="1" :max="100" />
+            <span class="sample-limit-hint">默认 100 条，仅用于 Agent 的受限只读数据检索</span>
           </el-form-item>
-          <el-form-item label="测试问题">
-            <el-input
-              v-model="form.test_question"
-              type="textarea"
-              :rows="3"
-              placeholder="如：请判断该批次缺陷是否存在工艺异常，并给出优先排查方向"
-            />
-          </el-form-item>
-          <el-form-item label="额外输入">
-            <el-input
-              v-model="form.input_payload"
-              type="textarea"
-              :rows="4"
-              placeholder="可输入 JSON 或补充业务上下文，例如批次号、时间窗口、人工备注等"
-            />
-          </el-form-item>
-          <el-form-item label="采样行数">
-            <el-input-number v-model="form.sample_limit" :min="1" :max="10" />
-          </el-form-item>
+          <el-alert title="无需手工选择数据对象：启动后 Agent 会依据 Skill 和数据源自动选择对象。请在右侧对话框中自由提问。" type="info" :closable="false" class="object-selection-hint" />
         </el-form>
 
         <div class="test-actions">
           <el-button @click="loadAll">刷新</el-button>
-          <el-button type="primary" :loading="testing" @click="runTest">执行测试</el-button>
+          <el-button type="primary" @click="openTestDialog">执行测试</el-button>
         </div>
       </el-card>
 
       <div class="result-column">
         <el-card class="test-card" shadow="never">
           <template #header><span>技能信息</span></template>
-          <div v-if="selectedSkill" class="skill-profile">
-            <div class="skill-name">{{ selectedSkill.skill_name }}</div>
+          <div v-if="selectedManagedSkill" class="skill-profile">
+            <div class="skill-name">{{ selectedManagedSkill.skill_name }}</div>
             <div class="skill-meta">
-              <el-tag size="small" type="success">{{ selectedSkill.process_name }}</el-tag>
-              <el-tag size="small" effect="plain">{{ selectedSkill.entity_display_name || selectedSkill.entity_name }}</el-tag>
-              <el-tag size="small" :type="selectedSkill.status === 'ACTIVE' ? 'success' : selectedSkill.status === 'DRAFT' ? 'warning' : 'info'">
-                {{ selectedSkill.status }}
-              </el-tag>
+              <el-tag size="small" type="success">上传 Skill</el-tag>
+              <el-tag size="small" effect="plain">{{ selectedManagedSkill.package_filename }}</el-tag>
+              <el-tag size="small" :type="selectedManagedSkill.status === 'ACTIVE' ? 'success' : 'info'">{{ selectedManagedSkill.status }}</el-tag>
             </div>
-            <div class="skill-desc">{{ selectedSkill.skill_desc || '当前技能尚未补充说明。' }}</div>
+            <div class="skill-desc">{{ selectedManagedSkill.skill_desc || '当前技能尚未补充说明。' }}</div>
             <div class="skill-section">
-              <div class="section-title">构建模型</div>
-              <div>{{ selectedSkill.llm_config_name }} / {{ selectedSkill.llm_model_name }}</div>
-            </div>
-            <div class="skill-section">
-              <div class="section-title">分析目标</div>
-              <div>{{ selectedSkill.analysis_goal || '未设置' }}</div>
-            </div>
-            <div class="skill-section">
-              <div class="section-title">Prompt 模板</div>
-              <el-input :model-value="selectedSkill.prompt_template" type="textarea" :rows="10" readonly />
+              <div class="section-title">使用情况</div>
+              <div>包内文件 {{ selectedManagedSkill.file_count }} 个 · 已测试 {{ selectedManagedSkill.use_count }} 次</div>
             </div>
           </div>
-          <el-empty v-else description="选择 skill 后显示详情" :image-size="72" />
+          <el-empty v-else description="选择上传 Skill 后显示详情" :image-size="72" />
         </el-card>
 
         <el-card class="test-card" shadow="never">
-          <template #header><span>测试结果</span></template>
-          <div v-if="result">
-            <el-alert
-              v-for="item in result.warnings || []"
-              :key="item"
-              :title="item"
-              type="warning"
-              :closable="false"
-              show-icon
-              class="warning-item"
-            />
-
-            <div class="result-block">
-              <div class="section-title">执行摘要</div>
-              <div class="summary-box">{{ result.expected_output?.summary }}</div>
-              <div class="execution-model" v-if="result.execution_model">
-                测试模型：{{ result.execution_model.llm_config_name }} / {{ result.execution_model.llm_model_name }}
-              </div>
-              <div class="focus-list">
-                <el-tag v-for="item in result.expected_output?.focus_points || []" :key="item" size="small">{{ item }}</el-tag>
-              </div>
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">大模型执行结果</div>
-              <div class="llm-output-box">{{ result.agent_output }}</div>
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">流程执行轨迹</div>
-              <div class="trace-list">
-                <div v-for="item in result.process_trace || []" :key="item.step_no" class="trace-item">
-                  <div class="trace-step">{{ item.step_no }}</div>
-                  <div class="trace-body">
-                    <div class="trace-name">{{ item.step_name }} <span>{{ item.step_type }}</span></div>
-                    <div class="trace-action">{{ item.action }}</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">字段匹配</div>
-              <el-table :data="result.matched_columns || []" border stripe size="small" max-height="220">
-                <el-table-column prop="property_display_name" label="本体属性" min-width="120">
-                  <template #default="{ row }">{{ row.property_display_name || row.property_name }}</template>
-                </el-table-column>
-                <el-table-column prop="column_name" label="表字段" min-width="120" />
-                <el-table-column prop="data_type" label="类型" min-width="120" />
-                <el-table-column prop="column_comment" label="字段说明" min-width="180" />
-              </el-table>
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">建议 SQL</div>
-              <pre class="code-box">{{ result.suggested_sql }}</pre>
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">测试 Prompt</div>
-              <el-input :model-value="result.prompt_preview" type="textarea" :rows="12" readonly />
-            </div>
-
-            <div class="result-block">
-              <div class="section-title">Graph 表样例</div>
-              <el-table :data="result.table_preview?.sample_rows || []" border stripe size="small" max-height="240">
-                <el-table-column
-                  v-for="item in (result.table_preview?.columns || []).slice(0, 8)"
-                  :key="item.column_name"
-                  :prop="item.column_name"
-                  :label="item.column_name"
-                  min-width="120"
-                />
-              </el-table>
-            </div>
-          </div>
-          <el-empty v-else description="执行测试后显示流程回放与结果建议" :image-size="76" />
+          <template #header><span>测试历史</span></template>
+          <el-table v-if="testSessions.length" :data="testSessions" size="small" class="history-table" @row-click="openTestHistory">
+            <el-table-column prop="skill_name" label="Skill" min-width="150" show-overflow-tooltip />
+            <el-table-column prop="last_question" label="最近问题" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="message_count" label="消息" width="64" align="center" />
+            <el-table-column label="测试时间" min-width="145">
+              <template #default="{ row }">{{ formatDateTime(row.updated_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="72" fixed="right">
+              <template #default="{ row }"><el-link type="primary" @click.stop="openTestHistory(row)">查看</el-link></template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else description="暂无测试历史。完成一次对话后会自动保留记录。" :image-size="76" />
         </el-card>
       </div>
     </div>
+
+    <el-dialog v-model="dialogVisible" :title="`${historyView ? '测试历史' : 'Agent + Skill 对话测试'}${dialogSkillName ? ' · ' + dialogSkillName : ''}`" width="860px" :close-on-click-modal="false" :close-on-press-escape="!testing">
+      <div class="dialog-model" v-if="form.llm_config_id">测试模型：{{ llmConfigs.find(item => item.config_id === form.llm_config_id)?.config_name }}</div>
+      <div class="conversation-list dialog-conversation">
+        <el-empty v-if="!result?.conversation?.length" description="请输入客户问题，Agent 将按 Skill 检索并分析数据。" :image-size="70" />
+        <template v-else>
+          <div v-for="(message, index) in result.conversation" :key="index" class="conversation-message" :class="message.role">
+            <div class="conversation-role">{{ message.role === 'user' ? '客户' : 'Agent' }}</div>
+            <div class="llm-output-box">{{ message.content }}</div>
+            <div v-if="message.role === 'user' && index === latestUserMessageIndex && !result.pending && result.table_preview?.sample_rows?.length" class="data-answer-card">
+              <div class="data-answer-title">问数结果 · {{ result.table_preview.sample_rows.length }} 条</div>
+              <el-table :data="result.table_preview.sample_rows" border stripe size="small" max-height="280">
+                <el-table-column v-for="column in (result.table_preview.columns || []).slice(0, 12)" :key="column.column_name" :prop="column.column_name" :label="column.column_name" min-width="130" show-overflow-tooltip />
+              </el-table>
+            </div>
+            <div v-if="message.role === 'user' && index === latestUserMessageIndex && result.pending" class="agent-pending">
+              <el-icon class="is-loading"><Loading /></el-icon>
+              Agent 正在依据 Skill 执行 Oracle Graph 查询并分析数据…
+            </div>
+          </div>
+          <div v-if="!testing && result.agent_output" class="execution-entry">
+            <el-link type="primary" @click="processDialogVisible = true">查看本次对话执行流程</el-link>
+            <span>含执行摘要、选表依据与数据库 SQL</span>
+          </div>
+        </template>
+      </div>
+      <div v-if="!historyView" class="chat-composer">
+        <el-input v-model="chatInput" type="textarea" :rows="3" placeholder="请输入客户问题，按 Ctrl / ⌘ + Enter 发送" :disabled="testing" @keydown.ctrl.enter.prevent="sendMessage" @keydown.meta.enter.prevent="sendMessage" />
+        <el-button type="primary" :loading="testing" :disabled="!chatInput.trim()" @click="sendMessage">发送问题</el-button>
+      </div>
+    </el-dialog>
+
+    <el-dialog v-model="processDialogVisible" title="本次对话执行流程" width="860px" append-to-body>
+      <template v-if="result">
+        <el-alert v-for="item in result.warnings || []" :key="item" :title="item" type="warning" :closable="false" show-icon class="warning-item" />
+        <div class="result-block">
+          <div class="section-title">Agent 执行摘要</div>
+          <div class="summary-box">以下为本次对话可审计的执行摘要：Skill 加载、数据对象选择、数据读取与分析步骤。</div>
+          <div class="execution-model" v-if="result.execution_model">测试模型：{{ result.execution_model.llm_config_name }} / {{ result.execution_model.llm_model_name }}</div>
+        </div>
+        <div class="result-block">
+          <div class="section-title">执行步骤与决策依据</div>
+          <el-collapse class="trace-collapse">
+            <el-collapse-item v-for="item in result.execution_trace || []" :key="item.step_no" :name="item.step_no">
+              <template #title><span class="trace-title"><b>步骤 {{ item.step_no }}</b> · {{ item.title }} · <el-tag size="small" type="success">{{ item.status }}</el-tag></span></template>
+              <div class="trace-action">{{ item.detail }}</div>
+              <pre v-if="item.sql" class="code-box">{{ item.sql }}</pre>
+            </el-collapse-item>
+          </el-collapse>
+        </div>
+        <div class="result-block">
+          <div class="section-title">本次执行的 Oracle Graph SQL</div>
+          <div v-for="item in result.executed_queries || []" :key="item.sql" class="query-item">
+            <div>{{ item.purpose }}（返回 {{ item.row_count }} 行）</div>
+            <pre class="code-box">{{ item.sql }}</pre>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Loading } from '@element-plus/icons-vue'
 import { agentApi, domainApi, sourceApi, systemApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
 const appStore = useAppStore()
 
 const domains = ref<any[]>([])
-const skills = ref<any[]>([])
+const managedSkills = ref<any[]>([])
 const dataSources = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const schemas = ref<string[]>([])
-const graphTables = ref<any[]>([])
+const testSessions = ref<any[]>([])
 const result = ref<any>(null)
 const testing = ref(false)
+const dialogVisible = ref(false)
+const processDialogVisible = ref(false)
+const historyView = ref(false)
+const currentSessionId = ref('')
+const historySession = ref<any>(null)
 const currentDomainId = ref(appStore.currentDomainId || '')
 
 const form = ref({
-  skill_id: '',
+  managed_skill_id: '',
   llm_config_id: '',
   source_id: '',
   schema: '',
-  graph_table: '',
-  test_question: '',
-  input_payload: '',
-  sample_limit: 5
+  sample_limit: 100
 })
+const chatInput = ref('')
 
-const selectedSkill = computed(() => skills.value.find(item => item.skill_id === form.value.skill_id))
+const selectedManagedSkill = computed(() => managedSkills.value.find(item => item.managed_skill_id === form.value.managed_skill_id))
 const defaultTestModel = computed(() => llmConfigs.value.find(item => item.is_default === 'Y') || llmConfigs.value[0])
+const dialogSkillName = computed(() => historyView.value ? historySession.value?.skill_name : selectedManagedSkill.value?.skill_name)
+const latestUserMessageIndex = computed(() => {
+  const messages = result.value?.conversation || []
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user') return index
+  }
+  return -1
+})
 
 const loadDomains = async () => {
   try {
@@ -242,16 +220,16 @@ const loadDomains = async () => {
 
 const loadDomainResources = async () => {
   if (!currentDomainId.value) {
-    skills.value = []
+    managedSkills.value = []
     dataSources.value = []
     return
   }
   try {
     const [skillRes, sourceRes] = await Promise.all([
-      agentApi.listSkills(currentDomainId.value),
+      agentApi.listManagedSkills(),
       sourceApi.listDataSources(currentDomainId.value)
     ])
-    skills.value = skillRes.data || []
+    managedSkills.value = (skillRes.data || []).filter((item: any) => item.status === 'ACTIVE')
     dataSources.value = sourceRes.data || []
   } catch (e) {}
 }
@@ -282,99 +260,105 @@ const loadSchemas = async () => {
   } catch (e) {}
 }
 
-const loadTables = async () => {
-  if (!form.value.source_id) {
-    graphTables.value = []
-    return
-  }
-  try {
-    const res = await sourceApi.getRemoteTables(form.value.source_id, {
-      schema: form.value.schema || undefined
-    })
-    graphTables.value = res.data?.tables || []
-    if (form.value.graph_table && !graphTables.value.some((item: any) => item.table_name === form.value.graph_table)) {
-      form.value.graph_table = ''
-    }
-  } catch (e) {}
-}
-
 const loadAll = async () => {
   await loadDomains()
   await loadLLMConfigs()
   await loadDomainResources()
+  await loadTestSessions()
   if (form.value.source_id) {
     await loadSchemas()
-    await loadTables()
   }
+}
+
+const loadTestSessions = async () => {
+  try {
+    const res = await agentApi.listManagedSkillTestSessions()
+    testSessions.value = res.data || []
+  } catch (e) {}
 }
 
 const handleDomainChange = async (val: string) => {
   const domain = domains.value.find(item => item.domain_id === val)
   if (domain) appStore.setCurrentDomain(domain.domain_id, domain.domain_name)
-  form.value.skill_id = ''
+  form.value.managed_skill_id = ''
   result.value = null
+  currentSessionId.value = ''
   await loadDomainResources()
-}
-
-const handleSkillChange = async (val: string) => {
-  if (!val) return
-  try {
-    const res = await agentApi.getSkill(val)
-    const detail = res.data
-    const index = skills.value.findIndex(item => item.skill_id === val)
-    if (index >= 0) skills.value[index] = detail
-    if (detail?.llm_config_id && llmConfigs.value.some((item: any) => item.config_id === detail.llm_config_id)) {
-      form.value.llm_config_id = detail.llm_config_id
-    } else if (!form.value.llm_config_id) {
-      form.value.llm_config_id = defaultTestModel.value?.config_id || ''
-    }
-  } catch (e) {}
 }
 
 const handleSourceChange = async () => {
   form.value.schema = ''
-  form.value.graph_table = ''
-  graphTables.value = []
   await loadSchemas()
-  await loadTables()
 }
 
-const runTest = async () => {
-  if (!form.value.skill_id) { ElMessage.warning('请选择技能'); return }
+const openTestDialog = () => {
+  if (!form.value.managed_skill_id) { ElMessage.warning('请选择技能管理中上传的 Skill'); return }
   if (!form.value.llm_config_id) { ElMessage.warning('请选择测试模型'); return }
   if (!form.value.source_id) { ElMessage.warning('请选择对象数据库'); return }
-  if (!form.value.graph_table) { ElMessage.warning('请选择 graph 表'); return }
-  testing.value = true
   result.value = null
+  chatInput.value = ''
+  currentSessionId.value = ''
+  historySession.value = null
+  historyView.value = false
+  dialogVisible.value = true
+}
+
+const openTestHistory = async (row: any) => {
   try {
-    const res = await agentApi.testSkill(form.value.skill_id, {
+    const res = await agentApi.getManagedSkillTestSession(row.session_id)
+    historySession.value = res.data
+    result.value = res.data?.result || { conversation: res.data?.conversation || [] }
+    currentSessionId.value = row.session_id
+    historyView.value = true
+    chatInput.value = ''
+    dialogVisible.value = true
+  } catch (e) {}
+}
+
+const sendMessage = async () => {
+  const question = chatInput.value.trim()
+  if (!question) return
+  const previousResult = result.value
+  const previousConversation = previousResult?.conversation || []
+  testing.value = true
+  chatInput.value = ''
+  result.value = {
+    ...(previousResult || {}),
+    conversation: [...previousConversation, { role: 'user', content: question }],
+    pending: true
+  }
+  try {
+    const res = await agentApi.testManagedSkill(form.value.managed_skill_id, {
       llm_config_id: form.value.llm_config_id,
       source_id: form.value.source_id,
       schema: form.value.schema || null,
-      graph_table: form.value.graph_table,
-      test_question: form.value.test_question,
-      input_payload: form.value.input_payload,
-      sample_limit: form.value.sample_limit
+      test_question: question,
+      sample_limit: form.value.sample_limit,
+      session_id: currentSessionId.value || null,
+      conversation_history: previousConversation
     })
     result.value = res.data
-    ElMessage.success('测试完成')
-  } catch (e) {} finally {
+    currentSessionId.value = res.data?.session_id || currentSessionId.value
+    await loadTestSessions()
+  } catch (e) {
+    result.value = previousResult
+    chatInput.value = question
+  } finally {
     testing.value = false
   }
 }
 
-const formatTableLabel = (item: any) => {
-  return item.comments ? `${item.table_name} (${item.comments})` : item.table_name
-}
-
 const formatModelOption = (item: any) => `${item.config_name} / ${item.model_name}`
+const formatDateTime = (value: string) => value ? String(value).replace('T', ' ').slice(0, 16) : '-'
 
 watch(() => appStore.currentDomainId, async (val) => {
   if (!val || val === currentDomainId.value) return
   currentDomainId.value = val
-  form.value.skill_id = ''
+  form.value.managed_skill_id = ''
   form.value.llm_config_id = defaultTestModel.value?.config_id || ''
   result.value = null
+  currentSessionId.value = ''
+  historyView.value = false
   await loadDomainResources()
 })
 
@@ -430,6 +414,7 @@ onMounted(async () => {
   flex-direction: column;
   gap: 16px;
 }
+.history-table { width: 100%; cursor: pointer; }
 .skill-profile {
   display: flex;
   flex-direction: column;
@@ -488,6 +473,23 @@ onMounted(async () => {
   white-space: pre-wrap;
   line-height: 1.8;
 }
+.conversation-list { display: flex; flex-direction: column; gap: 10px; }
+.dialog-conversation { min-height: 300px; max-height: 460px; overflow-y: auto; padding: 2px 6px 2px 2px; }
+.dialog-model { margin-bottom: 12px; color: #1f5f8b; font-size: 12px; font-weight: 600; }
+.conversation-message { display: flex; flex-direction: column; gap: 5px; }
+.conversation-message.user { align-items: flex-end; }
+.conversation-role { color: #58728b; font-size: 12px; font-weight: 700; }
+.conversation-message.user .llm-output-box { max-width: 78%; background: #eef7ff; border-color: #cfe5f6; color: #24435c; }
+.conversation-message.assistant .llm-output-box { background: #fffdf6; border-color: #efe1a8; color: #473f21; }
+.data-answer-card { align-self: stretch; margin-top: 8px; padding: 12px; border-radius: 12px; background: #f4f9fd; border: 1px solid #d9ebf7; }
+.data-answer-title { margin-bottom: 8px; color: #25527c; font-weight: 700; font-size: 13px; }
+.agent-pending { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; padding: 10px 12px; border-radius: 10px; background: #f4f9fd; color: #47708f; font-size: 13px; }
+.chat-composer { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.chat-composer .el-button { align-self: flex-end; }
+.execution-entry { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: #f4f9fd; color: #5c7184; font-size: 12px; }
+.sample-limit-hint { margin-left: 10px; color: #8493a1; font-size: 12px; }
+.trace-title { display: inline-flex; align-items: center; gap: 6px; }
+.query-item + .query-item { margin-top: 12px; }
 .trace-list {
   display: flex;
   flex-direction: column;

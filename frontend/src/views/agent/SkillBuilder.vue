@@ -4,7 +4,7 @@
       <div>
         <div class="hero-title">智能体技能构建</div>
         <div class="hero-desc">
-          基于分析域、Oracle 源数据库和属性图（Property Graph），构建可复用的数据分析 skill。保存后的 skill 可直接用于图数据分析。
+          基于分析域、Oracle 源数据库和属性图（Property Graph），构建可复用的数据分析 skill。保存后可由大模型生成包含 SKILL.md 与参考文件的 Agent Skill ZIP 包。
         </div>
       </div>
       <div class="hero-stats">
@@ -160,8 +160,9 @@
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="90" fixed="right">
+            <el-table-column label="操作" width="150" fixed="right">
               <template #default="{ row }">
+                <el-button type="primary" link :loading="packagingSkillId === row.skill_id" @click.stop="downloadSkillPackage(row)">生成并下载</el-button>
                 <el-button type="danger" link @click.stop="removeSkill(row)">删除</el-button>
               </template>
             </el-table-column>
@@ -188,6 +189,7 @@ const skills = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
 const currentDomainId = ref(appStore.currentDomainId || '')
 const saving = ref(false)
+const packagingSkillId = ref('')
 
 const createEmptyForm = () => ({
   skill_id: '',
@@ -457,6 +459,26 @@ const removeSkill = async (row: any) => {
     ElMessage.success('技能已删除')
     await loadDomainResources()
   } catch (e) {}
+}
+
+const downloadSkillPackage = async (row: any) => {
+  packagingSkillId.value = row.skill_id
+  try {
+    const res = await agentApi.downloadSkillPackage(row.skill_id)
+    const blob = new Blob([res.data], { type: 'application/zip' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `${String(row.skill_name || 'agent_skill').replace(/[\\/:*?"<>|]/g, '_')}.zip`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success('Agent Skill 包已生成并开始下载')
+  } catch (e) {
+    // 请求错误由 API 拦截器提示。
+  } finally {
+    packagingSkillId.value = ''
+  }
 }
 
 watch(() => appStore.currentDomainId, async (val) => {

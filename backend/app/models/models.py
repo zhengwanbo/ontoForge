@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, CHAR
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, Boolean, ForeignKey, CHAR, LargeBinary
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -178,6 +178,46 @@ class SysAgentSkill(Base):
     prompt_template = Column(Text)
     context_json = Column(Text)
     status = Column(String(20), default="ACTIVE")  # DRAFT/ACTIVE/INACTIVE
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SysManagedAgentSkill(Base):
+    """Uploaded portable Agent Skill archives managed by the platform."""
+    __tablename__ = "sys_managed_agent_skill"
+
+    managed_skill_id = Column(String(50), primary_key=True, default=lambda: generate_id("mskill"))
+    skill_name = Column(String(200), nullable=False)
+    skill_desc = Column(String(2000))
+    package_filename = Column(String(255), nullable=False)
+    package_content = Column(LargeBinary, nullable=False)
+    package_size = Column(Integer, default=0)
+    file_count = Column(Integer, default=0)
+    use_count = Column(Integer, default=0)
+    status = Column(String(20), default="ACTIVE")
+    uploaded_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SysManagedAgentSkillTestSession(Base):
+    """Persistent conversation and audit snapshot for an uploaded Skill test."""
+    __tablename__ = "sys_managed_agent_skill_test_session"
+
+    session_id = Column(String(50), primary_key=True, default=lambda: generate_id("mstest"))
+    managed_skill_id = Column(String(50), ForeignKey("sys_managed_agent_skill.managed_skill_id"), nullable=False)
+    skill_name = Column(String(200), nullable=False)
+    source_id = Column(String(50), nullable=False)
+    source_name = Column(String(200))
+    schema_name = Column(String(128))
+    llm_config_id = Column(String(50), nullable=False)
+    sample_limit = Column(Integer, default=100)
+    session_title = Column(String(500))
+    last_question = Column(String(2000))
+    message_count = Column(Integer, default=0)
+    conversation_json = Column(Text)
+    result_json = Column(Text)
     created_by = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

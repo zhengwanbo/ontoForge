@@ -1,6 +1,8 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
@@ -50,6 +52,79 @@ async def list_agent_skills(
 ):
     service = AgentService(db)
     return ApiResponse(data=service.list_skills(domain_id=domain_id))
+
+
+@router.get("/managed-skills", response_model=ApiResponse)
+async def list_managed_agent_skills(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    return ApiResponse(data=AgentService(db).list_managed_skills())
+
+
+@router.post("/managed-skills/upload", response_model=ApiResponse)
+async def upload_managed_agent_skill(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        content = await file.read()
+        data = AgentService(db).upload_managed_skill(file.filename or "agent_skill.zip", content, current_user.get("username", "unknown"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        await file.close()
+    return ApiResponse(data=data, message="Agent Skill 已上传")
+
+
+@router.delete("/managed-skills/{managed_skill_id}", response_model=ApiResponse)
+async def delete_managed_agent_skill(
+    managed_skill_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        AgentService(db).delete_managed_skill(managed_skill_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return ApiResponse(message="Agent Skill 已删除")
+
+
+@router.get("/managed-skill-test-sessions", response_model=ApiResponse)
+async def list_managed_skill_test_sessions(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    return ApiResponse(data=AgentService(db).list_managed_skill_test_sessions())
+
+
+@router.get("/managed-skill-test-sessions/{session_id}", response_model=ApiResponse)
+async def get_managed_skill_test_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        return ApiResponse(data=AgentService(db).get_managed_skill_test_session(session_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/managed-skills/{managed_skill_id}/test", response_model=ApiResponse)
+async def test_managed_agent_skill(
+    managed_skill_id: str,
+    req: AgentSkillTestRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        data = await AgentService(db).test_managed_skill(managed_skill_id, req.model_dump(), current_user.get("username", "unknown"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"托管 Skill 测试失败: {str(exc)}")
+    return ApiResponse(data=data)
 
 
 @router.get("/skills/{skill_id}", response_model=ApiResponse)
@@ -108,6 +183,26 @@ async def delete_agent_skill(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return ApiResponse(message="技能已删除")
+
+
+@router.post("/skills/{skill_id}/package")
+async def download_agent_skill_package(
+    skill_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    service = AgentService(db)
+    try:
+        package = await service.build_skill_package(skill_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"生成技能包失败: {str(exc)}")
+    return StreamingResponse(
+        BytesIO(package["content"]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{package["filename"]}"'},
+    )
 
 
 @router.post("/skills/{skill_id}/test", response_model=ApiResponse)

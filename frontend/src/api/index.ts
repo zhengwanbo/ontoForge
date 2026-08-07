@@ -21,6 +21,7 @@ api.interceptors.request.use(config => {
 // Response interceptor
 api.interceptors.response.use(
   response => {
+    if (response.config.responseType === 'blob') return response
     const res = response.data
     if (res.code !== 200) {
       ElMessage.error(res.message || '请求失败')
@@ -217,12 +218,23 @@ export const browseApi = {
 // ====== Agent Skill API ======
 export const agentApi = {
   listSkills: (domainId?: string) => api.get('/agent/skills', { params: { domain_id: domainId } }),
+  listManagedSkills: () => api.get('/agent/managed-skills'),
+  uploadManagedSkill: (file: File) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return api.post('/agent/managed-skills/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+  },
+  deleteManagedSkill: (managedSkillId: string) => api.delete(`/agent/managed-skills/${managedSkillId}`),
+  listManagedSkillTestSessions: () => api.get('/agent/managed-skill-test-sessions'),
+  getManagedSkillTestSession: (sessionId: string) => api.get(`/agent/managed-skill-test-sessions/${sessionId}`),
+  testManagedSkill: (managedSkillId: string, data: any) => api.post(`/agent/managed-skills/${managedSkillId}/test`, data),
   listPropertyGraphs: (domainId: string, sourceId: string, schema?: string) =>
     api.get(`/agent/domains/${domainId}/property-graphs`, { params: { source_id: sourceId, schema } }),
   getSkill: (skillId: string) => api.get(`/agent/skills/${skillId}`),
   createSkill: (domainId: string, data: any) => api.post(`/agent/domains/${domainId}/skills`, data),
   updateSkill: (skillId: string, data: any) => api.put(`/agent/skills/${skillId}`, data),
   deleteSkill: (skillId: string) => api.delete(`/agent/skills/${skillId}`),
+  downloadSkillPackage: (skillId: string) => api.post(`/agent/skills/${skillId}/package`, {}, { responseType: 'blob', timeout: 300000 }),
   testSkill: (skillId: string, data: any) => api.post(`/agent/skills/${skillId}/test`, data)
 }
 

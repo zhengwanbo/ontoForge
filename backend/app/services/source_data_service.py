@@ -307,9 +307,10 @@ class SourceDataService:
         source = self._get_data_source(source_id)
         columns = []
         preview_rows = []
+        preview_sql = ""
 
         def action(_connection, cursor):
-            nonlocal columns, preview_rows
+            nonlocal columns, preview_rows, preview_sql
             self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
             connected_user = self._fetchone_logged(cursor, source, "connected_user")[0]
             owner = (schema or source.schema_name or connected_user or source.username).upper()
@@ -430,6 +431,7 @@ class SourceDataService:
                 "sample_columns": preview_columns,
                 "sample_rows": preview_rows,
                 "sample_limit": sample_limit,
+                "preview_sql": preview_sql.strip(),
             }
 
         try:

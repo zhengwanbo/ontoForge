@@ -139,6 +139,12 @@ const routes = [
             name: 'AgentSkillTest',
             component: () => import('../views/agent/AgentTest.vue'),
             meta: { title: '智能体测试', icon: 'Promotion', parentMenu: '智能体构建' }
+          },
+          {
+            path: 'manage',
+            name: 'AgentSkillManagement',
+            component: () => import('../views/agent/SkillManagement.vue'),
+            meta: { title: '技能管理', icon: 'FolderOpened', parentMenu: '智能体构建' }
           }
         ]
       },

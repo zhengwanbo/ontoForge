@@ -105,6 +105,10 @@
             <el-icon><Promotion /></el-icon>
             <span>智能体测试</span>
           </el-menu-item>
+          <el-menu-item index="/agent/manage">
+            <el-icon><FolderOpened /></el-icon>
+            <span>技能管理</span>
+          </el-menu-item>
         </el-sub-menu>
         <el-sub-menu index="/system">
           <template #title>

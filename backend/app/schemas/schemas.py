@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, Field
 
 
@@ -372,10 +372,12 @@ class AgentSkillTestRequest(BaseModel):
     llm_config_id: str
     source_id: str
     schema: Optional[str] = None
-    graph_table: str
+    graph_table: Optional[str] = None
     test_question: Optional[str] = None
-    input_payload: Optional[str] = None
-    sample_limit: int = 5
+    conversation_history: List[Dict[str, str]] = Field(default_factory=list)
+    session_id: Optional[str] = None
+    start_session: bool = False
+    sample_limit: int = Field(default=100, ge=1, le=100)
 
 
 # ====== 业务规则与活动 ======

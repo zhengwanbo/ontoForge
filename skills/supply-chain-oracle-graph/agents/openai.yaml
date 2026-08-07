@@ -1,0 +1,4 @@
+interface:
+  display_name: "供应链图谱分析"
+  short_description: "通过 SQLcl MCP 进行五码追溯与供应链图分析"
+  default_prompt: "Use $supply-chain-oracle-graph to trace a product code or analyze a supply-chain exception through Oracle."

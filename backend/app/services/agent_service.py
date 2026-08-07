@@ -1,14 +1,19 @@
 import json
+import re
 from collections import deque
 from datetime import datetime
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.models import (
     SysAgentSkill,
+    SysManagedAgentSkill,
+    SysManagedAgentSkillTestSession,
     SysDataSource,
     SysDomain,
     SysLLMConfig,
@@ -174,6 +179,735 @@ class AgentService:
             raise ValueError("技能不存在")
         self.db.delete(skill)
         self.db.commit()
+
+    def list_managed_skills(self) -> List[Dict[str, Any]]:
+        rows = self.db.query(SysManagedAgentSkill).order_by(
+            SysManagedAgentSkill.updated_at.desc(),
+            SysManagedAgentSkill.created_at.desc(),
+        ).all()
+        return [self._serialize_managed_skill(item) for item in rows]
+
+    def upload_managed_skill(self, filename: str, content: bytes, uploaded_by: str) -> Dict[str, Any]:
+        if not filename.lower().endswith(".zip"):
+            raise ValueError("仅支持上传 Agent Skill ZIP 文件")
+        if not content or len(content) > 10 * 1024 * 1024:
+            raise ValueError("Skill ZIP 不能为空且不能超过 10MB")
+        try:
+            with ZipFile(BytesIO(content)) as archive:
+                info_list = archive.infolist()
+                if not info_list or len(info_list) > 30:
+                    raise ValueError("Skill ZIP 文件数量必须在 1 到 30 个之间")
+                if sum(item.file_size for item in info_list) > 3 * 1024 * 1024:
+                    raise ValueError("Skill ZIP 解压后的总大小不能超过 3MB")
+                names = [item.filename.replace("\\", "/") for item in info_list]
+                if any(not name or name.startswith("/") or ".." in name.split("/") for name in names):
+                    raise ValueError("Skill ZIP 包含不安全文件路径")
+                skill_entry = next((item for item in info_list if item.filename.replace("\\", "/") == "SKILL.md"), None)
+                if not skill_entry:
+                    raise ValueError("Skill ZIP 必须在根目录包含 SKILL.md")
+                if skill_entry.file_size > 256 * 1024:
+                    raise ValueError("SKILL.md 不能超过 256KB")
+                skill_markdown = archive.read(skill_entry).decode("utf-8-sig")
+        except BadZipFile as exc:
+            raise ValueError("上传文件不是有效的 ZIP 包") from exc
+        except UnicodeDecodeError as exc:
+            raise ValueError("SKILL.md 必须使用 UTF-8 编码") from exc
+
+        metadata = self._extract_skill_metadata(skill_markdown, filename)
+        record = SysManagedAgentSkill(
+            managed_skill_id=generate_id("mskill"),
+            skill_name=metadata["skill_name"],
+            skill_desc=metadata["skill_desc"],
+            package_filename=self._safe_uploaded_filename(filename),
+            package_content=content,
+            package_size=len(content),
+            file_count=len(info_list),
+            use_count=0,
+            status="ACTIVE",
+            uploaded_by=uploaded_by or "unknown",
+        )
+        self.db.add(record)
+        self.db.commit()
+        self.db.refresh(record)
+        return self._serialize_managed_skill(record)
+
+    def delete_managed_skill(self, managed_skill_id: str):
+        record = self.db.query(SysManagedAgentSkill).filter(SysManagedAgentSkill.managed_skill_id == managed_skill_id).first()
+        if not record:
+            raise ValueError("托管 Skill 不存在")
+        self.db.query(SysManagedAgentSkillTestSession).filter(
+            SysManagedAgentSkillTestSession.managed_skill_id == managed_skill_id
+        ).delete(synchronize_session=False)
+        self.db.delete(record)
+        self.db.commit()
+
+    def list_managed_skill_test_sessions(self) -> List[Dict[str, Any]]:
+        rows = self.db.query(SysManagedAgentSkillTestSession).order_by(
+            SysManagedAgentSkillTestSession.updated_at.desc(),
+            SysManagedAgentSkillTestSession.created_at.desc(),
+        ).all()
+        return [self._serialize_managed_skill_test_session(item, include_result=False) for item in rows]
+
+    def get_managed_skill_test_session(self, session_id: str) -> Dict[str, Any]:
+        session = self.db.query(SysManagedAgentSkillTestSession).filter(
+            SysManagedAgentSkillTestSession.session_id == session_id
+        ).first()
+        if not session:
+            raise ValueError("测试历史不存在")
+        return self._serialize_managed_skill_test_session(session, include_result=True)
+
+    async def test_managed_skill(self, managed_skill_id: str, payload: Dict[str, Any], created_by: str = "unknown") -> Dict[str, Any]:
+        """Use an uploaded Skill package with sampled, read-only source data for an agent test."""
+        managed_skill = self.db.query(SysManagedAgentSkill).filter(
+            SysManagedAgentSkill.managed_skill_id == managed_skill_id,
+            SysManagedAgentSkill.status == "ACTIVE",
+        ).first()
+        if not managed_skill:
+            raise ValueError("托管 Skill 不存在或未启用")
+        llm_config = self._get_llm_config(payload.get("llm_config_id"), purpose="智能体测试")
+        skill_files = self._read_managed_skill_files(managed_skill)
+        skill_markdown = skill_files["SKILL.md"]
+        existing_session = None
+        requested_session_id = str(payload.get("session_id") or "").strip()
+        if requested_session_id:
+            existing_session = self.db.query(SysManagedAgentSkillTestSession).filter(
+                SysManagedAgentSkillTestSession.session_id == requested_session_id
+            ).first()
+            if not existing_session or existing_session.managed_skill_id != managed_skill_id:
+                raise ValueError("测试会话不存在，或不属于当前 Skill")
+        conversation_history = self._normalize_conversation_history(
+            self._safe_json_loads(existing_session.conversation_json, []) if existing_session else payload.get("conversation_history")
+        )
+        is_session_start = bool(payload.get("start_session"))
+        question = (payload.get("test_question") or "").strip()
+        if not question:
+            question = "请开始测试会话，说明你将如何依据已加载 Skill 对当前数据源进行分析，并等待我的问题。"
+        topology = self.source_service.get_remote_property_graph_topology(
+            source_id=payload["source_id"], schema=payload.get("schema")
+        )
+        if not topology.get("graph_name") or not topology.get("nodes"):
+            raise ValueError("所选数据源没有可用 Oracle Property Graph，无法按本体属性执行图查询")
+        graph_plan = self._build_supply_chain_graph_plan(question, topology)
+        if graph_plan:
+            selected_node = graph_plan["selection"]
+            graph_sql = graph_plan["sql"]
+        else:
+            selected_node = await self._select_managed_skill_graph_node(
+                skill_markdown=skill_markdown,
+                question=question,
+                llm_config=llm_config,
+                topology=topology,
+            )
+            graph_sql = self._build_graph_node_property_sql(
+                graph_name=topology["graph_name"],
+                node=selected_node,
+            )
+        graph_result = self.source_service.execute_remote_graph_query(
+            source_id=payload["source_id"],
+            graph_sql=graph_sql,
+            schema=payload.get("schema"),
+            row_limit=max(1, min(int(payload.get("sample_limit") or 100), 100)),
+        )
+        source = self.db.query(SysDataSource).filter(SysDataSource.source_id == payload["source_id"]).first()
+        executed_sql = graph_sql
+        references = "\n\n".join(
+            f"## {path}\n{content}" for path, content in skill_files.items() if path != "SKILL.md"
+        )[:30000]
+        sample_rows = json.dumps(graph_result.get("rows", [])[:100], ensure_ascii=False, indent=2, default=str)
+        columns = json.dumps(graph_result.get("columns", [])[:30], ensure_ascii=False, indent=2, default=str)
+        system_prompt = """你是供应链数据分析智能体。严格遵守用户上传的 Skill：只依据给定 Skill、Oracle Property Graph 本体属性、只读查询结果和用户问题分析，不臆造字段、数据或查询结果。
+
+平台会在你的文字回答前先以结构化表格展示本轮 SQL 返回数据。你的职责是在表格之后，严格按 Skill 要求解读数据、给出结论和可继续追问的问题；如果 Skill 未规定格式，则依次输出结论摘要、数据解读和建议追问。不要重复罗列整张原始数据表，也不要强制输出“风险与限制”章节。
+
+不得只罗列实例 ID；必须优先说明查询结果中实际返回的产品、批次、工厂、质检、码、仓储或渠道等本体业务属性。不要输出或建议任何写入、删除、DDL、权限或凭据操作。"""
+        user_prompt = f"""# 已加载 Skill
+{skill_markdown[:30000]}
+
+# Skill 参考文件
+{references or '无'}
+
+# 数据源上下文
+- 数据源：{source.source_name if source else payload['source_id']}
+- Oracle Property Graph：{topology.get('schema')}.{topology.get('graph_name')}
+- 本体查询对象：{selected_node.get('displayName')}（底层对象：{selected_node.get('tableName')}）
+- 当前用户问题：{question}
+
+# 已有对话
+{self._format_conversation_history(conversation_history) or '这是一次新会话，尚无历史消息。'}
+
+# 已执行的只读 SQL
+{executed_sql}
+
+# 可用字段
+{columns}
+
+# SQL 返回的数据样例
+{sample_rows}
+"""
+        agent_output = await self.llm_service.call_llm(
+            system_prompt, user_prompt, llm_config, timeout_override=max(llm_config.timeout, 120)
+        )
+        managed_skill.use_count = (managed_skill.use_count or 0) + 1
+        self.db.commit()
+        trace = [
+            {"step_no": 1, "stage": "SKILL_LOAD", "title": "加载上传 Skill", "status": "SUCCESS", "detail": f"已加载 SKILL.md 及 {len(skill_files) - 1} 个参考文件。"},
+            {"step_no": 2, "stage": "ONTOLOGY_NODE_SELECTION", "title": "Agent 选择本体查询对象", "status": "SUCCESS", "detail": f"在属性图 {topology.get('graph_name')} 中选择 {selected_node.get('displayName')}。原因：{selected_node.get('reason')}"},
+            {"step_no": 3, "stage": "GRAPH_SCHEMA_INSPECTION", "title": "检查本体属性与关系", "status": "SUCCESS", "detail": f"底层对象为 {selected_node.get('tableName')}，本次 GRAPH_TABLE 返回 {len(graph_result.get('columns', []))} 个本体属性或汇总字段。"},
+            {"step_no": 4, "stage": "ORACLE_GRAPH_QUERY", "title": "执行 Oracle Graph SQL", "status": "SUCCESS", "detail": f"使用 GRAPH_TABLE 查询并返回 {len(graph_result.get('rows', []))} 条本体实例记录。", "sql": executed_sql},
+            {"step_no": 5, "stage": "AGENT_ANALYSIS", "title": "Agent 按 Skill 分析", "status": "SUCCESS", "detail": "已将 Skill 指令、会话上下文、本体属性字段、Graph SQL 结果和当前问题发送给分析 Agent。"},
+        ]
+        conversation = conversation_history + ([] if is_session_start else [{"role": "user", "content": question}])
+        conversation.append({"role": "assistant", "content": agent_output})
+        response = {
+            "managed_skill": self._serialize_managed_skill(managed_skill),
+            "execution_model": {"llm_config_id": llm_config.config_id, "llm_config_name": llm_config.config_name, "llm_model_name": normalize_model_name(llm_config.model_name, llm_config.api_base_url)},
+            "test_context": {"source_id": payload["source_id"], "source_name": source.source_name if source else "", "schema": topology.get("schema"), "property_graph": topology.get("graph_name"), "ontology_node": selected_node.get("displayName"), "test_question": "" if is_session_start else question},
+            "conversation": conversation,
+            "agent_output": agent_output,
+            "execution_trace": trace,
+            "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
+            "warnings": ["当前测试使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，会在图关系定位后通过经批准的只读事实表聚合。"],
+            "table_preview": {"columns": [{"column_name": column} for column in graph_result.get("columns", [])], "sample_rows": graph_result.get("rows", [])},
+        }
+        session = self._save_managed_skill_test_session(
+            session=existing_session,
+            managed_skill=managed_skill,
+            source=source,
+            payload=payload,
+            question=question,
+            conversation=conversation,
+            response=response,
+            created_by=created_by,
+        )
+        response["session_id"] = session.session_id
+        return response
+
+    def _save_managed_skill_test_session(
+        self,
+        *,
+        session: Optional[SysManagedAgentSkillTestSession],
+        managed_skill: SysManagedAgentSkill,
+        source: Optional[SysDataSource],
+        payload: Dict[str, Any],
+        question: str,
+        conversation: List[Dict[str, str]],
+        response: Dict[str, Any],
+        created_by: str,
+    ) -> SysManagedAgentSkillTestSession:
+        if not session:
+            session = SysManagedAgentSkillTestSession(
+                session_id=generate_id("mstest"),
+                managed_skill_id=managed_skill.managed_skill_id,
+                skill_name=managed_skill.skill_name,
+                source_id=payload["source_id"],
+                source_name=source.source_name if source else "",
+                schema_name=payload.get("schema") or "",
+                llm_config_id=payload["llm_config_id"],
+                sample_limit=max(1, min(int(payload.get("sample_limit") or 100), 100)),
+                created_by=created_by or "unknown",
+            )
+            self.db.add(session)
+        session.session_title = question[:500]
+        session.last_question = question[:2000]
+        session.message_count = len(conversation)
+        session.conversation_json = json.dumps(conversation, ensure_ascii=False)
+        session.result_json = json.dumps(response, ensure_ascii=False, default=str)
+        session.updated_at = datetime.utcnow()
+        self.db.commit()
+        self.db.refresh(session)
+        return session
+
+    def _serialize_managed_skill_test_session(
+        self, session: SysManagedAgentSkillTestSession, *, include_result: bool
+    ) -> Dict[str, Any]:
+        data = {
+            "session_id": session.session_id,
+            "managed_skill_id": session.managed_skill_id,
+            "skill_name": session.skill_name,
+            "source_id": session.source_id,
+            "source_name": session.source_name,
+            "schema": session.schema_name,
+            "llm_config_id": session.llm_config_id,
+            "sample_limit": session.sample_limit,
+            "session_title": session.session_title,
+            "last_question": session.last_question,
+            "message_count": session.message_count or 0,
+            "created_by": session.created_by,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+        if include_result:
+            data["conversation"] = self._safe_json_loads(session.conversation_json, [])
+            data["result"] = self._safe_json_loads(session.result_json, {})
+        return data
+
+    async def _select_managed_skill_graph_node(
+        self,
+        *,
+        skill_markdown: str,
+        question: str,
+        llm_config: SysLLMConfig,
+        topology: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidates = topology.get("nodes") or []
+        if len(candidates) == 1:
+            return {**candidates[0], "reason": "当前属性图仅有一个可访问本体节点。"}
+        catalog = [
+            {
+                "element_name": item.get("name"),
+                "label": item.get("displayName"),
+                "table": item.get("tableName"),
+                "properties": [prop.get("property_name") for prop in (item.get("properties") or [])[:20]],
+            }
+            for item in candidates[:80]
+        ]
+        prompt = f'''根据上传 Skill 与用户问题，从 Oracle Property Graph 的本体节点中选择一个最适合首次查询业务属性的节点。
+只返回 JSON：{{"label":"候选节点标签","reason":"不超过50字的理由"}}。必须选择候选列表中的 label；不得返回 SQL。
+
+Skill：
+{skill_markdown[:12000]}
+
+用户问题：{question}
+
+本体节点候选：{json.dumps(catalog, ensure_ascii=False)}'''
+        raw = await self.llm_service.call_llm(
+            "你是 Oracle 图本体节点选择器，只能选择候选图节点并关注业务属性。", prompt, llm_config,
+            timeout_override=max(llm_config.timeout, 60),
+        )
+        selection = self.llm_service._extract_json_object(raw or "") or {}
+        selected_label = str(selection.get("label") or "").strip().upper()
+        by_label = {str(item.get("displayName") or "").upper(): item for item in candidates}
+        if selected_label in by_label:
+            return {**by_label[selected_label], "reason": str(selection.get("reason") or "与 Skill 和当前问题匹配。").strip()[:200]}
+        raise ValueError("Agent 未能从 Oracle 属性图中选择有效本体节点，请在对话中补充更明确的问题或检查 Skill 指令")
+
+    @staticmethod
+    def _build_graph_node_property_sql(graph_name: str, node: Dict[str, Any]) -> str:
+        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+        label = str(node.get("displayName") or "").upper()
+        if not identifier_pattern.fullmatch(str(graph_name or "")) or not identifier_pattern.fullmatch(label):
+            raise ValueError("属性图或本体节点标签包含不支持的标识符")
+        properties = []
+        for prop in node.get("properties") or []:
+            name = str(prop.get("property_name") or "").upper()
+            data_type = str(prop.get("data_type") or "").upper()
+            if identifier_pattern.fullmatch(name) and not any(token in data_type for token in ("BLOB", "CLOB", "NCLOB", "BFILE", "LONG", "XMLTYPE")):
+                properties.append(name)
+        if not properties:
+            raise ValueError(f"本体节点 {label} 没有可用于 Oracle Graph SQL 查询的属性")
+        projections = ",\n      ".join(f"n.{name} AS {name}" for name in properties[:30])
+        return f'''SELECT *
+FROM GRAPH_TABLE(
+  {graph_name.upper()}
+  MATCH (n IS {label})
+  COLUMNS (
+      {projections}
+  )
+)'''
+
+    @staticmethod
+    def _build_supply_chain_graph_plan(question: str, topology: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return approved multi-ontology graph templates for high-value supply-chain questions.
+
+        Quantities live in OUTBOUND_DETAIL rather than the graph edge, so the
+        template first uses GRAPH_TABLE to establish the business relationship
+        and then performs a read-only aggregate over that fact table.
+        """
+        normalized = (question or "").upper()
+        asks_outbound_distributor = ("出库" in question or "OUTBOUND" in normalized) and ("经销商" in question or "DISTRIBUTOR" in normalized)
+        if not asks_outbound_distributor:
+            return None
+        nodes_by_label = {str(item.get("displayName") or "").upper(): item for item in (topology.get("nodes") or [])}
+        outbound = nodes_by_label.get("OUTBOUNDORDER")
+        distributor = nodes_by_label.get("DISTRIBUTOR")
+        if not outbound or not distributor:
+            return None
+        outbound_properties = {str(item.get("property_name") or "").upper() for item in (outbound.get("properties") or [])}
+        distributor_properties = {str(item.get("property_name") or "").upper() for item in (distributor.get("properties") or [])}
+        if not {"OUTBOUND_ID", "OUTBOUND_NO", "OUTBOUND_TIME"}.issubset(outbound_properties) or not {"DISTRIBUTOR_ID", "DISTRIBUTOR_NAME"}.issubset(distributor_properties):
+            return None
+        graph_name = str(topology.get("graph_name") or "").upper()
+        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+        if not identifier_pattern.fullmatch(graph_name):
+            return None
+        month_filter = "\n  AND od.OUTBOUND_TIME >= TRUNC(SYSDATE, 'MM')\n  AND od.OUTBOUND_TIME < ADD_MONTHS(TRUNC(SYSDATE, 'MM'), 1)" if "本月" in question else ""
+        sql = f'''WITH outbound_distributor AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (o IS OUTBOUNDORDER)-[e IS GRAPH_LABEL]->(d IS DISTRIBUTOR)
+    COLUMNS (
+      o.OUTBOUND_ID AS OUTBOUND_ID,
+      o.OUTBOUND_NO AS OUTBOUND_NO,
+      o.OUTBOUND_TIME AS OUTBOUND_TIME,
+      o.OUTBOUND_TYPE AS OUTBOUND_TYPE,
+      o.STATUS AS OUTBOUND_STATUS,
+      d.DISTRIBUTOR_ID AS DISTRIBUTOR_ID,
+      d.DISTRIBUTOR_CODE AS DISTRIBUTOR_CODE,
+      d.DISTRIBUTOR_NAME AS DISTRIBUTOR_NAME,
+      e.RELATION_NAME AS RELATION_NAME
+    )
+  )
+)
+SELECT od.OUTBOUND_NO,
+       od.OUTBOUND_TIME,
+       od.OUTBOUND_TYPE,
+       od.OUTBOUND_STATUS,
+       od.DISTRIBUTOR_CODE,
+       od.DISTRIBUTOR_NAME,
+       SUM(NVL(obd.QUANTITY, 0)) AS OUTBOUND_QUANTITY
+FROM outbound_distributor od
+LEFT JOIN OUTBOUND_DETAIL obd ON obd.OUTBOUND_ID = od.OUTBOUND_ID
+WHERE od.RELATION_NAME = '发往'{month_filter}
+GROUP BY od.OUTBOUND_NO, od.OUTBOUND_TIME, od.OUTBOUND_TYPE, od.OUTBOUND_STATUS,
+         od.DISTRIBUTOR_CODE, od.DISTRIBUTOR_NAME
+ORDER BY od.OUTBOUND_TIME DESC, od.DISTRIBUTOR_NAME'''
+        return {
+            "sql": sql,
+            "selection": {
+                "displayName": "出库单 → 经销商",
+                "tableName": f"{outbound.get('tableName')} → {distributor.get('tableName')}；OUTBOUND_DETAIL（数量事实）",
+                "reason": "问题同时涉及出库单、经销商与出库数量，需通过图关系定位两端本体并汇总出库明细。",
+            },
+        }
+
+    async def _select_managed_skill_table(
+        self,
+        *,
+        skill_markdown: str,
+        source_id: str,
+        schema: Optional[str],
+        question: str,
+        llm_config: SysLLMConfig,
+    ) -> Dict[str, str]:
+        table_list = self.source_service.get_remote_tables(source_id=source_id, schema=schema)
+        candidates = (table_list.get("tables") or [])[:150]
+        if not candidates:
+            raise ValueError("所选数据源 Schema 中没有可供 Agent 分析的数据表")
+        if len(candidates) == 1:
+            item = candidates[0]
+            return {"owner": item["owner"], "table_name": item["table_name"], "reason": "当前 Schema 仅有一个可访问数据对象。"}
+        catalog = json.dumps(
+            [{"table_name": item["table_name"], "comments": item.get("comments") or "", "num_rows": item.get("num_rows") or 0} for item in candidates],
+            ensure_ascii=False,
+        )
+        select_prompt = f"""根据用户上传 Skill 与用户问题，从候选数据对象中选择最适合进行首次只读采样分析的一张表。
+只返回 JSON 对象，格式严格为 {{"table_name":"候选表名","reason":"不超过50字的选择理由"}}。不得选择候选列表以外的表，不得输出 SQL。
+
+Skill：
+{skill_markdown[:12000]}
+
+用户问题：{question or '请基于当前数据给出分析结论。'}
+
+候选表：{catalog}
+"""
+        raw = await self.llm_service.call_llm(
+            "你是数据对象选择器，只能从候选表中返回一个精确表名。", select_prompt, llm_config,
+            timeout_override=max(llm_config.timeout, 60),
+        )
+        selection = self.llm_service._extract_json_object(raw or "") or {}
+        selected_name = str(selection.get("table_name") or "").strip()
+        selection_reason = str(selection.get("reason") or "").strip()
+        candidate_by_name = {(item["table_name"] or "").upper(): item for item in candidates}
+        if selected_name.upper() in candidate_by_name:
+            item = candidate_by_name[selected_name.upper()]
+            return {"owner": item["owner"], "table_name": item["table_name"], "reason": selection_reason[:200] or "与 Skill 和问题匹配。"}
+        raise ValueError("Agent 未能从数据源候选对象中选择有效表，请在对话中补充更明确的问题或检查 Skill 指令")
+
+    @staticmethod
+    def _normalize_conversation_history(history: Any) -> List[Dict[str, str]]:
+        """Keep a bounded, text-only dialogue context sent from the test page."""
+        normalized: List[Dict[str, str]] = []
+        for item in (history or [])[-12:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                normalized.append({"role": role, "content": content[:6000]})
+        return normalized
+
+    @staticmethod
+    def _format_conversation_history(history: List[Dict[str, str]]) -> str:
+        role_labels = {"user": "用户", "assistant": "Agent"}
+        return "\n".join(f"{role_labels.get(item['role'], item['role'])}：{item['content']}" for item in history)
+
+    @staticmethod
+    def _read_managed_skill_files(skill: SysManagedAgentSkill) -> Dict[str, str]:
+        try:
+            with ZipFile(BytesIO(skill.package_content), "r") as archive:
+                files = {}
+                for info in archive.infolist():
+                    path = info.filename.replace("\\", "/")
+                    if path == "SKILL.md" or path.startswith("references/"):
+                        files[path] = archive.read(info).decode("utf-8-sig")
+        except (BadZipFile, UnicodeDecodeError) as exc:
+            raise ValueError(f"无法读取托管 Skill 包：{exc}") from exc
+        if "SKILL.md" not in files:
+            raise ValueError("托管 Skill 包缺少 SKILL.md")
+        return files
+
+    @staticmethod
+    def _safe_uploaded_filename(filename: str) -> str:
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", (filename or "agent_skill.zip"))[:255] or "agent_skill.zip"
+
+    def _extract_skill_metadata(self, skill_markdown: str, filename: str) -> Dict[str, str]:
+        frontmatter = re.match(r"^---\s*\n(.*?)\n---", skill_markdown or "", flags=re.DOTALL)
+        values: Dict[str, str] = {}
+        if frontmatter:
+            for line in frontmatter.group(1).splitlines():
+                match = re.match(r"^\s*([A-Za-z_][\w-]*)\s*:\s*(.*?)\s*$", line)
+                if match:
+                    values[match.group(1).lower()] = match.group(2).strip().strip('"\'')
+        heading = re.search(r"^#\s+(.+?)\s*$", skill_markdown or "", flags=re.MULTILINE)
+        skill_name = values.get("name") or (heading.group(1).strip() if heading else "") or filename.rsplit(".", 1)[0]
+        skill_desc = values.get("description") or ""
+        if not skill_desc:
+            paragraphs = [line.strip() for line in (skill_markdown or "").splitlines() if line.strip() and not line.lstrip().startswith(("#", "---"))]
+            skill_desc = next((line for line in paragraphs if len(line) > 8), "未提供技能说明")
+        return {"skill_name": skill_name[:200], "skill_desc": skill_desc[:2000]}
+
+    @staticmethod
+    def _serialize_managed_skill(skill: SysManagedAgentSkill) -> Dict[str, Any]:
+        return {
+            "managed_skill_id": skill.managed_skill_id,
+            "skill_name": skill.skill_name,
+            "skill_desc": skill.skill_desc,
+            "package_filename": skill.package_filename,
+            "package_size": skill.package_size or 0,
+            "file_count": skill.file_count or 0,
+            "use_count": skill.use_count or 0,
+            "status": skill.status,
+            "uploaded_by": skill.uploaded_by,
+            "created_at": skill.created_at,
+            "updated_at": skill.updated_at,
+        }
+
+    async def build_skill_package(self, skill_id: str) -> Dict[str, Any]:
+        """Build a portable, multi-file Agent Skill package from live graph metadata."""
+        skill = self.db.query(SysAgentSkill).filter(SysAgentSkill.skill_id == skill_id).first()
+        if not skill:
+            raise ValueError("技能不存在")
+        domain, process, entity, properties, relations = self._load_skill_dependencies(
+            domain_id=skill.domain_id,
+            process_id=skill.process_id,
+            source_id=skill.source_id,
+            property_graph_name=skill.property_graph_name,
+        )
+        llm_config = self._get_llm_config(skill.llm_config_id, purpose="技能包生成")
+        topology = self.source_service.get_remote_property_graph_topology(
+            skill.source_id,
+            skill.property_graph_name,
+            schema=getattr(entity, "schema", None),
+        )
+        package_files = await self._generate_skill_package_files(
+            domain=domain,
+            process=process,
+            entity=entity,
+            skill=skill,
+            llm_config=llm_config,
+            topology=topology,
+        )
+        archive = BytesIO()
+        with ZipFile(archive, "w", ZIP_DEFLATED) as zip_file:
+            for path, content in package_files.items():
+                zip_file.writestr(path, content)
+        safe_name = self._safe_package_name(skill.skill_name)
+        return {
+            "filename": f"{safe_name}.zip",
+            "content": archive.getvalue(),
+            "files": list(package_files.keys()),
+        }
+
+    async def _generate_skill_package_files(
+        self,
+        *,
+        domain: SysDomain,
+        process: SysProcessDef,
+        entity: Any,
+        skill: SysAgentSkill,
+        llm_config: SysLLMConfig,
+        topology: Dict[str, Any],
+    ) -> Dict[str, str]:
+        graph_reference = self._build_graph_reference(topology)
+        flow_reference = self._build_flow_reference(process)
+        fallback = {
+            "SKILL.md": self._build_skill_markdown(domain, process, entity, skill, topology),
+            "references/property-graph.md": graph_reference,
+            "references/analysis-flow.md": flow_reference,
+        }
+        system_prompt = """你是 Agent Skill 打包专家。根据用户给出的技能配置、业务流程和 Oracle Property Graph 实时拓扑，生成可直接被 Agent 加载的技能包文件。
+
+必须遵守：
+1. 输出严格 JSON，格式为 {"files":[{"path":"SKILL.md","content":"..."}]}。
+2. 必须包含 SKILL.md；可额外生成 references/*.md、references/*.sql、references/*.json 文件。
+3. SKILL.md 使用标准 Agent Skill 风格：YAML frontmatter（name、description）、适用范围、输入、执行工作流、只读安全约束、输出格式和限制。
+4. 数据库只允许 SELECT / WITH ... SELECT / GRAPH_TABLE 查询；严禁 DDL、DML、PL/SQL、权限操作、凭据及任何密码。
+5. 所有图标签、关系、顶点属性必须来自提供的实时拓扑；不要臆造数据库对象。对于图形结果，要求返回 SOURCE_ID、TARGET_ID、RELATION_NAME，并为不同类型 ID 加前缀。
+6. 文件路径必须是相对路径，不能包含 ..；总文件数不超过 8 个，每个文件不超过 24000 字符。
+7. 用中文编写说明和规则，SQL 保持 Oracle 语法。"""
+        payload = {
+            "skill_config": {
+                "skill_name": skill.skill_name,
+                "skill_desc": skill.skill_desc,
+                "analysis_goal": skill.analysis_goal,
+                "execution_rules": skill.execution_rules,
+                "output_requirements": skill.output_requirements,
+            },
+            "domain": {"name": domain.domain_name, "description": domain.domain_desc},
+            "process": {
+                "name": process.process_name,
+                "description": process.process_desc,
+                "steps": self._extract_process_steps(process.process_json),
+            },
+            "property_graph": self._compact_topology(topology),
+            "required_references": {
+                "property_graph_reference": graph_reference,
+                "analysis_flow_reference": flow_reference,
+            },
+        }
+        try:
+            result_text = await self.llm_service.call_llm(
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                llm_config,
+                timeout_override=max(llm_config.timeout, 180),
+            )
+            parsed = self._safe_json_loads(self.llm_service._extract_json_object(result_text), {})
+            files = self._normalize_skill_package_files(parsed)
+            if "SKILL.md" in files:
+                # Real database facts are always included even if the model omitted its references.
+                files.setdefault("references/property-graph.md", graph_reference)
+                files.setdefault("references/analysis-flow.md", flow_reference)
+                return files
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def _safe_package_name(value: str) -> str:
+        cleaned = "".join(char if char.isascii() and (char.isalnum() or char in ("-", "_")) else "_" for char in (value or "agent_skill"))
+        return (cleaned.strip("_") or "agent_skill")[:80]
+
+    def _normalize_skill_package_files(self, raw: Any) -> Dict[str, str]:
+        files = raw.get("files") if isinstance(raw, dict) else None
+        if not isinstance(files, list):
+            return {}
+        normalized: Dict[str, str] = {}
+        allowed_suffixes = (".md", ".sql", ".json", ".txt")
+        for item in files[:8]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").replace("\\", "/").strip().lstrip("/")
+            content = str(item.get("content") or "").strip()
+            if not path or ".." in path.split("/") or not path.endswith(allowed_suffixes) or len(content) > 24000:
+                continue
+            if path != "SKILL.md" and not path.startswith("references/"):
+                continue
+            normalized[path] = content
+        return normalized
+
+    def _compact_topology(self, topology: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "graph_name": topology.get("graph_name"),
+            "schema": topology.get("schema"),
+            "nodes": [
+                {
+                    "label": node.get("name"),
+                    "display_name": node.get("displayName"),
+                    "table": node.get("tableName"),
+                    "properties": [
+                        {"name": prop.get("property_name"), "type": prop.get("data_type"), "primary_key": prop.get("is_primary_key")}
+                        for prop in (node.get("properties") or [])[:20]
+                    ],
+                }
+                for node in (topology.get("nodes") or [])[:30]
+            ],
+            "edges": [
+                {
+                    "label": edge.get("name"),
+                    "source": edge.get("source"),
+                    "target": edge.get("target"),
+                    "table": edge.get("tableName"),
+                }
+                for edge in (topology.get("edges") or [])[:60]
+            ],
+        }
+
+    def _build_graph_reference(self, topology: Dict[str, Any]) -> str:
+        compact = self._compact_topology(topology)
+        lines = [
+            "# Oracle Property Graph 实时参考",
+            "",
+            f"- Schema：`{compact.get('schema') or '当前 Schema'}`",
+            f"- Property Graph：`{compact.get('graph_name') or '未识别'}`",
+            "- 仅允许使用只读 `SELECT` 或 `WITH ... SELECT`；图查询使用 `GRAPH_TABLE`。",
+            "",
+            "## 顶点标签",
+        ]
+        for node in compact["nodes"]:
+            props = ", ".join(item.get("name") or "" for item in node["properties"][:12]) or "无属性元数据"
+            lines.append(f"- `{node.get('label')}`：底表 `{node.get('table')}`；属性：{props}")
+        lines.extend(["", "## 边关系"])
+        for edge in compact["edges"]:
+            lines.append(f"- `{edge.get('label')}`：`{edge.get('source')}` → `{edge.get('target')}`；边表 `{edge.get('table')}`")
+        lines.extend([
+            "",
+            "## 图形结果约定",
+            "如需返回图形数据，必须输出 `SOURCE_ID`、`TARGET_ID`、`RELATION_NAME`，并使用 `标签:主键` 形式避免跨节点表主键冲突。",
+        ])
+        return "\n".join(lines)
+
+    def _build_flow_reference(self, process: SysProcessDef) -> str:
+        lines = ["# 分析流程参考", "", f"流程名称：{process.process_name}", process.process_desc or ""]
+        for step in self._extract_process_steps(process.process_json):
+            lines.append(f"{step['step_no']}. {step['label']}（{step['type_label']}）{('：' + step['desc']) if step['desc'] else ''}")
+        return "\n".join(lines)
+
+    def _build_skill_markdown(self, domain: SysDomain, process: SysProcessDef, entity: Any, skill: SysAgentSkill, topology: Dict[str, Any]) -> str:
+        steps = self._extract_process_steps(process.process_json)
+        step_text = "\n".join(f"{item['step_no']}. {item['label']}（{item['type_label']}）" for item in steps) or "1. 校验输入并准备分析上下文。"
+        graph_name = topology.get("graph_name") or entity.entity_name
+        return f"""---
+name: {self._safe_package_name(skill.skill_name).lower()}
+description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_name}。'}
+---
+
+# {skill.skill_name}
+
+## 分析目标
+
+{skill.analysis_goal or f'围绕 Oracle Property Graph `{graph_name}` 完成结构化分析。'}
+
+## 适用范围与输入
+
+- 分析域：{domain.domain_name}
+- Oracle Property Graph：`{graph_name}`
+- 使用用户提供的精确业务标识（如码、批次、单据）作为查询入口；标识无法命中时如实说明，不做无边界检索。
+
+## 执行工作流
+
+{step_text}
+
+## 执行规则
+
+{skill.execution_rules or '先校验输入和图谱对象，再以最小范围只读查询取得证据；数据缺失时明确限制。'}
+
+## 安全约束
+
+- 仅允许 `SELECT` 或 `WITH ... SELECT`，图查询使用 `GRAPH_TABLE`。
+- 禁止 DDL、DML、PL/SQL、权限操作、凭据和密码。
+- 只使用 `references/property-graph.md` 中存在的图标签、关系和属性；不要臆造对象。
+
+## 输出要求
+
+{skill.output_requirements or '输出结论、证据、异常或限制、建议动作，以及必要时使用的只读 SQL。'}
+
+## 参考文件
+
+- `references/property-graph.md`：从数据库实时读取的图谱拓扑。
+- `references/analysis-flow.md`：当前技能配置的分析流程。
+"""
 
     async def test_skill(self, skill_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         skill = self.db.query(SysAgentSkill).filter(SysAgentSkill.skill_id == skill_id).first()
