@@ -396,7 +396,8 @@
             </el-table-column>
             <el-table-column label="实际业务 Join" min-width="270">
               <template #default="{ row }">
-                <code v-if="row.join_recommendation?.join_condition">{{ row.join_recommendation.join_condition }}</code>
+                <span v-if="row.mapping_mode === 'RELATION_TABLE'" class="relation-join">已配置关系表 {{ row.relation_table }}：{{ row.relation_source_column }} → {{ row.relation_target_column }}</span>
+                <code v-else-if="row.join_recommendation?.join_condition">{{ row.join_recommendation.join_condition }}</code>
                 <span v-else class="relation-join-warning">待人工确认</span>
                 <div class="relation-join">{{ row.join_recommendation?.message }}</div>
               </template>
@@ -861,8 +862,8 @@ const saveRelationMode = async (row: any) => {
   relationSavingId.value = row.relation_id
   const payload = {
     edge_table_name: row.edge_table_name || null,
-    source_table: row.source_table || row.join_recommendation?.source_tables?.[0] || null,
-    target_table: row.target_table || row.join_recommendation?.source_tables?.[1] || null,
+    source_table: row.source_table || row.oracle_edge?.source_vertex_table || null,
+    target_table: row.target_table || row.oracle_edge?.target_vertex_table || null,
     join_condition: mappingMode === 'DIRECT' ? (row.join_recommendation?.join_condition || null) : null,
     edge_sql: null,
     mapping_mode: mappingMode,
@@ -875,6 +876,7 @@ const saveRelationMode = async (row: any) => {
     if (existing.data?.mapping_id) await mappingApi.updateRelationMapping(row.relation_id, payload)
     else await mappingApi.createRelationMapping(row.relation_id, payload)
     row.mapping_mode = mappingMode
+    if (result.value) result.value = await hydratePersistedRelationMappings(result.value)
     ElMessage.success(`已保存关系「${row.relation_name || row.relation_id}」的${mappingMode === 'RELATION_TABLE' ? '关系表模式' : '直接 Join 模式'}`)
   } catch (e: any) {
     ElMessage.error(e?.message || '保存关系配置失败')
@@ -918,21 +920,47 @@ const applyEntities = async (entityIds: string[]) => {
     ElMessage.warning('当前没有符合应用范围的映射建议')
     return false
   }
-  const res = await mappingApi.bulkApplyMappings(currentDomainId.value, { entities, relations: [] })
+  // 只落库本次全域映射已经验证的关系；EMPTY/PENDING 关系保持为空，
+  // 由数据映射管理页作为真正需要人工确认的项目展示。
+  const relations = (result.value?.relations || [])
+    .filter((relation: any) =>
+      selectedSet.has(relation.source_entity_id)
+      && selectedSet.has(relation.target_entity_id)
+      && relation.status === 'READY'
+      && (relation.source_table || relation.oracle_edge?.source_vertex_table)
+      && (relation.target_table || relation.oracle_edge?.target_vertex_table)
+      && relation.join_recommendation?.join_condition
+    )
+    .map((relation: any) => ({
+      relation_id: relation.relation_id,
+      edge_table_name: relation.edge_table_name || null,
+      source_table: relation.source_table || relation.oracle_edge?.source_vertex_table,
+      target_table: relation.target_table || relation.oracle_edge?.target_vertex_table,
+      join_condition: relation.join_recommendation.join_condition,
+      edge_sql: null,
+    }))
+  const res = await mappingApi.bulkApplyMappings(currentDomainId.value, { entities, relations })
   const appliedMap = new Map((res.data?.entities || []).map((item: any) => [item.entity_id, item.applied_count]))
+  const appliedRelationIds = new Set(
+    (res.data?.relations || []).filter((item: any) => item.applied).map((item: any) => item.relation_id)
+  )
   result.value = {
     ...result.value,
     summary: {
       ...(result.value?.summary || {}),
       applied_total: ((result.value?.summary?.applied_total || 0) + (res.data?.applied_total || 0)),
-      applied_relation_count: result.value?.summary?.applied_relation_count || 0
+      applied_relation_count: (result.value?.summary?.applied_relation_count || 0) + appliedRelationIds.size
     },
     entities: (result.value?.entities || []).map((item: any) => (
       appliedMap.has(item.entity_id)
         ? { ...item, status: 'APPLIED', applied_count: appliedMap.get(item.entity_id) }
         : item
     )),
-    relations: result.value?.relations || []
+    relations: (result.value?.relations || []).map((relation: any) => (
+      appliedRelationIds.has(relation.relation_id)
+        ? { ...relation, status: 'APPLIED', mapping_status: 'STALE' }
+        : relation
+    ))
   }
   return true
 }
@@ -1109,9 +1137,51 @@ const loadHistory = async () => {
   }
 }
 
-const loadHistoryItem = (item: any) => {
-  result.value = item.result
-  selectedEntityIds.value = ((item.result?.entities || []) as any[])
+const hydratePersistedRelationMappings = async (snapshot: any) => {
+  if (!snapshot?.relations?.length) return snapshot
+  const responses = await Promise.allSettled(
+    snapshot.relations.map((relation: any) => mappingApi.getRelationMapping(relation.relation_id))
+  )
+  return {
+    ...snapshot,
+    relations: snapshot.relations.map((relation: any, index: number) => {
+      const response = responses[index]
+      const mapping = response.status === 'fulfilled' ? response.value?.data : null
+      // 草案仍属于历史快照；只有已经保存的关系映射才能覆盖待确认状态。
+      if (!mapping?.mapping_id) return relation
+      const mappingMode = mapping.mapping_mode || 'DIRECT'
+      const ready = mappingMode === 'RELATION_TABLE'
+        ? Boolean(mapping.relation_table && mapping.relation_source_column && mapping.relation_target_column)
+        : Boolean(mapping.source_table && mapping.target_table && mapping.join_condition)
+      const joinCondition = mapping.join_condition || relation.join_recommendation?.join_condition || ''
+      return {
+        ...relation,
+        edge_table_name: mapping.edge_table_name || relation.edge_table_name,
+        source_table: mapping.source_table || relation.source_table,
+        target_table: mapping.target_table || relation.target_table,
+        mapping_mode: mappingMode,
+        relation_table: mapping.relation_table || '',
+        relation_source_column: mapping.relation_source_column || '',
+        relation_target_column: mapping.relation_target_column || '',
+        mapping_status: mapping.mapping_status || relation.mapping_status,
+        status: ready ? 'READY' : relation.status,
+        join_recommendation: {
+          ...(relation.join_recommendation || {}),
+          join_condition: joinCondition,
+          validated: ready,
+          message: ready
+            ? (mappingMode === 'RELATION_TABLE' ? '已保存关系表模式配置。' : '已保存并确认业务 Join。')
+            : relation.join_recommendation?.message,
+        },
+      }
+    }),
+  }
+}
+
+const loadHistoryItem = async (item: any) => {
+  const hydratedResult = await hydratePersistedRelationMappings(item.result)
+  result.value = hydratedResult
+  selectedEntityIds.value = ((hydratedResult?.entities || []) as any[])
     .filter(entity => (entity.mappings || []).length > 0 || Boolean(entity.node_mapping?.node_sql))
     .map(entity => entity.entity_id)
   ElMessage.success('已载入历史映射结果')
@@ -1139,8 +1209,9 @@ const restoreHistoryDetail = async () => {
   form.value.model_config_id = request.model_config_id || form.value.model_config_id
   form.value.sample_limit = request.sample_limit || form.value.sample_limit
   form.value.mapping_instruction = request.mapping_instruction || ''
-  result.value = historyDetail.value.result
-  selectedEntityIds.value = ((historyDetail.value.result?.entities || []) as any[])
+  const hydratedResult = await hydratePersistedRelationMappings(historyDetail.value.result)
+  result.value = hydratedResult
+  selectedEntityIds.value = ((hydratedResult?.entities || []) as any[])
     .filter(entity => (entity.mappings || []).length > 0 || Boolean(entity.node_mapping?.node_sql))
     .map(entity => entity.entity_id)
   historyDetailVisible.value = false
@@ -1247,8 +1318,9 @@ const refreshActiveTask = async () => {
         if (task.status === 'FAILED') {
           ElMessage.error('后台全域映射任务执行失败')
         } else {
-          result.value = task.result
-          selectedEntityIds.value = ((task.result?.entities || []) as any[])
+          const hydratedResult = await hydratePersistedRelationMappings(task.result)
+          result.value = hydratedResult
+          selectedEntityIds.value = ((hydratedResult?.entities || []) as any[])
             .filter(entity => (entity.mappings || []).length > 0 || Boolean(entity.node_mapping?.node_sql))
             .map(entity => entity.entity_id)
           ElMessage.success(task.status === 'PARTIAL' ? '后台全域映射任务已结束，存在部分失败对象' : '后台全域映射任务已完成')
@@ -1258,10 +1330,11 @@ const refreshActiveTask = async () => {
   } catch (e) {}
 }
 
-const loadActiveTaskResult = () => {
+const loadActiveTaskResult = async () => {
   if (!activeTaskDetail.value?.result) return
-  result.value = activeTaskDetail.value.result
-  selectedEntityIds.value = ((activeTaskDetail.value.result?.entities || []) as any[])
+  const hydratedResult = await hydratePersistedRelationMappings(activeTaskDetail.value.result)
+  result.value = hydratedResult
+  selectedEntityIds.value = ((hydratedResult?.entities || []) as any[])
     .filter(entity => (entity.mappings || []).length > 0 || Boolean(entity.node_mapping?.node_sql))
     .map(entity => entity.entity_id)
   ElMessage.success('已载入后台任务结果')

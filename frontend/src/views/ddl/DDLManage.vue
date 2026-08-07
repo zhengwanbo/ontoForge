@@ -367,12 +367,14 @@ const executionStatusType = (status: string) => ({ success: 'success', failed: '
 const relationMappingStatusLabel = (status?: string) => ({
   DEPLOYED: '已部署',
   STALE: '待重新部署',
+  SUGGESTED: '已生成建议',
   CONFIRMED: '已确认',
   PENDING: '待配置'
 }[status || ''] || '待配置')
 const relationMappingStatusType = (status?: string) => ({
   DEPLOYED: 'success',
   STALE: 'warning',
+  SUGGESTED: 'info',
   CONFIRMED: 'info',
   PENDING: 'danger'
 }[status || ''] || 'danger')

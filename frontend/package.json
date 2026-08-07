@@ -18,6 +18,8 @@
     "@vue-flow/minimap": "^1.5.4",
     "axios": "^1.18.1",
     "codemirror": "^6.0.2",
+    "cytoscape": "^3.34.0",
+    "echarts": "^6.1.0",
     "element-plus": "^2.14.3",
     "pinia": "^3.0.4",
     "vue": "^3.5.39",

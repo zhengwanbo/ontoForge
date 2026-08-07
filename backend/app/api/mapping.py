@@ -55,7 +55,28 @@ def _set_relation_edge_table_name(
             SysOntologyRelation.relation_table_name == normalized,
         ).first()
         if duplicate:
-            raise HTTPException(status_code=400, detail=f"边表名 {normalized} 已被关系「{duplicate.relation_name}」使用")
+            # Older automatic designs could assign the same readable edge name
+            # to two distinct semantic relations with identical endpoints (for
+            # example, “调拨至” and “从出库”).  Keep the requested base name
+            # but make this relation's physical edge name deterministic and
+            # unique, so a subsequent save can repair those legacy records.
+            relation_suffix = re.sub(r"[^A-Z0-9_$#]", "", (relation.relation_id or "").upper())[-12:]
+            unique_name = f"{normalized[:115 - len(relation_suffix)]}_{relation_suffix}" if relation_suffix else ""
+            unique_duplicate = db.query(SysOntologyRelation).filter(
+                SysOntologyRelation.domain_id == relation.domain_id,
+                SysOntologyRelation.relation_id != relation.relation_id,
+                SysOntologyRelation.relation_table_name == unique_name,
+            ).first() if unique_name else None
+            if not unique_name or unique_duplicate:
+                raise HTTPException(status_code=400, detail=f"边表名 {normalized} 已被关系「{duplicate.relation_name}」使用，请修改英文边表名")
+            logger.warning(
+                "Resolve duplicate relation edge table name: relation_id=%s duplicate_relation_id=%s old=%s new=%s",
+                relation.relation_id,
+                duplicate.relation_id,
+                normalized,
+                unique_name,
+            )
+            normalized = unique_name
     relation.relation_table_name = normalized or None
 
 
@@ -443,6 +464,10 @@ def _build_relation_mapping_draft(
     blueprint_payload: Optional[dict],
     table_column_cache: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
+    task_recommendation = _find_latest_relation_task_recommendation(db, relation)
+    if task_recommendation:
+        return task_recommendation
+
     source_entity_context = _build_blueprint_mapping_context(blueprint_payload, relation.source_entity) if relation.source_entity else {}
     target_entity_context = _build_blueprint_mapping_context(blueprint_payload, relation.target_entity) if relation.target_entity else {}
     relation_recommendation = _find_blueprint_relation_recommendation(blueprint_payload, relation) or {}
@@ -518,6 +543,79 @@ def _build_relation_mapping_draft(
     }
 
 
+def _find_latest_relation_task_recommendation(
+    db: Session,
+    relation: SysOntologyRelation,
+) -> Optional[Dict[str, Any]]:
+    """Return the newest verified relation suggestion from bulk mapping history.
+
+    Bulk-generation results are task snapshots, while relation mappings are
+    saved independently.  Before a user applies a suggestion, the management
+    page must still be able to show that verified recommendation rather than
+    treating the relation as empty.
+    """
+    tasks = (
+        db.query(SysMappingTask)
+        .filter(
+            SysMappingTask.domain_id == relation.domain_id,
+            SysMappingTask.task_type == "BULK_GENERATE",
+            SysMappingTask.status.in_(["SUCCESS", "PARTIAL"]),
+        )
+        .order_by(SysMappingTask.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    for task in tasks:
+        try:
+            task_result = json.loads(task.result_json or "{}")
+        except Exception:
+            continue
+        if not isinstance(task_result, dict):
+            continue
+        recommendation = next(
+            (
+                item for item in (task_result.get("relations") or [])
+                if isinstance(item, dict) and item.get("relation_id") == relation.relation_id
+            ),
+            None,
+        )
+        if not recommendation or str(recommendation.get("status") or "").upper() not in {"READY", "APPLIED"}:
+            continue
+        join_recommendation = recommendation.get("join_recommendation") or {}
+        join_condition = str(join_recommendation.get("join_condition") or "").strip()
+        if not join_condition:
+            continue
+        oracle_edge = recommendation.get("oracle_edge") or {}
+        source_table = str(
+            recommendation.get("source_table")
+            or oracle_edge.get("source_vertex_table")
+            or (relation.source_entity.table_name if relation.source_entity else "")
+            or f"ONTO_NODE_{(relation.source_entity.entity_name if relation.source_entity else relation.source_entity_id).upper()}"
+        ).strip().upper()
+        target_table = str(
+            recommendation.get("target_table")
+            or oracle_edge.get("target_vertex_table")
+            or (relation.target_entity.table_name if relation.target_entity else "")
+            or f"ONTO_NODE_{(relation.target_entity.entity_name if relation.target_entity else relation.target_entity_id).upper()}"
+        ).strip().upper()
+        if not source_table or not target_table:
+            continue
+        return {
+            "source_table": source_table,
+            "target_table": target_table,
+            "join_condition": join_condition,
+            "edge_sql": "",
+            "blueprint_recommendation": {
+                "relation_name": relation.relation_name,
+                "task_id": task.task_id,
+                "task_created_at": task.created_at.isoformat() if task.created_at else None,
+                "design_reason": join_recommendation.get("design_reason") or "",
+                "recommendation_source": "latest_bulk_mapping_task",
+            },
+        }
+    return None
+
+
 def _build_bulk_relation_mapping_result(
     db: Session,
     relation: SysOntologyRelation,
@@ -537,9 +635,24 @@ def _build_bulk_relation_mapping_result(
     target_vertex_table = str(target_node_mapping.get("node_table_name") or target_vertex.get("vertex_table") or "").strip().upper()
     source_key_property = str(source_node_mapping.get("key_property_name") or source_vertex.get("key_property") or "").strip()
     target_key_property = str(target_node_mapping.get("key_property_name") or target_vertex.get("key_property") or "").strip()
+    source_data_tables = [
+        str(table_name).strip().upper()
+        for table_name in (source_node_mapping.get("source_tables") or [])
+        if str(table_name).strip()
+    ]
+    target_data_tables = [
+        str(table_name).strip().upper()
+        for table_name in (target_node_mapping.get("source_tables") or [])
+        if str(table_name).strip()
+    ]
+    # A physical edge always joins the two ontology node tables.  Keep raw
+    # source tables only as provenance in the recommendation; never persist
+    # them as the edge's src/dst tables.
+    source_table = source_vertex_table
+    target_table = target_vertex_table
     join_condition = str(graph_relation_mapping.get("join_condition") or "").strip()
     node_ready = bool(source_vertex_table and target_vertex_table and source_key_property and target_key_property)
-    ready = bool(node_ready and join_condition)
+    ready = bool(node_ready and source_table and target_table and join_condition)
 
     return {
         "relation_id": relation.relation_id,
@@ -557,6 +670,8 @@ def _build_bulk_relation_mapping_result(
         "target_entity_id": relation.target_entity_id,
         "target_entity_name": relation.target_entity.entity_name if relation.target_entity else "",
         "target_entity_display_name": relation.target_entity.entity_display_name if relation.target_entity else "",
+        "source_table": source_table,
+        "target_table": target_table,
         "mapping_status": "DESIGNED" if ready else "PENDING",
         "status": "READY" if ready else "EMPTY",
         "diff_status": "ADDED",
@@ -572,7 +687,7 @@ def _build_bulk_relation_mapping_result(
         },
         "join_recommendation": {
             "join_condition": join_condition,
-            "source_tables": graph_relation_mapping.get("source_tables") or [],
+            "source_tables": graph_relation_mapping.get("source_tables") or source_data_tables + target_data_tables,
             "design_reason": graph_relation_mapping.get("design_reason") or "",
             "validated": bool(join_condition),
             "message": (

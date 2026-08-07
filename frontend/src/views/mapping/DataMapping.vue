@@ -274,7 +274,7 @@
           <div class="card-header">
             <div class="relation-card-heading">
               <span>当前实体关系与实现配置</span>
-              <span class="relation-card-hint">先展示本体节点之间的关系，再配置该关系如何由源数据实现</span>
+              <span class="relation-card-hint">边表始终连接本体节点表；仅在下方维护用于证明关系的源数据 Join</span>
             </div>
             <div class="header-actions">
               <el-checkbox v-model="showOnlyManualReview">仅显示待人工确认（{{ manualReviewRelationCount }}）</el-checkbox>
@@ -297,6 +297,7 @@
                   <el-tag v-if="row.source_entity_id === currentEntityId" size="small" type="primary">当前实体</el-tag>
                 </div>
                 <div class="ontology-node-name">{{ row.source_entity_name }}</div>
+                <code class="ontology-node-table">{{ row.source_node_table }}</code>
               </div>
             </template>
           </el-table-column>
@@ -325,10 +326,11 @@
                   <el-tag v-if="row.target_entity_id === currentEntityId" size="small" type="primary">当前实体</el-tag>
                 </div>
                 <div class="ontology-node-name">{{ row.target_entity_name }}</div>
+                <code class="ontology-node-table">{{ row.target_node_table }}</code>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="源数据实现" min-width="390">
+          <el-table-column label="边关系实现" min-width="390">
             <template #default="{ row }">
               <el-radio-group v-model="row.mapping_mode" size="small" style="margin-bottom: 8px">
                 <el-radio-button value="DIRECT">直接 Join</el-radio-button>
@@ -343,27 +345,30 @@
               </template>
               <div v-if="row.mapping_mode !== 'RELATION_TABLE'" class="relation-source-implementation">
                 <label class="relation-source-field">
-                  <span>源节点来源表</span>
-                  <el-select v-model="row.source_table" size="small" placeholder="选择源节点来源表" filterable>
+                  <span>源节点表（src）</span>
+                  <el-select v-model="row.source_table" size="small" placeholder="选择本体源节点表" filterable>
                     <el-option
-                      v-for="t in sourceTables"
-                      :key="`src-${row.relation_id}-${t.table_name}`"
-                      :label="t.comments ? `${t.table_name} (${t.comments})` : t.table_name"
-                      :value="t.table_name"
+                      v-for="node in nodeTableOptions"
+                      :key="`src-${row.relation_id}-${node.table_name}`"
+                      :label="node.label"
+                      :value="node.table_name"
                     />
                   </el-select>
                 </label>
                 <label class="relation-source-field">
-                  <span>目标节点来源表</span>
-                  <el-select v-model="row.target_table" size="small" placeholder="选择目标节点来源表" filterable>
+                  <span>目标节点表（dst）</span>
+                  <el-select v-model="row.target_table" size="small" placeholder="选择本体目标节点表" filterable>
                     <el-option
-                      v-for="t in sourceTables"
-                      :key="`dst-${row.relation_id}-${t.table_name}`"
-                      :label="t.comments ? `${t.table_name} (${t.comments})` : t.table_name"
-                      :value="t.table_name"
+                      v-for="node in nodeTableOptions"
+                      :key="`dst-${row.relation_id}-${node.table_name}`"
+                      :label="node.label"
+                      :value="node.table_name"
                     />
                   </el-select>
                 </label>
+                <div class="relation-node-join-hint">
+                  边表直接连接：{{ row.source_node_table }} → {{ row.target_node_table }}。Join 条件中的 src、dst 分别对应所选节点表。
+                </div>
               </div>
             </template>
           </el-table-column>
@@ -484,6 +489,8 @@ interface RelationMappingRow {
   target_entity_id: string
   source_entity_name: string
   target_entity_name: string
+  source_node_table: string
+  target_node_table: string
   edge_table_name: string
   source_table: string
   target_table: string
@@ -645,6 +652,21 @@ const getEntityName = (entityId: string) => {
   const node = mappingNodes.value.find(item => item.id === entityId)
   return node?.displayName || node?.name || entityId
 }
+
+const getEntityNodeTable = (entityId: string) => {
+  const entity = entities.value.find(item => item.entity_id === entityId)
+  const configuredTable = (entity?.table_name || '').trim().toUpperCase()
+  if (configuredTable) return configuredTable
+  const entityName = (entity?.entity_name || getEntityName(entityId) || entityId)
+    .replace(/[^A-Za-z0-9_]/g, '_')
+    .toUpperCase()
+  return `ONTO_NODE_${entityName}`
+}
+
+const nodeTableOptions = computed(() => entities.value.map(entity => ({
+  table_name: getEntityNodeTable(entity.entity_id),
+  label: `${getEntityNodeTable(entity.entity_id)}（${entity.entity_display_name || entity.entity_name}）`,
+})))
 
 const createLocalRowId = () => `row_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
 
@@ -829,9 +851,11 @@ const loadRelationMappings = async () => {
         target_entity_id: edge.target,
         source_entity_name: getEntityName(edge.source),
         target_entity_name: getEntityName(edge.target),
+        source_node_table: getEntityNodeTable(edge.source),
+        target_node_table: getEntityNodeTable(edge.target),
         edge_table_name: mapping?.edge_table_name || '',
-        source_table: mapping?.source_table || '',
-        target_table: mapping?.target_table || '',
+        source_table: mapping?.source_table?.toUpperCase().startsWith('ONTO_NODE_') ? mapping.source_table : getEntityNodeTable(edge.source),
+        target_table: mapping?.target_table?.toUpperCase().startsWith('ONTO_NODE_') ? mapping.target_table : getEntityNodeTable(edge.target),
         join_condition: mapping?.join_condition || '',
         edge_sql: mapping?.edge_sql || '',
         mapping_status: mapping?.mapping_status || 'PENDING',
@@ -856,6 +880,8 @@ const loadRelationMappings = async () => {
       target_entity_id: edge.target,
       source_entity_name: getEntityName(edge.source),
       target_entity_name: getEntityName(edge.target),
+      source_node_table: getEntityNodeTable(edge.source),
+      target_node_table: getEntityNodeTable(edge.target),
       edge_table_name: '',
       source_table: '',
       target_table: '',
@@ -1565,6 +1591,14 @@ onMounted(async () => {
   word-break: break-word;
 }
 
+.ontology-node-table {
+  display: block;
+  margin-top: 6px;
+  color: #3d6f9e;
+  font-size: 11px;
+  word-break: break-all;
+}
+
 .relation-config-title {
   font-size: 13px;
   font-weight: 600;
@@ -1617,6 +1651,13 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.relation-node-join-hint {
+  grid-column: 1 / -1;
+  color: #62788f;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .join-candidate-main code {

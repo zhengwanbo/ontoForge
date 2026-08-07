@@ -301,16 +301,41 @@ onMounted(() => {
 <style scoped>
 .layout-container {
   height: 100vh;
+  min-height: 0;
+  overflow: hidden;
 }
 .sidebar {
   background-color: #1a3a5c;
   transition: width 0.3s;
   overflow: hidden;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.sidebar :deep(.el-menu) {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,.35) transparent;
+}
+.sidebar :deep(.el-menu::-webkit-scrollbar) {
+  width: 7px;
+}
+.sidebar :deep(.el-menu::-webkit-scrollbar-thumb) {
+  background: rgba(255,255,255,.32);
+  border-radius: 8px;
+}
+.sidebar :deep(.el-menu::-webkit-scrollbar-track) {
+  background: transparent;
 }
 .logo-area {
   padding: 16px;
   color: #fff;
   border-bottom: 1px solid rgba(255,255,255,0.1);
+  flex-shrink: 0;
 }
 .logo-title {
   display: flex;

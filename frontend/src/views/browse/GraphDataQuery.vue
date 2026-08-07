@@ -21,14 +21,16 @@
     <div v-if="result" class="result-layout">
       <el-card shadow="never" class="graph-result-card">
         <template #header><div class="card-header"><span>查询图形结果</span><el-tag>{{ graphData.nodes.length }} 个节点 / {{ graphData.edges.length }} 条边</el-tag></div></template>
-        <div class="graph-canvas">
-          <svg v-if="graphData.nodes.length" viewBox="0 0 1100 620" class="graph-svg">
-            <defs><marker id="query-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#64748b" /></marker></defs>
-            <g v-for="edge in graphData.edges" :key="edge.id"><line :x1="nodePosition(edge.source).x" :y1="nodePosition(edge.source).y" :x2="nodePosition(edge.target).x" :y2="nodePosition(edge.target).y" class="edge-line" marker-end="url(#query-arrow)" /><text :x="(nodePosition(edge.source).x + nodePosition(edge.target).x) / 2" :y="(nodePosition(edge.source).y + nodePosition(edge.target).y) / 2 - 8" class="edge-text">{{ edge.label }}</text></g>
-            <g v-for="node in graphData.nodes" :key="node.id" :transform="`translate(${nodePosition(node.id).x}, ${nodePosition(node.id).y})`" class="query-node"><circle r="35" /><text y="4">{{ node.label }}</text></g>
-          </svg>
-          <el-empty v-else description="查询结果中没有可绘制的关系数据" />
+        <div v-if="graphData.nodes.length" ref="graphChartRef" class="graph-canvas"></div>
+        <el-empty v-else description="查询结果中没有可绘制的关系数据" />
+        <div v-if="selectedQueryNode" class="node-detail">
+          <div class="node-detail-heading"><span class="node-detail-dot" :style="{ background: graphNodeColor(selectedQueryNode.id) }"></span><strong>{{ selectedQueryNode.label }}</strong><el-tag size="small" effect="plain">{{ graphNodeType(selectedQueryNode.id) }}</el-tag></div>
+          <el-descriptions :column="2" border size="small" class="node-detail-properties">
+            <el-descriptions-item v-for="item in selectedNodeProperties" :key="item.key" :label="item.key">{{ item.value }}</el-descriptions-item>
+            <el-descriptions-item label="关联关系">{{ selectedNodeRelationNames || '无' }}</el-descriptions-item>
+          </el-descriptions>
         </div>
+        <div v-else-if="graphData.nodes.length" class="node-detail-placeholder">点击图中的实例节点，可查看其主要属性和关联关系。</div>
       </el-card>
       <el-card shadow="never" class="table-result-card">
         <template #header><div class="card-header"><span>原始查询结果</span><span class="result-meta">{{ result.source_name }} / {{ result.schema }} / {{ result.rows?.length || 0 }} 行</span></div></template>
@@ -39,7 +41,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import * as echarts from 'echarts'
 import { ElMessage } from 'element-plus'
 import { domainApi, sourceApi } from '../../api'
 import { useAppStore } from '../../stores/app'
@@ -54,17 +57,31 @@ const sources = ref<any[]>([])
 const schemas = ref<string[]>([])
 const result = ref<any>(null)
 const executing = ref(false)
-const graphSql = ref(`SELECT
-  a.element_id AS source_id,
-  a.element_id AS source_label,
-  b.element_id AS target_id,
-  b.element_id AS target_label,
-  e.label AS relation_name
-FROM GRAPH_TABLE (
-  <PROPERTY_GRAPH_NAME>
-  MATCH (a)-[e]->(b)
-  COLUMNS (a.element_id, b.element_id, e.label)
-)`)
+const graphChartRef = ref<HTMLElement | null>(null)
+const selectedQueryNode = ref<any>(null)
+let graphChart: echarts.ECharts | null = null
+const graphSql = ref(`WITH trace_path AS (
+  SELECT * FROM GRAPH_TABLE(
+    PG_JDXQ_SUPPLY_TRACE
+    MATCH (b IS BOTTLECODE)-[e1 IS GRAPH_LABEL]->(p IS PACKCODE)-[e2 IS GRAPH_LABEL]->(c IS CASECODE)-[e3 IS GRAPH_LABEL]->(pal IS PALLETCODE)-[e4 IS GRAPH_LABEL]->(s IS STACKCODE)
+    COLUMNS (
+      b.BOTTLE_ID AS bottle_id, b.BOTTLE_CODE AS bottle_code,
+      p.PACK_ID AS pack_id, p.PACK_CODE AS pack_code,
+      c.CASE_ID AS case_id, c.CASE_CODE AS case_code,
+      pal.PALLET_ID AS pallet_id, pal.PALLET_CODE AS pallet_code,
+      s.STACK_ID AS stack_id, s.STACK_CODE AS stack_code,
+      e1.RELATION_NAME AS bottle_pack_relation, e2.RELATION_NAME AS pack_case_relation,
+      e3.RELATION_NAME AS case_pallet_relation, e4.RELATION_NAME AS pallet_stack_relation
+    )
+  )
+)
+SELECT 'BOTTLE:' || bottle_id AS source_id, bottle_code AS source_label, 'PACK:' || pack_id AS target_id, pack_code AS target_label, bottle_pack_relation AS relation_name FROM trace_path WHERE bottle_code = 'BOT-202608-000001'
+UNION ALL
+SELECT 'PACK:' || pack_id, pack_code, 'CASE:' || case_id, case_code, pack_case_relation FROM trace_path WHERE bottle_code = 'BOT-202608-000001'
+UNION ALL
+SELECT 'CASE:' || case_id, case_code, 'PALLET:' || pallet_id, pallet_code, case_pallet_relation FROM trace_path WHERE bottle_code = 'BOT-202608-000001'
+UNION ALL
+SELECT 'PALLET:' || pallet_id, pallet_code, 'STACK:' || stack_id, stack_code, pallet_stack_relation FROM trace_path WHERE bottle_code = 'BOT-202608-000001'`)
 
 const canExecute = computed(() => Boolean(domainId.value && sourceId.value && graphSql.value.trim()))
 const rowValue = (row: any, names: string[]) => { const key = Object.keys(row || {}).find(item => names.includes(item.toUpperCase())); return key ? String(row[key] ?? '') : '' }
@@ -75,18 +92,59 @@ const graphData = computed(() => {
     if (!source || !target) return
     const sourceLabel = rowValue(row, ['SOURCE_LABEL', 'SOURCE_NAME', 'FROM_LABEL']) || source
     const targetLabel = rowValue(row, ['TARGET_LABEL', 'TARGET_NAME', 'TO_LABEL']) || target
-    nodeMap.set(source, { id: source, label: sourceLabel }); nodeMap.set(target, { id: target, label: targetLabel })
+    const readProperties = (side: 'source' | 'target', id: string, label: string) => {
+      const prefixes = side === 'source' ? ['SOURCE_', 'FROM_'] : ['TARGET_', 'TO_']
+      const properties: Record<string, string> = { 实例标识: id, 实例名称: label, 实体类型: graphNodeType(id) }
+      Object.entries(row).forEach(([key, value]) => {
+        const upperKey = key.toUpperCase()
+        if (prefixes.some(prefix => upperKey.startsWith(prefix)) && !/(?:_ID|_LABEL|_NAME)$/.test(upperKey) && value != null && value !== '') properties[key] = String(value)
+      })
+      return properties
+    }
+    nodeMap.set(source, { id: source, label: sourceLabel, properties: readProperties('source', source, sourceLabel) }); nodeMap.set(target, { id: target, label: targetLabel, properties: readProperties('target', target, targetLabel) })
     edges.push({ id: `${source}-${target}-${index}`, source, target, label: rowValue(row, ['RELATION_NAME', 'EDGE_LABEL', 'LABEL', 'RELATION']) || '关联' })
   })
   return { nodes: Array.from(nodeMap.values()).slice(0, 80), edges: edges.slice(0, 160) }
 })
-const nodePosition = (id: string) => { const index = graphData.value.nodes.findIndex((node: any) => node.id === id); const count = Math.max(graphData.value.nodes.length, 1); const angle = (Math.PI * 2 * index) / count - Math.PI / 2; const radius = Math.min(230, Math.max(100, count * 11)); return { x: 550 + radius * Math.cos(angle), y: 310 + radius * Math.sin(angle) } }
+const graphPalette = ['#2563eb', '#0891b2', '#059669', '#7c3aed', '#ea580c', '#db2777', '#65a30d']
+const graphNodeType = (id: string) => String(id || '').split(':', 1)[0] || '实体'
+const graphNodeColor = (id: string) => graphPalette[Math.abs(Array.from(graphNodeType(id)).reduce((value, char) => value + char.charCodeAt(0), 0)) % graphPalette.length]
+const selectedNodeProperties = computed(() => Object.entries(selectedQueryNode.value?.properties || {}).slice(0, 8).map(([key, value]) => ({ key, value })))
+const selectedNodeRelationNames = computed(() => Array.from(new Set(graphData.value.edges.filter((edge: any) => edge.source === selectedQueryNode.value?.id || edge.target === selectedQueryNode.value?.id).map((edge: any) => edge.label))).join('、'))
+const renderGraph = async () => {
+  await nextTick()
+  if (!graphChartRef.value || !graphData.value.nodes.length) { graphChart?.clear(); return }
+  if (!graphChart) {
+    graphChart = echarts.init(graphChartRef.value)
+    graphChart.on('click', (params: any) => { if (params.dataType === 'node') selectedQueryNode.value = graphData.value.nodes.find((node: any) => node.id === params.data.id) || null })
+  }
+  const visibleIds = new Set(graphData.value.nodes.map((node: any) => node.id))
+  const typeNames = Array.from(new Set(graphData.value.nodes.map((node: any) => graphNodeType(node.id))))
+  const typeIndex = new Map(typeNames.map((name, index) => [name, index]))
+  graphChart.setOption({
+    animationDurationUpdate: 450,
+    tooltip: { trigger: 'item', formatter: (params: any) => params.dataType === 'edge' ? `关系：${params.data.value}` : `<b>${params.data.label}</b><br/>${params.data.type}` },
+    series: [{
+      type: 'graph', layout: 'force', roam: true, draggable: true,
+      categories: typeNames.map((name, index) => ({ name, itemStyle: { color: graphPalette[index % graphPalette.length] } })),
+      data: graphData.value.nodes.map((node: any) => ({ id: node.id, name: node.label, label: node.label, type: graphNodeType(node.id), category: typeIndex.get(graphNodeType(node.id)) || 0, symbol: 'circle', symbolSize: 62, itemStyle: { color: graphNodeColor(node.id), borderColor: '#fff', borderWidth: 2, shadowBlur: 8, shadowColor: 'rgba(15, 23, 42, .18)' } })),
+      links: graphData.value.edges.filter((edge: any) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).map((edge: any) => ({ source: edge.source, target: edge.target, value: edge.label })),
+      edgeSymbol: ['none', 'arrow'], edgeSymbolSize: [0, 9],
+      label: { show: true, position: 'inside', color: '#fff', fontSize: 10, fontWeight: 650, width: 54, overflow: 'truncate' },
+      edgeLabel: { show: true, formatter: (params: any) => params.data.value, color: '#475569', fontSize: 10, backgroundColor: 'rgba(255,255,255,.9)', padding: [3, 5], borderRadius: 4 },
+      lineStyle: { color: '#94a3b8', width: 1.6, curveness: .12, opacity: .88 },
+      emphasis: { focus: 'adjacency', lineStyle: { color: '#2563eb', width: 3 } },
+      force: { repulsion: 850, edgeLength: [115, 220], gravity: .1, layoutAnimation: true }
+    }]
+  }, true)
+}
+const resizeGraph = () => graphChart?.resize()
 const loadDomains = async () => { try { const res = await domainApi.list('ACTIVE'); domains.value = res.data || [] } catch (_) {} }
 const loadSources = async () => { if (!domainId.value) return; try { const res = await sourceApi.listDataSources(domainId.value); sources.value = (res.data || []).filter((item: any) => (item.db_type || '').toLowerCase() === 'oracle'); sourceId.value = sources.value.find((item: any) => item.is_default === 'Y')?.source_id || sources.value[0]?.source_id || ''; await loadSchemas() } catch (_) { sources.value = [] } }
 const loadSchemas = async () => { if (!sourceId.value) { schemas.value = []; return }; try { const res = await sourceApi.getSchemas(sourceId.value); schemas.value = res.data?.schemas || []; schema.value = res.data?.default_schema || schemas.value[0] || '' } catch (_) { schemas.value = [] } }
 const handleDomainChange = async () => { const domain = domains.value.find(item => item.domain_id === domainId.value); appStore.setCurrentDomain(domainId.value, domain?.domain_name || ''); result.value = null; sourceId.value = ''; schema.value = ''; await loadSources() }
 const handleSourceChange = async () => { result.value = null; await loadSchemas() }
-const executeQuery = async () => { if (!canExecute.value) return; executing.value = true; try { const res = await sourceApi.executeGraphQuery({ domain_id: domainId.value, source_id: sourceId.value, schema: schema.value || undefined, graph_sql: graphSql.value, row_limit: rowLimit.value }); result.value = res.data; ElMessage.success(`查询完成，返回 ${res.data?.rows?.length || 0} 行`) } catch (_) {} finally { executing.value = false } }
+const executeQuery = async () => { if (!canExecute.value) return; executing.value = true; try { const res = await sourceApi.executeGraphQuery({ domain_id: domainId.value, source_id: sourceId.value, schema: schema.value || undefined, graph_sql: graphSql.value, row_limit: rowLimit.value }); selectedQueryNode.value = null; result.value = res.data; void renderGraph(); ElMessage.success(`查询完成，返回 ${res.data?.rows?.length || 0} 行`) } catch (_) {} finally { executing.value = false } }
 watch(() => appStore.currentDomainId, async (currentDomainId) => {
   if (currentDomainId === domainId.value) return
   domainId.value = currentDomainId || ''
@@ -95,9 +153,11 @@ watch(() => appStore.currentDomainId, async (currentDomainId) => {
   schema.value = ''
   await loadSources()
 })
-onMounted(async () => { await loadDomains(); if (domainId.value) await loadSources() })
+watch(result, value => { if (!value) { selectedQueryNode.value = null; graphChart?.dispose(); graphChart = null } })
+onMounted(async () => { window.addEventListener('resize', resizeGraph); await loadDomains(); if (domainId.value) await loadSources() })
+onBeforeUnmount(() => { window.removeEventListener('resize', resizeGraph); graphChart?.dispose(); graphChart = null })
 </script>
 
 <style scoped>
-.graph-query-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.query-card, .graph-result-card, .table-result-card { border-color: #e4eaf2; }.query-form { display: grid; grid-template-columns: 1.2fr 1.3fr 1fr 105px auto; gap: 10px; }.form-hint { margin: 10px 0; color: #64748b; font-size: 12px; }.form-hint code { color: #2563eb; }.sql-editor :deep(textarea) { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; }.result-alert { margin: 16px 0; }.result-layout { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; }.card-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.result-meta { color: #64748b; font-size: 12px; }.graph-canvas { height: 590px; overflow: hidden; background: radial-gradient(circle at 1px 1px, #d6e0eb 1px, transparent 1.2px); background-size: 22px 22px; }.graph-svg { width: 100%; height: 100%; }.edge-line { stroke: #94a3b8; stroke-width: 1.7; }.edge-text { fill: #475569; font-size: 11px; text-anchor: middle; }.query-node circle { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; }.query-node text { fill: #1e3a5f; font-size: 10px; text-anchor: middle; pointer-events: none; }.table-result-card { min-width: 0; } @media (max-width: 1200px) { .query-form, .result-layout { grid-template-columns: 1fr; }.graph-canvas { height: 460px; } }
+.graph-query-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.query-card, .graph-result-card, .table-result-card { border-color: #e4eaf2; }.query-form { display: grid; grid-template-columns: 1.2fr 1.3fr 1fr 105px auto; gap: 10px; }.form-hint { margin: 10px 0; color: #64748b; font-size: 12px; }.form-hint code { color: #2563eb; }.sql-editor :deep(textarea) { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; }.result-alert { margin: 16px 0; }.result-layout { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; }.card-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.result-meta { color: #64748b; font-size: 12px; }.graph-canvas { height: 590px; overflow: hidden; background: radial-gradient(circle at 1px 1px, #d6e0eb 1px, transparent 1.2px); background-size: 22px 22px; }.node-detail, .node-detail-placeholder { margin: 12px 14px 14px; padding: 12px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }.node-detail-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: #0f172a; font-size: 13px; }.node-detail-dot { width: 10px; height: 10px; border-radius: 50%; }.node-detail-properties { background: #fff; }.node-detail-placeholder { color: #64748b; font-size: 12px; }.table-result-card { min-width: 0; } @media (max-width: 1200px) { .query-form, .result-layout { grid-template-columns: 1fr; }.graph-canvas { height: 460px; } }
 </style>

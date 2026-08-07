@@ -18,6 +18,7 @@ from app.models.models import (
     generate_id,
 )
 from app.services.source_data_service import SourceDataService
+from app.api.mapping import _find_latest_relation_task_recommendation
 import json
 import re
 import time
@@ -155,9 +156,105 @@ def _serialize_entity(entity) -> dict:
     }
 
 
-def _serialize_relation(relation) -> dict:
+def _relation_mapping_is_complete(mapping: Optional[SysRelationMapping]) -> bool:
+    if not mapping:
+        return False
+    if (mapping.mapping_mode or "DIRECT").upper() == "RELATION_TABLE":
+        return bool(
+            (mapping.relation_table or "").strip()
+            and (mapping.relation_source_column or "").strip()
+            and (mapping.relation_target_column or "").strip()
+        )
+    return bool(
+        (mapping.source_table or "").strip()
+        and (mapping.target_table or "").strip()
+        and (mapping.join_condition or "").strip()
+    )
+
+
+def _effective_relation_mapping(db: Session, relation: SysOntologyRelation) -> dict:
+    """Return persisted mapping, augmented with the latest verified task draft."""
+    mapping = getattr(relation, "relation_mapping", None)
+    if _relation_mapping_is_complete(mapping):
+        return {
+            "mapping_id": mapping.mapping_id,
+            "relation_id": mapping.relation_id,
+            "source_table": mapping.source_table,
+            "target_table": mapping.target_table,
+            "join_condition": mapping.join_condition,
+            "edge_sql": mapping.edge_sql,
+            "mapping_mode": mapping.mapping_mode or "DIRECT",
+            "relation_table": mapping.relation_table,
+            "relation_source_column": mapping.relation_source_column,
+            "relation_target_column": mapping.relation_target_column,
+            "mapping_status": mapping.mapping_status,
+            "recommendation_source": "persisted_mapping",
+        }
+    recommendation = _find_latest_relation_task_recommendation(db, relation)
+    if recommendation:
+        return {
+            "mapping_id": mapping.mapping_id if mapping else "",
+            "relation_id": relation.relation_id,
+            "source_table": recommendation.get("source_table"),
+            "target_table": recommendation.get("target_table"),
+            "join_condition": recommendation.get("join_condition"),
+            "edge_sql": "",
+            "mapping_mode": "DIRECT",
+            "relation_table": "",
+            "relation_source_column": "",
+            "relation_target_column": "",
+            "mapping_status": "SUGGESTED",
+            "recommendation_source": "latest_bulk_mapping_task",
+        }
+    return {
+        "mapping_id": mapping.mapping_id if mapping else "",
+        "relation_id": relation.relation_id,
+        "source_table": mapping.source_table if mapping else "",
+        "target_table": mapping.target_table if mapping else "",
+        "join_condition": mapping.join_condition if mapping else "",
+        "edge_sql": mapping.edge_sql if mapping else "",
+        "mapping_mode": mapping.mapping_mode if mapping else "DIRECT",
+        "relation_table": mapping.relation_table if mapping else "",
+        "relation_source_column": mapping.relation_source_column if mapping else "",
+        "relation_target_column": mapping.relation_target_column if mapping else "",
+        "mapping_status": mapping.mapping_status if mapping else "PENDING",
+        "recommendation_source": "none",
+    }
+
+
+def _sync_verified_relation_recommendations(db: Session, relations: list[SysOntologyRelation]) -> None:
+    """Materialize valid latest-task Join suggestions before DDL generation."""
+    changed = False
+    for relation in relations:
+        mapping = getattr(relation, "relation_mapping", None)
+        if _relation_mapping_is_complete(mapping):
+            continue
+        recommendation = _find_latest_relation_task_recommendation(db, relation)
+        if not recommendation:
+            continue
+        if not mapping:
+            mapping = SysRelationMapping(mapping_id=generate_id("rmap"), relation_id=relation.relation_id)
+            db.add(mapping)
+            relation.relation_mapping = mapping
+        mapping.source_table = recommendation.get("source_table") or None
+        mapping.target_table = recommendation.get("target_table") or None
+        mapping.join_condition = recommendation.get("join_condition") or None
+        mapping.edge_sql = None
+        mapping.mapping_mode = "DIRECT"
+        mapping.relation_table = None
+        mapping.relation_source_column = None
+        mapping.relation_target_column = None
+        mapping.mapping_status = "STALE"
+        mapping.mapped_at = datetime.utcnow()
+        changed = True
+    if changed:
+        db.flush()
+
+
+def _serialize_relation(db: Session, relation: SysOntologyRelation) -> dict:
     relation_mapping = getattr(relation, "relation_mapping", None)
-    mapping_status = getattr(relation_mapping, "mapping_status", None)
+    effective_mapping = _effective_relation_mapping(db, relation)
+    mapping_status = effective_mapping.get("mapping_status")
     # Legacy records were marked PENDING because they lacked the now-retired
     # edge_sql field, even when a complete physical Join had been saved.
     # Present these correctly as needing deployment rather than configuration.
@@ -178,15 +275,7 @@ def _serialize_relation(relation) -> dict:
         "relation_type": relation.relation_type,
         "relation_desc": relation.relation_desc,
         "relation_table_name": relation.relation_table_name,
-        "relation_mapping": {
-            "mapping_id": relation_mapping.mapping_id,
-            "relation_id": relation_mapping.relation_id,
-            "source_table": relation_mapping.source_table,
-            "target_table": relation_mapping.target_table,
-            "join_condition": relation_mapping.join_condition,
-            "edge_sql": relation_mapping.edge_sql,
-            "mapping_status": mapping_status,
-        } if relation_mapping else None,
+        "relation_mapping": {**effective_mapping, "mapping_status": mapping_status},
     }
 
 
@@ -224,7 +313,7 @@ async def get_ddl_context(
         "domain_id": domain.domain_id,
         "domain_name": domain.domain_name,
         "entities": [_serialize_entity(entity) for entity in entities],
-        "relations": [_serialize_relation(relation) for relation in relations],
+        "relations": [_serialize_relation(db, relation) for relation in relations],
         "blueprint": _serialize_blueprint_payload(latest_blueprint),
     })
 
@@ -257,6 +346,8 @@ async def generate_ddl(
     ).filter(
         SysOntologyRelation.domain_id == domain_id
     ).all()
+
+    _sync_verified_relation_recommendations(db, relations)
 
     ddl_service = DDLService(db)
     try:

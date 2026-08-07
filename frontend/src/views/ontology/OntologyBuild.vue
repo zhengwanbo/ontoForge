@@ -766,7 +766,40 @@
         </section>
 
         <section v-else-if="guideStep === 2" class="guide-step-body">
-          <el-empty v-if="!guidePreview" description="请先在第 1 步生成结构化分析结果。" :image-size="76" />
+          <el-empty v-if="!guidePreview" description="请先在第 1 步生成本体对象与关系建议。" :image-size="76" />
+          <div v-else-if="isLlmFirstGuide" class="guide-preview">
+            <div class="guide-preview-grid">
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">通用业务范围确认</div>
+                <div class="guide-preview-summary">生成策略：LLM 自由生成</div>
+                <div class="guide-preview-summary">业务目标：通用规则</div>
+                <div class="guide-preview-summary">MVP 范围：{{ guidePreview.ontology_design_document?.mvp_scope || '模型未返回范围说明' }}</div>
+                <div class="guide-preview-summary">范围说明：{{ guidePreview.ontology_design_document?.scope_reasoning || '-' }}</div>
+              </section>
+
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">已读取源表</div>
+                <div class="guide-preview-summary">已选择 {{ (guidePreview.selected_tables || []).length }} 张表</div>
+                <div class="guide-table-chip-list">
+                  <el-tag v-for="tableName in guidePreview.selected_tables || []" :key="tableName" size="small" effect="plain">{{ tableName }}</el-tag>
+                </div>
+              </section>
+
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">对象范围确认</div>
+                <div class="guide-preview-summary">建议实体：{{ guidePreview.entities?.length || 0 }} 个</div>
+                <div class="guide-preview-summary">建议关系：{{ guidePreview.relations?.length || 0 }} 条</div>
+                <div class="guide-preview-summary">首期对象：{{ (guidePreview.ontology_design_document?.included_entities || []).map((item: any) => item.entityDisplayName || item.entityName).join(' / ') || '未限定，将在本体预览中查看' }}</div>
+              </section>
+
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">延后项与实施说明</div>
+                <div v-for="item in guidePreview.ontology_design_document?.excluded_or_deferred || []" :key="`${item.name}-${item.reason}`" class="guide-preview-summary">{{ item.name }}：{{ item.reason || '延后处理' }}</div>
+                <div v-if="!(guidePreview.ontology_design_document?.excluded_or_deferred || []).length" class="guide-preview-summary">暂无延后项。</div>
+                <div v-for="note in guidePreview.ontology_design_document?.implementation_notes || []" :key="note" class="guide-preview-summary">{{ note }}</div>
+              </section>
+            </div>
+          </div>
           <div v-else class="guide-preview">
             <div class="guide-preview-grid">
               <section class="guide-preview-panel">
@@ -1314,6 +1347,7 @@ const filteredGuideTables = computed(() => {
 const activeGuideStepDescription = computed(() =>
   guideStepOptions.find(item => item.value === guideStep.value)?.description || ''
 )
+const isLlmFirstGuide = computed(() => guidePreview.value?.generation_strategy === 'llm_first')
 const availableGuideHistorySources = computed(() => {
   const candidates = [
     ...(guidePreview.value?.document_facts?.history_knowledge_sources || []),
@@ -1938,7 +1972,7 @@ const hasGuidePreviewContent = (payload: any) => {
 const canEnterGuideStep = (step: number) => {
   if (step <= 1) return true
   if (!guidePreview.value) return false
-  if (step === 2) return !!(guidePreview.value.document_facts || guidePreview.value.rule_analysis || guidePreview.value.schema_analysis)
+  if (step === 2) return isLlmFirstGuide.value || !!(guidePreview.value.document_facts || guidePreview.value.rule_analysis || guidePreview.value.schema_analysis)
   if (step === 3) return Array.isArray(guidePreview.value.entities) && guidePreview.value.entities.length > 0
   if (step === 4) return !!guidePreview.value.view_plan || !!guidePreview.value.deployment_design
   return false
@@ -2331,7 +2365,7 @@ const generateOntologyGuide = async (autoApply = false) => {
           ...latestPreview,
           apply_result: res.data?.apply_result || null,
         }
-        if (guidePreview.value?.document_facts || guidePreview.value?.rule_analysis || guidePreview.value?.schema_analysis) {
+        if (canEnterGuideStep(2)) {
           guideStep.value = 2
         }
         guideRunState.value = 'success'
@@ -2354,7 +2388,7 @@ const generateOntologyGuide = async (autoApply = false) => {
     }
 
     if (hasGuidePreviewContent(guidePreview.value) && guideRunState.value === 'running') {
-      if (guidePreview.value?.document_facts || guidePreview.value?.rule_analysis || guidePreview.value?.schema_analysis) {
+      if (canEnterGuideStep(2)) {
         guideStep.value = 2
       }
       guideRunState.value = 'success'
@@ -2394,7 +2428,7 @@ const reloadGuidePreview = async () => {
     const latestPreview = await loadLatestGuidePreview()
     if (hasGuidePreviewContent(latestPreview)) {
       guidePreview.value = latestPreview
-      if (guidePreview.value?.document_facts || guidePreview.value?.rule_analysis || guidePreview.value?.schema_analysis) {
+      if (canEnterGuideStep(2)) {
         guideStep.value = Math.max(guideStep.value, 2)
       }
       guideRunState.value = 'success'
@@ -3054,6 +3088,7 @@ onBeforeUnmount(() => {
 .guide-preview-tags, .guide-apply-summary { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 12px; color: #61748b; }
 .guide-preview-summary { font-size: 12px; line-height: 1.7; color: #54687f; }
 .guide-preview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.guide-table-chip-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 
 .natural-adjust-dialog { display: flex; flex-direction: column; gap: 14px; }
 .natural-adjust-banner { display: flex; justify-content: space-between; gap: 16px; padding: 14px 16px; background: linear-gradient(135deg, #fff8ee 0%, #fff2dc 100%); border: 1px solid #f6d8a7; border-radius: 12px; }

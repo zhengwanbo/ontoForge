@@ -52,7 +52,7 @@ class MappingOracleGraphTest(unittest.TestCase):
 
         self.assertFalse(annotated[0]["is_vertex_key"])
         self.assertTrue(annotated[1]["is_vertex_key"])
-        self.assertEqual(vertex["vertex_table"], "ONTO_WORKORDER_V")
+        self.assertEqual(vertex["vertex_table"], "ONTO_NODE_WORKORDER_V")
         self.assertEqual(vertex["key_property"], "work_order_id")
         self.assertEqual(vertex["key_source_column"], "WORK_ORDER_ID")
         self.assertEqual(len(vertex["properties"]), 2)
@@ -94,8 +94,17 @@ class MappingOracleGraphTest(unittest.TestCase):
             relation=relation,
             blueprint_payload=None,
             entity_results_by_id={
-                source.entity_id: {"oracle_vertex": {"vertex_table": "ONTO_WORK_ORDER", "key_property": "WORK_ORDER_ID"}},
-                target.entity_id: {"oracle_vertex": {"vertex_table": "ONTO_DEFECT", "key_property": "DEFECT_ID"}},
+                source.entity_id: {
+                    "oracle_vertex": {"vertex_table": "ONTO_WORK_ORDER", "key_property": "WORK_ORDER_ID"},
+                    "node_mapping": {"source_tables": ["WORK_ORDER"]},
+                },
+                target.entity_id: {
+                    "oracle_vertex": {"vertex_table": "ONTO_DEFECT", "key_property": "DEFECT_ID"},
+                    "node_mapping": {"source_tables": ["DEFECT"]},
+                },
+            },
+            graph_relation_mapping={
+                "join_condition": "src.WORK_ORDER_ID = dst.WORK_ORDER_ID",
             },
         )
 
@@ -104,7 +113,9 @@ class MappingOracleGraphTest(unittest.TestCase):
         self.assertEqual(result["oracle_edge"]["target_vertex_table"], "ONTO_DEFECT")
         self.assertEqual(result["oracle_edge"]["target_vertex_key_property"], "DEFECT_ID")
         self.assertNotIn("edge_sql", result)
-        self.assertNotIn("source_table", result)
+        self.assertEqual(result["source_table"], "ONTO_WORK_ORDER")
+        self.assertEqual(result["target_table"], "ONTO_DEFECT")
+        self.assertEqual(result["status"], "READY")
 
     def test_bulk_apply_request_accepts_vertex_and_edge_payloads(self):
         request = BulkMappingApplyRequest.model_validate({
