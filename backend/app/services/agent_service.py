@@ -275,19 +275,58 @@ class AgentService:
             ).first()
             if not existing_session or existing_session.managed_skill_id != managed_skill_id:
                 raise ValueError("测试会话不存在，或不属于当前 Skill")
-        conversation_history = self._normalize_conversation_history(
-            self._safe_json_loads(existing_session.conversation_json, []) if existing_session else payload.get("conversation_history")
-        )
+        previous_response = self._safe_json_loads(existing_session.result_json, {}) if existing_session else {}
+        previous_turn_results = previous_response.get("turn_results", []) if isinstance(previous_response, dict) else []
+        if not isinstance(previous_turn_results, list):
+            previous_turn_results = []
+        raw_conversation_history = self._safe_json_loads(
+            existing_session.conversation_json, []
+        ) if existing_session else payload.get("conversation_history")
+        stored_conversation_history = self._normalize_conversation_history(raw_conversation_history, limit=None)
+        conversation_history = self._normalize_conversation_history(stored_conversation_history)
+        # 兼容本次升级前仅保存最后一轮结果的会话；更早轮次没有落库，无法可靠补建。
+        if existing_session and not previous_turn_results and isinstance(previous_response, dict) and previous_response.get("table_preview"):
+            previous_turn_results = [{
+                "turn_no": 1,
+                "user_message_no": len([item for item in stored_conversation_history if item.get("role") == "user"]) - 1,
+                "question": (previous_response.get("test_context") or {}).get("test_question", ""),
+                "table_preview": previous_response.get("table_preview", {}),
+                "agent_output": previous_response.get("agent_output", ""),
+                "execution_trace": previous_response.get("execution_trace", []),
+                "executed_queries": previous_response.get("executed_queries", []),
+                "warnings": previous_response.get("warnings", []),
+            }]
         is_session_start = bool(payload.get("start_session"))
         question = (payload.get("test_question") or "").strip()
         if not question:
             question = "请开始测试会话，说明你将如何依据已加载 Skill 对当前数据源进行分析，并等待我的问题。"
+        source = self.db.query(SysDataSource).filter(SysDataSource.source_id == payload["source_id"]).first()
+        if not is_session_start and self._needs_question_clarification(question):
+            return self._save_managed_skill_clarification(
+                session=existing_session,
+                managed_skill=managed_skill,
+                source=source,
+                payload=payload,
+                question=question,
+                stored_conversation_history=stored_conversation_history,
+                previous_turn_results=previous_turn_results,
+                created_by=created_by,
+            )
         topology = self.source_service.get_remote_property_graph_topology(
             source_id=payload["source_id"], schema=payload.get("schema")
         )
         if not topology.get("graph_name") or not topology.get("nodes"):
             raise ValueError("所选数据源没有可用 Oracle Property Graph，无法按本体属性执行图查询")
-        graph_plan = self._build_supply_chain_graph_plan(question, topology)
+        graph_plan = await self._plan_graph_query_from_topology(
+            question=question,
+            conversation_context=self._format_conversation_history(conversation_history),
+            topology=topology,
+            llm_config=llm_config,
+        )
+        if not graph_plan:
+            graph_plan = self._build_supply_chain_graph_plan(
+                question, topology, self._format_conversation_history(conversation_history)
+            )
         if graph_plan:
             selected_node = graph_plan["selection"]
             graph_sql = graph_plan["sql"]
@@ -308,7 +347,6 @@ class AgentService:
             schema=payload.get("schema"),
             row_limit=max(1, min(int(payload.get("sample_limit") or 100), 100)),
         )
-        source = self.db.query(SysDataSource).filter(SysDataSource.source_id == payload["source_id"]).first()
         executed_sql = graph_sql
         references = "\n\n".join(
             f"## {path}\n{content}" for path, content in skill_files.items() if path != "SKILL.md"
@@ -316,6 +354,8 @@ class AgentService:
         sample_rows = json.dumps(graph_result.get("rows", [])[:100], ensure_ascii=False, indent=2, default=str)
         columns = json.dumps(graph_result.get("columns", [])[:30], ensure_ascii=False, indent=2, default=str)
         system_prompt = """你是供应链数据分析智能体。严格遵守用户上传的 Skill：只依据给定 Skill、Oracle Property Graph 本体属性、只读查询结果和用户问题分析，不臆造字段、数据或查询结果。
+
+当前用户问题是本轮唯一需要回答的目标。历史对话仅用于解析“该瓶码”“继续”等指代，或寻找与当前问题直接相关的已知标识；不得复用历史问题的结论、SQL、字段或表格来代替当前问题的回答。若当前问题无法确定查询对象、关系或标识，直接提出简洁澄清问题，不能猜测或执行与上一轮相同的查询。
 
 平台会在你的文字回答前先以结构化表格展示本轮 SQL 返回数据。你的职责是在表格之后，严格按 Skill 要求解读数据、给出结论和可继续追问的问题；如果 Skill 未规定格式，则依次输出结论摘要、数据解读和建议追问。不要重复罗列整张原始数据表，也不要强制输出“风险与限制”章节。
 
@@ -332,7 +372,7 @@ class AgentService:
 - 本体查询对象：{selected_node.get('displayName')}（底层对象：{selected_node.get('tableName')}）
 - 当前用户问题：{question}
 
-# 已有对话
+# 历史对话（仅用于解析指代与寻找当前问题相关标识，不是本轮回答目标）
 {self._format_conversation_history(conversation_history) or '这是一次新会话，尚无历史消息。'}
 
 # 已执行的只读 SQL
@@ -356,8 +396,20 @@ class AgentService:
             {"step_no": 4, "stage": "ORACLE_GRAPH_QUERY", "title": "执行 Oracle Graph SQL", "status": "SUCCESS", "detail": f"使用 GRAPH_TABLE 查询并返回 {len(graph_result.get('rows', []))} 条本体实例记录。", "sql": executed_sql},
             {"step_no": 5, "stage": "AGENT_ANALYSIS", "title": "Agent 按 Skill 分析", "status": "SUCCESS", "detail": "已将 Skill 指令、会话上下文、本体属性字段、Graph SQL 结果和当前问题发送给分析 Agent。"},
         ]
-        conversation = conversation_history + ([] if is_session_start else [{"role": "user", "content": question}])
+        conversation = stored_conversation_history + ([] if is_session_start else [{"role": "user", "content": question}])
         conversation.append({"role": "assistant", "content": agent_output})
+        table_preview = {"columns": [{"column_name": column} for column in graph_result.get("columns", [])], "sample_rows": graph_result.get("rows", [])}
+        current_turn = {
+            "turn_no": len(previous_turn_results) + 1,
+            "user_message_no": len([item for item in conversation if item.get("role") == "user"]) - 1,
+            "question": "" if is_session_start else question,
+            "table_preview": table_preview,
+            "agent_output": agent_output,
+            "execution_trace": trace,
+            "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
+            "warnings": ["当前测试使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，会在图关系定位后通过经批准的只读事实表聚合。"],
+        }
+        turn_results = previous_turn_results + ([] if is_session_start else [current_turn])
         response = {
             "managed_skill": self._serialize_managed_skill(managed_skill),
             "execution_model": {"llm_config_id": llm_config.config_id, "llm_config_name": llm_config.config_name, "llm_model_name": normalize_model_name(llm_config.model_name, llm_config.api_base_url)},
@@ -367,7 +419,8 @@ class AgentService:
             "execution_trace": trace,
             "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
             "warnings": ["当前测试使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，会在图关系定位后通过经批准的只读事实表聚合。"],
-            "table_preview": {"columns": [{"column_name": column} for column in graph_result.get("columns", [])], "sample_rows": graph_result.get("rows", [])},
+            "table_preview": table_preview,
+            "turn_results": turn_results,
         }
         session = self._save_managed_skill_test_session(
             session=existing_session,
@@ -416,6 +469,63 @@ class AgentService:
         self.db.commit()
         self.db.refresh(session)
         return session
+
+    def _save_managed_skill_clarification(
+        self,
+        *,
+        session: Optional[SysManagedAgentSkillTestSession],
+        managed_skill: SysManagedAgentSkill,
+        source: Optional[SysDataSource],
+        payload: Dict[str, Any],
+        question: str,
+        stored_conversation_history: List[Dict[str, str]],
+        previous_turn_results: List[Dict[str, Any]],
+        created_by: str,
+    ) -> Dict[str, Any]:
+        """Persist an agent clarification turn without guessing a graph query."""
+        clarification = "请说明本次要查询的对象或关系，例如“查询该瓶码的质检记录”“查询该批次的工厂信息”；如有编码，请一并提供。"
+        conversation = stored_conversation_history + [{"role": "user", "content": question}, {"role": "assistant", "content": clarification}]
+        trace = [
+            {"step_no": 1, "stage": "SKILL_LOAD", "title": "加载上传 Skill", "status": "SUCCESS", "detail": "已加载 Skill，准备识别当前问题。"},
+            {"step_no": 2, "stage": "CLARIFICATION", "title": "请求澄清当前问题", "status": "SUCCESS", "detail": "当前消息未明确查询目标，未执行 Oracle Graph SQL，也未复用历史查询。"},
+        ]
+        table_preview = {"columns": [], "sample_rows": []}
+        current_turn = {
+            "turn_no": len(previous_turn_results) + 1,
+            "user_message_no": len([item for item in conversation if item.get("role") == "user"]) - 1,
+            "question": question,
+            "table_preview": table_preview,
+            "agent_output": clarification,
+            "execution_trace": trace,
+            "executed_queries": [],
+            "warnings": [],
+        }
+        response = {
+            "managed_skill": self._serialize_managed_skill(managed_skill),
+            "execution_model": {"llm_config_id": payload["llm_config_id"]},
+            "test_context": {"source_id": payload["source_id"], "source_name": source.source_name if source else "", "schema": payload.get("schema"), "property_graph": "", "ontology_node": "", "test_question": question},
+            "conversation": conversation,
+            "agent_output": clarification,
+            "execution_trace": trace,
+            "executed_queries": [],
+            "warnings": [],
+            "table_preview": table_preview,
+            "turn_results": previous_turn_results + [current_turn],
+        }
+        saved_session = self._save_managed_skill_test_session(
+            session=session, managed_skill=managed_skill, source=source, payload=payload,
+            question=question, conversation=conversation, response=response, created_by=created_by,
+        )
+        response["session_id"] = saved_session.session_id
+        return response
+
+    @staticmethod
+    def _needs_question_clarification(question: str) -> bool:
+        normalized = re.sub(r"\s+", "", question or "")
+        if re.search(r"\b(?:BOT|BATCH|CASE|PACK|PALLET|STACK|OUT|TRANS)-[A-Z0-9_-]+\b", normalized.upper()):
+            return False
+        ambiguous_messages = {"继续", "继续查询", "再查一下", "这个呢", "这个怎么样", "查一下", "查询一下", "分析一下"}
+        return normalized in ambiguous_messages
 
     def _serialize_managed_skill_test_session(
         self, session: SysManagedAgentSkillTestSession, *, include_result: bool
@@ -505,8 +615,252 @@ FROM GRAPH_TABLE(
   )
 )'''
 
+    async def _plan_graph_query_from_topology(
+        self,
+        *,
+        question: str,
+        conversation_context: str,
+        topology: Dict[str, Any],
+        llm_config: SysLLMConfig,
+    ) -> Optional[Dict[str, Any]]:
+        """Plan a graph query from live topology, then compile it without accepting model SQL."""
+        nodes = topology.get("nodes") or []
+        if not nodes:
+            return None
+        catalog = {
+            "nodes": [
+                {
+                    "label": node.get("displayName"),
+                    "properties": [
+                        {"name": prop.get("property_name"), "primary_key": prop.get("is_primary_key")}
+                        for prop in (node.get("properties") or [])[:30]
+                    ],
+                }
+                for node in nodes[:80]
+            ],
+            "relationships": [
+                {"from": edge.get("source"), "to": edge.get("target"), "label": edge.get("name")}
+                for edge in (topology.get("edges") or [])[:160]
+            ],
+        }
+        planner_prompt = f'''根据用户问题和 Oracle Property Graph 知识地图，规划一次有精确过滤条件的只读图查询。
+只返回 JSON，不返回 SQL，格式如下：
+{{"root_label":"起点节点标签","filter_property":"起点过滤属性","filter_value":"必须出现在当前问题或会话上下文中的精确值","root_properties":["起点需展示的属性名"],"target_labels":["目标节点标签"],"target_properties":{{"目标节点标签":["需展示的属性名"]}}}}
+
+规则：
+1. root_label、filter_property、target_labels 和属性名必须来自候选节点。
+2. 仅在用户给出精确标识时规划；未给出精确标识时返回 {{}}。
+3. target_labels 应覆盖用户明确要求的全部业务对象；路径由系统依据关系地图搜索。
+4. 不得编造节点、属性、关系或过滤值。
+5. root_properties 与 target_properties 是表格展示字段清单：必须优先、完整覆盖用户明确要求的码、名称、状态、时间、数量等业务信息；每个对象仅保留回答问题所需字段，通常不超过 5 个。
+6. 不得为了“信息更全”加入无关属性、内部主键或关联外键；除非用户明确询问 ID。起点过滤属性可作为必要定位字段保留。
+7. 若无法从知识地图精确映射用户要求的对象或展示字段，返回 {{}}，由系统选择其他受控查询方式。
+8. 当前问题优先于会话上下文：若当前问题含有 BOT-、BATCH-、CASE-、PACK-、PALLET-、STACK- 等精确业务编码，filter_value 必须取当前问题中的编码；只有当前问题未给出精确编码且使用“该瓶码/继续”等指代时，才可从上下文继承。
+9. 用户显式提到 `ONTO_NODE_XXX` 时，`XXX` 就是必须覆盖的目标图节点标签；图关系可顺向或反向遍历。
+
+当前问题：{question}
+会话上下文：{conversation_context or '无'}
+知识地图：{json.dumps(catalog, ensure_ascii=False)}'''
+        raw = await self.llm_service.call_llm(
+            "你是 Oracle Property Graph 查询规划器，只输出可由实时拓扑验证的 JSON 计划。",
+            planner_prompt,
+            llm_config,
+            timeout_override=max(llm_config.timeout, 60),
+        )
+        plan = self.llm_service._extract_json_object(raw or "") or {}
+        return self._compile_topology_graph_plan(
+            plan, topology, f"{question}\n{conversation_context}",
+            display_request_text=question, current_question=question,
+        )
+
     @staticmethod
-    def _build_supply_chain_graph_plan(question: str, topology: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _compile_topology_graph_plan(
+        plan: Dict[str, Any], topology: Dict[str, Any], known_text: str,
+        display_request_text: Optional[str] = None,
+        current_question: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a model plan and compile only known labels/properties/edges to Graph SQL."""
+        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+        graph_name = str(topology.get("graph_name") or "").upper()
+        if not identifier_pattern.fullmatch(graph_name):
+            return None
+        nodes_by_label = {str(node.get("displayName") or "").upper(): node for node in (topology.get("nodes") or [])}
+        root_label = str(plan.get("root_label") or "").upper()
+        root = nodes_by_label.get(root_label)
+        filter_property = str(plan.get("filter_property") or "").upper()
+        filter_value = str(plan.get("filter_value") or "").strip()
+        if not root or not filter_value or filter_value.upper() not in (known_text or "").upper():
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_:\-./]+", filter_value):
+            return None
+        current_text = (current_question or "").upper()
+        identifier_requirements = (
+            (r"\bBOT-[A-Z0-9_-]+\b", "BOTTLECODE", "BOTTLE_CODE"),
+            (r"\bBATCH-[A-Z0-9_-]+\b", "PRODUCTIONBATCH", "BATCH_NO"),
+            (r"\bCASE-[A-Z0-9_-]+\b", "CASECODE", "CASE_CODE"),
+            (r"\bPACK-[A-Z0-9_-]+\b", "PACKCODE", "PACK_CODE"),
+            (r"\bPALLET-[A-Z0-9_-]+\b", "PALLETCODE", "PALLET_CODE"),
+            (r"\bSTACK-[A-Z0-9_-]+\b", "STACKCODE", "STACK_CODE"),
+        )
+        current_identifier_requirements = [
+            (match.group(0), expected_root, expected_filter)
+            for pattern, expected_root, expected_filter in identifier_requirements
+            for match in re.finditer(pattern, current_text)
+        ]
+        if current_identifier_requirements and not any(
+            filter_value.upper() == value and root_label == expected_root and filter_property == expected_filter
+            for value, expected_root, expected_filter in current_identifier_requirements
+        ):
+            return None
+        root_properties = {str(prop.get("property_name") or "").upper(): prop for prop in (root.get("properties") or [])}
+        root_key = next((name for name, prop in root_properties.items() if prop.get("is_primary_key") == "Y"), "")
+        if not root_key or filter_property not in root_properties:
+            return None
+        target_labels = []
+        for item in plan.get("target_labels") or []:
+            label = str(item or "").upper()
+            if label and label != root_label and label in nodes_by_label and label not in target_labels:
+                target_labels.append(label)
+        if not target_labels:
+            return None
+        explicitly_named_nodes = {
+            item.upper() for item in re.findall(r"ONTO_NODE_([A-Z0-9_]+)", current_text)
+        }
+        if "质检" in (display_request_text or current_question or ""):
+            explicitly_named_nodes.add("QUALITYINSPECTION")
+        if any(label in nodes_by_label and label not in target_labels for label in explicitly_named_nodes):
+            return None
+
+        # 对“包码、箱码、托码、垛码”等明确点名的包装层级，使用当前问题而非
+        # 会话上下文来收紧字段。模型即使额外选择状态或生产外键，也不得污染结果表。
+        packaging_code_fields = (
+            ("瓶码", "BOTTLECODE", "BOTTLE_CODE"),
+            ("包码", "PACKCODE", "PACK_CODE"),
+            ("箱码", "CASECODE", "CASE_CODE"),
+            ("托码", "PALLETCODE", "PALLET_CODE"),
+            ("垛码", "STACKCODE", "STACK_CODE"),
+        )
+        requested_packaging_fields = [
+            (label, property_name)
+            for term, label, property_name in packaging_code_fields
+            if term in (display_request_text or known_text or "")
+        ]
+        forced_target_properties: Dict[str, List[str]] = {}
+        if requested_packaging_fields:
+            required_target_labels = [label for label, _property_name in requested_packaging_fields if label != root_label]
+            if not all(label in nodes_by_label and label in target_labels for label in required_target_labels):
+                return None
+            target_labels = [label for label in target_labels if label in set(required_target_labels)]
+            forced_target_properties = {label: [property_name] for label, property_name in requested_packaging_fields if label != root_label}
+
+        node_id_to_label = {str(node.get("id") or ""): str(node.get("displayName") or "").upper() for node in nodes_by_label.values()}
+        adjacency: Dict[str, List[tuple[str, str, str]]] = {}
+        for edge in topology.get("edges") or []:
+            source = node_id_to_label.get(str(edge.get("source") or ""))
+            target = node_id_to_label.get(str(edge.get("target") or ""))
+            edge_label = str(edge.get("name") or "").upper()
+            if source and target and identifier_pattern.fullmatch(edge_label):
+                adjacency.setdefault(source, []).append((target, edge_label, "OUT"))
+                adjacency.setdefault(target, []).append((source, edge_label, "IN"))
+
+        def find_path(target_label: str) -> Optional[List[tuple[str, str, str]]]:
+            queue = [(root_label, [])]
+            visited = {root_label}
+            while queue:
+                current, path = queue.pop(0)
+                if current == target_label:
+                    return path
+                for next_label, edge_label, direction in adjacency.get(current, []):
+                    if next_label not in visited:
+                        visited.add(next_label)
+                        queue.append((next_label, path + [(next_label, edge_label, direction)]))
+            return None
+
+        requested_root_properties = [
+            str(name or "").upper() for name in (plan.get("root_properties") or [])
+            if str(name or "").upper() in root_properties
+        ]
+        if requested_packaging_fields:
+            requested_root_properties = []
+        root_projection_names = [filter_property] + [
+            name for name in requested_root_properties
+            if name not in {root_key, filter_property}
+            and not any(token in str(root_properties[name].get("data_type") or "").upper() for token in ("BLOB", "CLOB", "NCLOB", "LONG", "XMLTYPE"))
+        ][:5]
+        root_projection_names = list(dict.fromkeys(root_projection_names))
+        root_columns = [f"r.{root_key} AS ROOT_ID"] + [f"r.{name} AS ROOT_{name}" for name in root_projection_names]
+        ctes = [f'''root_node AS (
+  SELECT * FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (r IS {root_label})
+    COLUMNS ({', '.join(root_columns)})
+  )
+)''']
+        joins: List[str] = []
+        outer_columns = [f"r.ROOT_{name}" for name in root_projection_names]
+        target_properties = {
+            str(label or "").upper(): properties
+            for label, properties in (plan.get("target_properties") or {}).items()
+        } if isinstance(plan.get("target_properties"), dict) else {}
+        if forced_target_properties:
+            target_properties = forced_target_properties
+        for index, target_label in enumerate(target_labels, start=1):
+            path = find_path(target_label)
+            if not path:
+                return None
+            target = nodes_by_label[target_label]
+            properties_by_name = {str(prop.get("property_name") or "").upper(): prop for prop in (target.get("properties") or [])}
+            selected_names = [
+                str(name or "").upper() for name in (target_properties.get(target_label) or [])
+                if str(name or "").upper() in properties_by_name
+            ]
+            if not selected_names:
+                return None
+            selected_names = [name for name in selected_names if identifier_pattern.fullmatch(name)][:12]
+            selected_names = list(dict.fromkeys(selected_names))
+            if not selected_names:
+                return None
+            aliases = ["r"]
+            match_parts = [f"(r IS {root_label})"]
+            for hop_index, (next_label, edge_label, direction) in enumerate(path, start=1):
+                alias = f"n{hop_index}"
+                aliases.append(alias)
+                relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+                match_parts.append(f"{relation}({alias} IS {next_label})")
+            target_alias = aliases[-1]
+            cte_name = f"path_{index}"
+            columns = [f"r.{root_key} AS ROOT_ID"] + [f"{target_alias}.{name} AS {target_label}_{name}" for name in selected_names]
+            ctes.append(f'''{cte_name} AS (
+  SELECT * FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH {''.join(match_parts)}
+    COLUMNS ({', '.join(columns)})
+  )
+)''')
+            joins.append(f"LEFT JOIN {cte_name} p{index} ON p{index}.ROOT_ID = r.ROOT_ID")
+            outer_columns.extend(f"p{index}.{target_label}_{name}" for name in selected_names)
+        if not joins:
+            return None
+        filter_alias = f"ROOT_{filter_property}"
+        cte_sql = ",\n".join(ctes)
+        sql = f'''WITH {cte_sql}
+SELECT {', '.join(outer_columns)}
+FROM root_node r
+{' '.join(joins)}
+WHERE r.{filter_alias} = '{filter_value}' '''
+        return {
+            "sql": sql,
+            "selection": {
+                "displayName": f"{root_label} → {' / '.join(target_labels)}",
+                "tableName": "由实时 Property Graph 拓扑自动规划",
+                "reason": f"根据问题选择起点 {root_label}、过滤属性 {filter_property}，并从知识地图搜索到目标节点路径。",
+            },
+        }
+
+    @staticmethod
+    def _build_supply_chain_graph_plan(
+        question: str, topology: Dict[str, Any], conversation_context: str = ""
+    ) -> Optional[Dict[str, Any]]:
         """Return approved multi-ontology graph templates for high-value supply-chain questions.
 
         Quantities live in OUTBOUND_DETAIL rather than the graph edge, so the
@@ -514,10 +868,174 @@ FROM GRAPH_TABLE(
         and then performs a read-only aggregate over that fact table.
         """
         normalized = (question or "").upper()
+        current_question_text = (question or "").upper()
+        code_search_text = f"{question or ''}\n{conversation_context or ''}".upper()
+        nodes_by_label = {str(item.get("displayName") or "").upper(): item for item in (topology.get("nodes") or [])}
+        graph_name = str(topology.get("graph_name") or "").upper()
+        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+        if not identifier_pattern.fullmatch(graph_name):
+            return None
+
+        current_exact_identifier = re.search(r"\b(?:BOT|BATCH|CASE|PACK|PALLET|STACK)-[A-Z0-9_-]+\b", current_question_text)
+        bottle_code_match = re.search(r"\bBOT-[A-Z0-9_-]+\b", current_question_text)
+        if not bottle_code_match and not current_exact_identifier:
+            bottle_code_match = re.search(r"\bBOT-[A-Z0-9_-]+\b", code_search_text)
+        asks_code_chain = bottle_code_match and any(
+            term in question for term in ("包码", "箱码", "托码", "垛码", "五码", "链路", "追溯")
+        )
+        if asks_code_chain:
+            chain_specs = [
+                ("BOTTLECODE", "b", "BOTTLE_ID", "BOTTLE_CODE", "bottle"),
+                ("PACKCODE", "p", "PACK_ID", "PACK_CODE", "pack"),
+                ("CASECODE", "c", "CASE_ID", "CASE_CODE", "case"),
+                ("PALLETCODE", "pal", "PALLET_ID", "PALLET_CODE", "pallet"),
+                ("STACKCODE", "s", "STACK_ID", "STACK_CODE", "stack"),
+            ]
+            if not all(
+                nodes_by_label.get(label)
+                and {key, code}.issubset({str(prop.get("property_name") or "").upper() for prop in (nodes_by_label[label].get("properties") or [])})
+                for label, _alias, key, code, _prefix in chain_specs
+            ):
+                return None
+            bottle_code = bottle_code_match.group(0)
+            sql = f'''WITH code_chain AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (b IS BOTTLECODE)-[e1 IS GRAPH_LABEL]->(p IS PACKCODE)
+          -[e2 IS GRAPH_LABEL]->(c IS CASECODE)
+          -[e3 IS GRAPH_LABEL]->(pal IS PALLETCODE)
+          -[e4 IS GRAPH_LABEL]->(s IS STACKCODE)
+    COLUMNS (
+      b.BOTTLE_ID AS BOTTLE_ID,
+      b.BOTTLE_CODE AS BOTTLE_CODE,
+      p.PACK_ID AS PACK_ID,
+      p.PACK_CODE AS PACK_CODE,
+      c.CASE_ID AS CASE_ID,
+      c.CASE_CODE AS CASE_CODE,
+      pal.PALLET_ID AS PALLET_ID,
+      pal.PALLET_CODE AS PALLET_CODE,
+      s.STACK_ID AS STACK_ID,
+      s.STACK_CODE AS STACK_CODE,
+      e1.RELATION_NAME AS BOTTLE_PACK_RELATION,
+      e2.RELATION_NAME AS PACK_CASE_RELATION,
+      e3.RELATION_NAME AS CASE_PALLET_RELATION,
+      e4.RELATION_NAME AS PALLET_STACK_RELATION
+    )
+  )
+)
+SELECT BOTTLE_CODE, PACK_CODE, CASE_CODE, PALLET_CODE, STACK_CODE,
+       BOTTLE_PACK_RELATION, PACK_CASE_RELATION,
+       CASE_PALLET_RELATION, PALLET_STACK_RELATION
+FROM code_chain
+WHERE BOTTLE_CODE = '{bottle_code}' '''
+            return {
+                "sql": sql,
+                "selection": {
+                    "displayName": "瓶码 → 包码 → 箱码 → 托码 → 垛码",
+                    "tableName": "BOTTLECODE → PACKCODE → CASECODE → PALLETCODE → STACKCODE",
+                    "reason": f"识别到精确瓶码 {bottle_code} 和五层包装链路需求，使用四跳属性图路径并精确过滤。",
+                },
+            }
+
+        asks_production_trace = bottle_code_match and any(
+            term in question for term in ("生产", "产品", "批次", "产线", "工厂", "生产信息")
+        )
+        if asks_production_trace:
+            production_specs = {
+                "BOTTLECODE": {"BOTTLE_ID", "BOTTLE_CODE"},
+                "PRODUCT": {"PRODUCT_ID", "SKU_CODE", "PRODUCT_NAME"},
+                "PRODUCTIONBATCH": {"BATCH_ID", "BATCH_NO", "PRODUCTION_DATE", "QUALITY_STATUS"},
+                "PRODUCTIONLINE": {"LINE_ID", "LINE_CODE", "LINE_NAME", "WORKSHOP"},
+                "FACTORY": {"FACTORY_ID", "FACTORY_CODE", "FACTORY_NAME", "PROVINCE", "CITY"},
+            }
+            if not all(
+                nodes_by_label.get(label)
+                and required.issubset({str(prop.get("property_name") or "").upper() for prop in (nodes_by_label[label].get("properties") or [])})
+                for label, required in production_specs.items()
+            ):
+                return None
+            bottle_code = bottle_code_match.group(0)
+            sql = f'''WITH bottle_product AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (b IS BOTTLECODE)-[e IS GRAPH_LABEL]->(p IS PRODUCT)
+    COLUMNS (
+      b.BOTTLE_ID AS BOTTLE_ID,
+      b.BOTTLE_CODE AS BOTTLE_CODE,
+      p.SKU_CODE AS SKU_CODE,
+      p.PRODUCT_NAME AS PRODUCT_NAME,
+      e.RELATION_NAME AS BOTTLE_PRODUCT_RELATION
+    )
+  )
+), bottle_batch AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (b IS BOTTLECODE)-[e IS GRAPH_LABEL]->(pb IS PRODUCTIONBATCH)
+    COLUMNS (
+      b.BOTTLE_ID AS BOTTLE_ID,
+      b.BOTTLE_CODE AS BOTTLE_CODE,
+      pb.BATCH_ID AS BATCH_ID,
+      pb.BATCH_NO AS BATCH_NO,
+      pb.PRODUCTION_DATE AS PRODUCTION_DATE,
+      pb.QUALITY_STATUS AS QUALITY_STATUS,
+      e.RELATION_NAME AS BOTTLE_BATCH_RELATION
+    )
+  )
+), bottle_line AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (b IS BOTTLECODE)-[e IS GRAPH_LABEL]->(l IS PRODUCTIONLINE)
+    COLUMNS (
+      b.BOTTLE_ID AS BOTTLE_ID,
+      l.LINE_CODE AS LINE_CODE,
+      l.LINE_NAME AS LINE_NAME,
+      l.WORKSHOP AS WORKSHOP,
+      e.RELATION_NAME AS BOTTLE_LINE_RELATION
+    )
+  )
+), batch_factory AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name}
+    MATCH (pb IS PRODUCTIONBATCH)-[e IS GRAPH_LABEL]->(f IS FACTORY)
+    COLUMNS (
+      pb.BATCH_ID AS BATCH_ID,
+      f.FACTORY_CODE AS FACTORY_CODE,
+      f.FACTORY_NAME AS FACTORY_NAME,
+      f.PROVINCE AS FACTORY_PROVINCE,
+      f.CITY AS FACTORY_CITY,
+      e.RELATION_NAME AS BATCH_FACTORY_RELATION
+    )
+  )
+)
+SELECT bp.BOTTLE_CODE,
+       bp.SKU_CODE, bp.PRODUCT_NAME,
+       bb.BATCH_NO, bb.PRODUCTION_DATE, bb.QUALITY_STATUS,
+       bl.LINE_CODE, bl.LINE_NAME, bl.WORKSHOP,
+       bf.FACTORY_CODE, bf.FACTORY_NAME, bf.FACTORY_PROVINCE, bf.FACTORY_CITY,
+       bp.BOTTLE_PRODUCT_RELATION, bb.BOTTLE_BATCH_RELATION,
+       bl.BOTTLE_LINE_RELATION, bf.BATCH_FACTORY_RELATION
+FROM bottle_product bp
+JOIN bottle_batch bb ON bb.BOTTLE_ID = bp.BOTTLE_ID
+JOIN bottle_line bl ON bl.BOTTLE_ID = bp.BOTTLE_ID
+JOIN batch_factory bf ON bf.BATCH_ID = bb.BATCH_ID
+WHERE bp.BOTTLE_CODE = '{bottle_code}' '''
+            return {
+                "sql": sql,
+                "selection": {
+                    "displayName": "瓶码 → 产品 / 批次 / 产线 / 工厂",
+                    "tableName": "BOTTLECODE → PRODUCT；BOTTLECODE → PRODUCTIONBATCH → FACTORY；BOTTLECODE → PRODUCTIONLINE",
+                    "reason": f"识别到精确瓶码 {bottle_code} 和生产追溯需求，按图关系查询产品、批次、产线和工厂明细。",
+                },
+            }
+
         asks_outbound_distributor = ("出库" in question or "OUTBOUND" in normalized) and ("经销商" in question or "DISTRIBUTOR" in normalized)
         if not asks_outbound_distributor:
             return None
-        nodes_by_label = {str(item.get("displayName") or "").upper(): item for item in (topology.get("nodes") or [])}
         outbound = nodes_by_label.get("OUTBOUNDORDER")
         distributor = nodes_by_label.get("DISTRIBUTOR")
         if not outbound or not distributor:
@@ -525,10 +1043,6 @@ FROM GRAPH_TABLE(
         outbound_properties = {str(item.get("property_name") or "").upper() for item in (outbound.get("properties") or [])}
         distributor_properties = {str(item.get("property_name") or "").upper() for item in (distributor.get("properties") or [])}
         if not {"OUTBOUND_ID", "OUTBOUND_NO", "OUTBOUND_TIME"}.issubset(outbound_properties) or not {"DISTRIBUTOR_ID", "DISTRIBUTOR_NAME"}.issubset(distributor_properties):
-            return None
-        graph_name = str(topology.get("graph_name") or "").upper()
-        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
-        if not identifier_pattern.fullmatch(graph_name):
             return None
         month_filter = "\n  AND od.OUTBOUND_TIME >= TRUNC(SYSDATE, 'MM')\n  AND od.OUTBOUND_TIME < ADD_MONTHS(TRUNC(SYSDATE, 'MM'), 1)" if "本月" in question else ""
         sql = f'''WITH outbound_distributor AS (
@@ -615,10 +1129,13 @@ Skill：
         raise ValueError("Agent 未能从数据源候选对象中选择有效表，请在对话中补充更明确的问题或检查 Skill 指令")
 
     @staticmethod
-    def _normalize_conversation_history(history: Any) -> List[Dict[str, str]]:
-        """Keep a bounded, text-only dialogue context sent from the test page."""
+    def _normalize_conversation_history(history: Any, limit: Optional[int] = 5) -> List[Dict[str, str]]:
+        """Normalize dialogue messages; use a bound only for the context sent to the model."""
         normalized: List[Dict[str, str]] = []
-        for item in (history or [])[-12:]:
+        items = history or []
+        if limit is not None:
+            items = items[-limit:]
+        for item in items:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "").strip()

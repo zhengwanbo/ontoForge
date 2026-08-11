@@ -101,7 +101,24 @@
       </div>
     </div>
 
-    <el-dialog v-model="dialogVisible" :title="`${historyView ? '测试历史' : 'Agent + Skill 对话测试'}${dialogSkillName ? ' · ' + dialogSkillName : ''}`" width="860px" :close-on-click-modal="false" :close-on-press-escape="!testing">
+    <el-dialog
+      v-model="dialogVisible"
+      class="agent-test-dialog"
+      width="860px"
+      :fullscreen="dialogFullscreen"
+      :draggable="!dialogFullscreen"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!testing"
+    >
+      <template #header>
+        <div class="dialog-header">
+          <span>{{ `${historyView ? '测试历史' : 'Agent + Skill 对话测试'}${dialogSkillName ? ' · ' + dialogSkillName : ''}` }}</span>
+          <el-button text type="primary" class="fullscreen-button" @click="dialogFullscreen = !dialogFullscreen">
+            <el-icon><FullScreen /></el-icon>
+            {{ dialogFullscreen ? '退出全屏' : '全屏' }}
+          </el-button>
+        </div>
+      </template>
       <div class="dialog-model" v-if="form.llm_config_id">测试模型：{{ llmConfigs.find(item => item.config_id === form.llm_config_id)?.config_name }}</div>
       <div class="conversation-list dialog-conversation">
         <el-empty v-if="!result?.conversation?.length" description="请输入客户问题，Agent 将按 Skill 检索并分析数据。" :image-size="70" />
@@ -109,10 +126,10 @@
           <div v-for="(message, index) in result.conversation" :key="index" class="conversation-message" :class="message.role">
             <div class="conversation-role">{{ message.role === 'user' ? '客户' : 'Agent' }}</div>
             <div class="llm-output-box">{{ message.content }}</div>
-            <div v-if="message.role === 'user' && index === latestUserMessageIndex && !result.pending && result.table_preview?.sample_rows?.length" class="data-answer-card">
-              <div class="data-answer-title">问数结果 · {{ result.table_preview.sample_rows.length }} 条</div>
-              <el-table :data="result.table_preview.sample_rows" border stripe size="small" max-height="280">
-                <el-table-column v-for="column in (result.table_preview.columns || []).slice(0, 12)" :key="column.column_name" :prop="column.column_name" :label="column.column_name" min-width="130" show-overflow-tooltip />
+            <div v-if="message.role === 'user' && !result.pending && getTurnResultForUserMessage(index)?.table_preview?.sample_rows?.length" class="data-answer-card">
+              <div class="data-answer-title">问数结果 · {{ getTurnResultForUserMessage(index).table_preview.sample_rows.length }} 条</div>
+              <el-table :data="getTurnResultForUserMessage(index).table_preview.sample_rows" border stripe size="small" max-height="280">
+                <el-table-column v-for="column in (getTurnResultForUserMessage(index).table_preview.columns || []).slice(0, 12)" :key="column.column_name" :prop="column.column_name" :label="column.column_name" min-width="130" show-overflow-tooltip />
               </el-table>
             </div>
             <div v-if="message.role === 'user' && index === latestUserMessageIndex && result.pending" class="agent-pending">
@@ -165,7 +182,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Loading } from '@element-plus/icons-vue'
+import { FullScreen, Loading } from '@element-plus/icons-vue'
 import { agentApi, domainApi, sourceApi, systemApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
@@ -180,6 +197,7 @@ const testSessions = ref<any[]>([])
 const result = ref<any>(null)
 const testing = ref(false)
 const dialogVisible = ref(false)
+const dialogFullscreen = ref(false)
 const processDialogVisible = ref(false)
 const historyView = ref(false)
 const currentSessionId = ref('')
@@ -205,6 +223,18 @@ const latestUserMessageIndex = computed(() => {
   }
   return -1
 })
+
+const getTurnResultForUserMessage = (messageIndex: number | string) => {
+  const messages = result.value?.conversation || []
+  const numericMessageIndex = Number(messageIndex)
+  if (messages[numericMessageIndex]?.role !== 'user') return null
+  const userMessageNo = messages.slice(0, numericMessageIndex + 1).filter((item: any) => item?.role === 'user').length - 1
+  const turnResults = result.value?.turn_results || []
+  const matched = turnResults.find((item: any) => item?.user_message_no === userMessageNo)
+  if (matched) return matched
+  // 兼容尚未保存逐轮结果的历史会话：只能展示其中最后一次已保存的查询结果。
+  return numericMessageIndex === latestUserMessageIndex.value && result.value?.table_preview ? result.value : null
+}
 
 const loadDomains = async () => {
   try {
@@ -300,6 +330,7 @@ const openTestDialog = () => {
   currentSessionId.value = ''
   historySession.value = null
   historyView.value = false
+  dialogFullscreen.value = false
   dialogVisible.value = true
 }
 
@@ -311,6 +342,7 @@ const openTestHistory = async (row: any) => {
     currentSessionId.value = row.session_id
     historyView.value = true
     chatInput.value = ''
+    dialogFullscreen.value = false
     dialogVisible.value = true
   } catch (e) {}
 }
@@ -474,7 +506,13 @@ onMounted(async () => {
   line-height: 1.8;
 }
 .conversation-list { display: flex; flex-direction: column; gap: 10px; }
-.dialog-conversation { min-height: 300px; max-height: 460px; overflow-y: auto; padding: 2px 6px 2px 2px; }
+.dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-right: 28px; font-size: 16px; font-weight: 600; color: #303133; }
+.fullscreen-button { flex: 0 0 auto; }
+.fullscreen-button .el-icon { margin-right: 4px; }
+:deep(.agent-test-dialog.el-dialog) { min-width: 640px; min-height: 460px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); resize: both; overflow: auto; }
+:deep(.agent-test-dialog.el-dialog.is-fullscreen) { min-width: 0; min-height: 0; max-width: none; max-height: none; resize: none; }
+.dialog-conversation { min-height: 300px; max-height: min(460px, calc(100vh - 300px)); overflow-y: auto; padding: 2px 6px 2px 2px; }
+:deep(.agent-test-dialog.el-dialog.is-fullscreen) .dialog-conversation { max-height: calc(100vh - 300px); }
 .dialog-model { margin-bottom: 12px; color: #1f5f8b; font-size: 12px; font-weight: 600; }
 .conversation-message { display: flex; flex-direction: column; gap: 5px; }
 .conversation-message.user { align-items: flex-end; }
