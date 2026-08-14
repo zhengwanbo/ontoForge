@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.logging import get_logger
 from app.models.models import (
     SysDomain,
+    SysBusinessType,
     SysOntologyBlueprint,
     SysOntologyEntity,
     SysEntityMapping,
@@ -52,26 +53,18 @@ class OntologyGuideService:
         "master-data-linking": {
             "name": "主数据关联",
             "description": "围绕主实体、批次、机种等稳定对象组织基础语义关系。",
-            "required_roles": {"entity_master"},
-            "derived_entities": [],
         },
         "process-trace": {
             "name": "过程追溯",
             "description": "围绕产品或对象的站位履历、设备、物料、时间构建追溯路径。",
-            "required_roles": {"process_history"},
-            "derived_entities": ["ProcessStep"],
         },
         "measurement-threshold-violation": {
             "name": "测量阈值判定",
             "description": "围绕测量结果与规则目录构建规则判定与异常语义对象。",
-            "required_roles": {"measurement", "rule_catalog"},
-            "derived_entities": ["ObservedMetric", "RuleDefinition", "ViolationEvent"],
         },
         "case-rootcause-action": {
             "name": "案例根因闭环",
             "description": "围绕历史案例、根因与改善动作构建经验复用链路。",
-            "required_roles": {"case_library"},
-            "derived_entities": ["HistoricalCase", "RootCauseCandidate", "CorrectiveAction"],
         },
     }
 
@@ -79,6 +72,44 @@ class OntologyGuideService:
         self.db = db
         self.source_service = SourceDataService(db)
         self.llm_service = LLMService(db)
+        self._semantic_pattern_catalog = self.SEMANTIC_PATTERN_CATALOG
+        self._business_type_context: Dict[str, str] = {}
+        self._selected_semantic_type_code: Optional[str] = None
+
+    def _load_domain_semantic_patterns(self, domain: SysDomain) -> None:
+        """Load user-maintained semantic patterns for the active business type."""
+        selected_code = (self._selected_semantic_type_code or domain.domain_type or "BUSINESS").strip().upper()
+        business_type = self.db.query(SysBusinessType).filter(
+            SysBusinessType.type_code == selected_code,
+            SysBusinessType.status == "ACTIVE",
+        ).first()
+        if not business_type:
+            if self._selected_semantic_type_code:
+                raise ValueError("所选业务语义不存在或已停用")
+            self._semantic_pattern_catalog = self.SEMANTIC_PATTERN_CATALOG
+            self._business_type_context = {}
+            return
+        try:
+            configured_patterns = json.loads(business_type.semantic_patterns_json or "[]")
+        except (TypeError, ValueError):
+            configured_patterns = []
+        catalog: Dict[str, Dict[str, Any]] = {}
+        for item in configured_patterns if isinstance(configured_patterns, list) else []:
+            if not isinstance(item, dict):
+                continue
+            code = (item.get("pattern_code") or item.get("code") or "").strip().lower()
+            if not code:
+                continue
+            catalog[code] = {
+                "name": (item.get("pattern_name") or item.get("name") or code).strip(),
+                "description": item.get("description") or "",
+            }
+        self._semantic_pattern_catalog = catalog or self.SEMANTIC_PATTERN_CATALOG
+        self._business_type_context = {
+            "type_code": business_type.type_code,
+            "type_name": business_type.type_name,
+            "semantic_desc": business_type.semantic_desc or "",
+        }
 
     def parse_uploaded_document(self, file_name: str, content: bytes) -> Dict[str, Any]:
         if not content:
@@ -171,6 +202,7 @@ class OntologyGuideService:
         table_source_mode: str = "database",
         generation_strategy: Optional[str] = None,
         business_scenario: Optional[str] = None,
+        semantic_type_code: Optional[str] = None,
         rule_table_name: Optional[str] = None,
         table_bindings: Optional[List[Dict[str, Any]]] = None,
         ddl_tables: Optional[List[Dict[str, Any]]] = None,
@@ -186,6 +218,11 @@ class OntologyGuideService:
         created_by: str = "unknown",
     ) -> Dict[str, Any]:
         normalized_generation_strategy = self._normalize_generation_strategy(generation_strategy)
+        self._selected_semantic_type_code = (
+            (semantic_type_code or "").strip().upper()
+            if normalized_generation_strategy == "llm_first" and (semantic_type_code or "").strip()
+            else None
+        )
         guide_context = self._build_guide_strategy_context(
             business_scenario=business_scenario,
             focus_metric_families=focus_metric_families,
@@ -193,10 +230,11 @@ class OntologyGuideService:
             history_case_sources=history_case_sources,
         )
 
-        # LLM 自由生成不使用任何领域场景模板；固定为通用规则，避免旧的
-        # SFR 根因/缺陷场景标签造成“已切换生成策略但仍使用领域目标”的歧义。
+        # LLM 自由生成不使用 SFR/缺陷等固定领域场景模板，而是由当前业务
+        # 类型的语义说明及用户选定的语义模式决定本次生成范围。
         if normalized_generation_strategy == "llm_first":
-            guide_context["business_scenario"] = "GENERAL_RULES"
+            guide_context["business_scenario"] = "BUSINESS_SEMANTIC"
+            guide_context["semantic_type_code"] = self._selected_semantic_type_code
 
         if normalized_generation_strategy == "structured_domain_pipeline":
             return await self._generate_with_structured_domain_pipeline(
@@ -489,6 +527,7 @@ class OntologyGuideService:
         domain = self.db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
         if not domain:
             raise ValueError("业务分析域不存在")
+        self._load_domain_semantic_patterns(domain)
 
         normalized_bindings = self._normalize_table_bindings(relation_tables, table_bindings or [])
         normalized_tables = [item["table_name"] for item in normalized_bindings]
@@ -799,6 +838,7 @@ class OntologyGuideService:
         domain = self.db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
         if not domain:
             raise ValueError("业务分析域不存在")
+        self._load_domain_semantic_patterns(domain)
 
         normalized_bindings = self._normalize_table_bindings(relation_tables, table_bindings or [])
         normalized_tables = [item["table_name"] for item in normalized_bindings]
@@ -3025,30 +3065,20 @@ class OntologyGuideService:
         source_role_bindings: List[Dict[str, Any]],
         enabled_patterns: List[str],
     ) -> List[Dict[str, Any]]:
-        role_set = {
-            (item.get("source_role") or "").strip().lower()
-            for item in source_role_bindings
-            if item.get("source_role")
-        }
         explicit_enabled = {
             (item or "").strip().lower()
             for item in enabled_patterns
-            if (item or "").strip().lower() in self.SEMANTIC_PATTERN_CATALOG
+            if (item or "").strip().lower() in self._semantic_pattern_catalog
         }
         patterns = []
-        for pattern_code, config in self.SEMANTIC_PATTERN_CATALOG.items():
-            required_roles = set(config.get("required_roles") or set())
-            recommended = required_roles.issubset(role_set)
-            enabled = pattern_code in explicit_enabled if explicit_enabled else recommended
+        for pattern_code, config in self._semantic_pattern_catalog.items():
+            enabled = pattern_code in explicit_enabled
             patterns.append({
                 "pattern_code": pattern_code,
                 "pattern_name": config.get("name"),
                 "description": config.get("description"),
-                "required_roles": sorted(required_roles),
-                "matched_roles": sorted(role_set.intersection(required_roles)),
-                "recommended": recommended,
                 "enabled": enabled,
-                "derived_entities": config.get("derived_entities") or [],
+                "business_type": self._business_type_context,
             })
         return patterns
 

@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.database import engine, Base
 from app.api.domains import router as domains_router
+from app.api.business_types import router as business_types_router
 from app.api.ontology import router as ontology_router
 from app.api.mapping import router as mapping_router
 from app.api.ddl import router as ddl_router
@@ -90,7 +91,9 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal
 from app.core.security import get_password_hash
 from app.models.models import SysUser
+from app.services.business_type_service import ensure_default_business_types
 db_session = SessionLocal()
+ensure_default_business_types(db_session)
 admin_user = db_session.query(SysUser).filter(SysUser.username == "admin").first()
 if not admin_user:
     admin_user = SysUser(
@@ -147,6 +150,7 @@ app.add_middleware(
 
 # Register routers with API prefix
 app.include_router(domains_router, prefix=settings.API_PREFIX)
+app.include_router(business_types_router, prefix=settings.API_PREFIX)
 app.include_router(ontology_router, prefix=settings.API_PREFIX)
 app.include_router(mapping_router, prefix=settings.API_PREFIX)
 app.include_router(ddl_router, prefix=settings.API_PREFIX)

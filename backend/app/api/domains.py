@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.schemas.schemas import ApiResponse, DomainCreate, DomainUpdate, DomainResponse
 from app.models.models import SysDomain, SysDataSource, generate_id
+from app.services.business_type_service import get_business_type_by_code
 
 router = APIRouter(prefix="/domains", tags=["本体-分析域"])
 
@@ -50,11 +51,14 @@ async def create_domain(
     existing = db.query(SysDomain).filter(SysDomain.domain_name == normalized_name).first()
     if existing:
         raise HTTPException(status_code=400, detail=f"业务分析域名称已存在：{normalized_name}")
+    business_type = get_business_type_by_code(db, req.domain_type)
+    if not business_type or business_type.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="请选择已启用的业务类型")
 
     domain = SysDomain(
         domain_id=generate_id("dm"),
         domain_name=normalized_name,
-        domain_type=req.domain_type,
+        domain_type=business_type.type_code,
         domain_desc=req.domain_desc,
         status="ACTIVE",
         created_by=current_user.get("username", "unknown")
@@ -119,7 +123,10 @@ async def update_domain(
             raise HTTPException(status_code=400, detail=f"业务分析域名称已存在：{normalized_name}")
         domain.domain_name = normalized_name
     if "domain_type" in provided_fields:
-        domain.domain_type = req.domain_type
+        business_type = get_business_type_by_code(db, req.domain_type)
+        if not business_type or business_type.status != "ACTIVE":
+            raise HTTPException(status_code=400, detail="请选择已启用的业务类型")
+        domain.domain_type = business_type.type_code
     if "domain_desc" in provided_fields:
         domain.domain_desc = req.domain_desc
     if "status" in provided_fields:

@@ -96,6 +96,15 @@ export const domainApi = {
   delete: (id: string) => api.delete(`/domains/${id}`)
 }
 
+// ====== Business Type Semantic API ======
+export const businessTypeApi = {
+  list: () => api.get('/business-types'),
+  get: (code: string) => api.get(`/business-types/${encodeURIComponent(code)}`),
+  create: (data: any) => api.post('/business-types', data),
+  update: (code: string, data: any) => api.put(`/business-types/${encodeURIComponent(code)}`, data),
+  delete: (code: string) => api.delete(`/business-types/${encodeURIComponent(code)}`)
+}
+
 // ====== Ontology Entity API ======
 export const entityApi = {
   list: (domainId: string) => api.get(`/domains/${domainId}/entities`),

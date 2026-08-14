@@ -39,6 +39,10 @@
             <el-icon><Share /></el-icon>
             <span>业务对象构建</span>
           </template>
+          <el-menu-item index="/business/types">
+            <el-icon><Tickets /></el-icon>
+            <span>业务语义管理</span>
+          </el-menu-item>
           <el-menu-item index="/business/domains">
             <el-icon><CollectionTag /></el-icon>
             <span>业务分析域管理</span>

@@ -68,7 +68,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { domainApi } from '../../api'
+import { businessTypeApi, domainApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
 const appStore = useAppStore()
@@ -81,12 +81,7 @@ const editingId = ref('')
 const formRef = ref()
 const domains = ref<any[]>([])
 
-const domainTypeOptions = [
-  { label: '业务主题域', value: 'BUSINESS' },
-  { label: '制造对象域', value: 'OBJECT' },
-  { label: '分析场景域', value: 'SCENARIO' },
-  { label: '自定义域', value: 'CUSTOM' }
-]
+const domainTypeOptions = ref<Array<{ label: string; value: string }>>([])
 
 const form = reactive({
   domain_name: '',
@@ -100,7 +95,7 @@ const rules = {
   domain_type: [{ required: true, message: '请选择业务分析域类型', trigger: 'change' }]
 }
 
-const formatType = (value: string) => domainTypeOptions.find(item => item.value === value)?.label || value || '未分类'
+const formatType = (value: string) => domainTypeOptions.value.find(item => item.value === value)?.label || value || '未分类'
 const normalizeDomainName = (value: string) => value.trim()
 
 const resetForm = () => {
@@ -120,6 +115,13 @@ const loadDomains = async () => {
   } finally {
     loading.value = false
   }
+}
+
+const loadBusinessTypes = async () => {
+  const res = await businessTypeApi.list()
+  domainTypeOptions.value = (res.data || [])
+    .filter((item: any) => item.status === 'ACTIVE')
+    .map((item: any) => ({ label: item.type_name, value: item.type_code }))
 }
 
 const openCreateDialog = () => {
@@ -194,7 +196,7 @@ const deleteDomain = async (domainId: string) => {
 }
 
 onMounted(() => {
-  loadDomains()
+  Promise.all([loadBusinessTypes(), loadDomains()])
 })
 </script>
 

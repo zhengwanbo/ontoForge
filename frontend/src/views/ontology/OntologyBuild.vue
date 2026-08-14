@@ -27,8 +27,9 @@
           <div v-if="graphNodes.length > 0" class="svg-graph">
             <svg
               ref="graphSvgRef"
-              width="100%" height="100%"
-              :viewBox="`0 0 ${canvasSize.w} ${canvasSize.h}`"
+              :width="canvasSize.w"
+              :height="graphCanvasHeight"
+              :viewBox="`0 0 ${canvasSize.w} ${graphCanvasHeight}`"
               @mousemove="onGraphMouseMove"
               @mouseup="onGraphMouseUp"
               @mouseleave="onGraphMouseUp"
@@ -47,6 +48,10 @@
                 v-for="edge in graphEdges"
                 :key="edge.id"
                 class="graph-edge"
+                :class="{
+                  'is-related': isRelatedGraphEdge(edge),
+                  'is-muted': selectedNode && !isRelatedGraphEdge(edge)
+                }"
                 @dblclick.stop="openRelationEditor(edge)"
               >
                 <line
@@ -85,6 +90,11 @@
                 :key="node.id"
                 :transform="`translate(${getNodePos(node.id).x}, ${getNodePos(node.id).y})`"
                 class="graph-node"
+                :class="{
+                  'is-selected': selectedNode?.id === node.id,
+                  'is-related': isRelatedGraphNode(node.id),
+                  'is-muted': selectedNode && !isRelatedGraphNode(node.id) && selectedNode?.id !== node.id
+                }"
                 @mousedown.stop="onNodeMouseDown($event, node)"
                 @click.stop="onNodeClick(node)"
                 @dblclick.stop="openEntityEditor(node)"
@@ -122,7 +132,7 @@
           </h4>
           <div class="entity-info">
             <p><strong>实体名称:</strong> {{ selectedNode.name }}</p>
-            <p><strong>构建方式:</strong> {{ selectedNode.buildType }}</p>
+            <p><strong>构建方式:</strong> TABLE/VIEW</p>
             <p><strong>状态:</strong>
               <el-tag :type="selectedNode.status === 'DEPLOYED' ? 'success' : 'info'" size="small">{{ selectedNode.status }}</el-tag>
             </p>
@@ -139,6 +149,7 @@
               <span class="prop-type">{{ prop.data_type }}</span>
               <el-tag v-if="prop.is_primary_key === 'Y'" type="danger" size="small">PK</el-tag>
               <span class="prop-desc">{{ prop.property_display_name || prop.property_desc }}</span>
+              <el-button size="small" type="primary" link @click="showEditProperty(prop)">修改</el-button>
               <el-popconfirm title="确定删除此属性?" @confirm="deleteProperty(prop.property_id)">
                 <template #reference>
                   <el-button size="small" type="danger" :icon="Delete" circle />
@@ -464,7 +475,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="propertyDialogVisible" title="添加本体属性" width="500px">
+    <el-dialog v-model="propertyDialogVisible" :title="propertyDialogMode === 'edit' ? '修改本体属性' : '添加本体属性'" width="500px">
       <el-form :model="propertyForm" label-width="100px">
         <el-form-item label="属性名称"><el-input v-model="propertyForm.property_name" placeholder="英文名如defect_id" /></el-form-item>
         <el-form-item label="显示名称"><el-input v-model="propertyForm.property_display_name" placeholder="中文名如缺陷ID" /></el-form-item>
@@ -484,7 +495,7 @@
       </el-form>
       <template #footer>
         <el-button @click="propertyDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="addProperty" :loading="loading">添加</el-button>
+        <el-button type="primary" @click="saveProperty" :loading="loading">{{ propertyDialogMode === 'edit' ? '保存' : '添加' }}</el-button>
       </template>
     </el-dialog>
 
@@ -594,26 +605,40 @@
               @change="handleGuideGenerationStrategyChange"
             >
               <el-option label="结构化领域生成" value="structured_domain_pipeline" />
-              <el-option label="LLM自由生成" value="llm_first" />
+              <el-option label="LLM模型辅助" value="llm_first" />
             </el-select>
             <el-select
+              v-if="guideForm.generation_strategy === 'llm_first'"
+              v-model="guideForm.semantic_type_code"
+              clearable
+              :placeholder="guideSemanticTypeOptions.length ? '选择本次业务语义' : '正在加载业务语义配置'"
+              class="guide-toolbar-item"
+              @change="handleGuideSemanticTypeChange"
+            >
+              <el-option
+                v-for="semanticType in guideSemanticTypeOptions"
+                :key="semanticType.type_code"
+                :label="semanticType.type_name"
+                :value="semanticType.type_code"
+              >
+                <span>{{ semanticType.type_name }}</span>
+                <span v-if="semanticType.semantic_desc" class="guide-mode-option-desc">{{ semanticType.semantic_desc }}</span>
+              </el-option>
+            </el-select>
+            <el-select
+              v-else
               v-model="guideForm.business_scenario"
               clearable
               placeholder="业务目标"
               class="guide-toolbar-item"
             >
-              <el-option
-                v-if="guideForm.generation_strategy === 'llm_first'"
-                label="通用规则"
-                value="GENERAL_RULES"
-              />
-              <template v-else>
-                <el-option label="SFR根因分析" value="SFR_ROOTCAUSE" />
-                <el-option label="缺陷分析" value="DEFECT_ANALYSIS" />
-              </template>
+              <el-option label="SFR根因分析" value="SFR_ROOTCAUSE" />
+              <el-option label="缺陷分析" value="DEFECT_ANALYSIS" />
             </el-select>
             <div class="guide-panel-hint guide-toolbar-item" style="grid-column: span 2;">
-              结构化领域生成会优先执行问卷/DDL/规则数据的结构化分析，再生成 canonical 本体与标准化视图计划。
+              {{ guideForm.generation_strategy === 'llm_first'
+                ? `LLM 模型辅助将按所选业务语义「${currentBusinessTypeName || '未配置'}」生成本体对象和关系。`
+                : '结构化领域生成会优先执行问卷/DDL/规则数据的结构化分析，再生成 canonical 本体与标准化视图计划。' }}
             </div>
           </section>
 
@@ -746,20 +771,32 @@
                   :description="guideForm.table_source_mode === 'ddl' ? (guideUploadedDDLFiles.length ? '当前DDL文件中没有匹配表' : '请先上传数据库DDL文件') : (guideForm.source_id ? '当前条件下没有可选关系表' : '请先选择数据库连接')"
                 />
               </div>
-              <div v-if="guideForm.relation_tables.length" class="guide-pattern-panel">
+              <div v-if="guideForm.relation_tables.length && guideForm.generation_strategy !== 'llm_first'" class="guide-pattern-panel">
                 <div class="guide-panel-head">
-                  <span class="guide-panel-title">语义模式</span>
-                  <span class="guide-panel-meta">已启用 {{ guideForm.enabled_patterns.length }}</span>
+                  <span class="guide-panel-title">业务语义模式（手工选择）</span>
+                  <span class="guide-panel-meta">本次已选择 {{ guideForm.enabled_patterns.length }}</span>
                 </div>
-                <el-checkbox-group v-model="guideForm.enabled_patterns" @change="handleGuidePatternChange">
+                <div class="guide-pattern-type-hint">当前业务类型：{{ currentBusinessTypeName || '未配置' }}。{{ currentBusinessTypeDesc || '语义模式由“业务类型语义管理”维护。' }}</div>
+                <el-checkbox-group v-model="guideForm.enabled_patterns">
                   <el-checkbox
                     v-for="pattern in guidePatternOptions"
                     :key="pattern.value"
                     :label="pattern.value"
                   >
-                    {{ pattern.label }}
+                    {{ pattern.label }}<span v-if="pattern.description" class="guide-pattern-desc">：{{ pattern.description }}</span>
                   </el-checkbox>
                 </el-checkbox-group>
+                <div v-if="guideForm.enabled_patterns.length" class="guide-selected-patterns">
+                  <span>本次生成已选择：</span>
+                  <el-tag
+                    v-for="patternCode in guideForm.enabled_patterns"
+                    :key="patternCode"
+                    closable
+                    size="small"
+                    @close="removeGuidePattern(patternCode)"
+                  >{{ guidePatternLabel(patternCode) }}</el-tag>
+                </div>
+                <div v-else class="guide-pattern-empty">请按本次业务目标手工勾选需要带入 LLM 提示词的语义模式。</div>
               </div>
             </section>
           </div>
@@ -770,9 +807,10 @@
           <div v-else-if="isLlmFirstGuide" class="guide-preview">
             <div class="guide-preview-grid">
               <section class="guide-preview-panel">
-                <div class="guide-panel-title">通用业务范围确认</div>
-                <div class="guide-preview-summary">生成策略：LLM 自由生成</div>
-                <div class="guide-preview-summary">业务目标：通用规则</div>
+                <div class="guide-panel-title">业务语义范围确认</div>
+                <div class="guide-preview-summary">生成策略：LLM模型辅助</div>
+                <div class="guide-preview-summary">业务类型：{{ currentBusinessTypeName || '-' }}</div>
+                <div class="guide-preview-summary">本次语义模式：{{ guideForm.enabled_patterns.map(guidePatternLabel).join(' / ') || '未选择' }}</div>
                 <div class="guide-preview-summary">MVP 范围：{{ guidePreview.ontology_design_document?.mvp_scope || '模型未返回范围说明' }}</div>
                 <div class="guide-preview-summary">范围说明：{{ guidePreview.ontology_design_document?.scope_reasoning || '-' }}</div>
               </section>
@@ -1190,7 +1228,7 @@ import { ref, reactive, onMounted, onBeforeUnmount, computed, watch, nextTick } 
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, UploadFilled } from '@element-plus/icons-vue'
-import { entityApi, propertyApi, relationApi, graphApi, processApi, sourceApi, systemApi, domainApi, mappingApi } from '../../api'
+import { entityApi, propertyApi, relationApi, graphApi, processApi, sourceApi, systemApi, domainApi, mappingApi, businessTypeApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
 interface GuideTableOption {
@@ -1202,7 +1240,6 @@ interface GuideTableOption {
 
 interface GuideTableBinding {
   table_name: string
-  source_role: string
 }
 
 interface GuideDDLColumn {
@@ -1247,6 +1284,9 @@ const activeTab = ref(fixedBuildSection.value || 'graph')
 const currentDomainId = ref(appStore.currentDomainId || '')
 const currentDomainName = computed(() => appStore.currentDomainName || '')
 const currentDomainDesc = ref('')
+const currentDomainType = ref('BUSINESS')
+const currentBusinessTypeName = ref('')
+const currentBusinessTypeDesc = ref('')
 const graphNodes = ref<any[]>([])
 const graphEdges = ref<any[]>([])
 const selectedNode = ref<any>(null)
@@ -1278,8 +1318,6 @@ const guideRunMessage = ref('')
 const guideUploadedDocument = ref<{ file_name: string; char_count: number; file_type: string } | null>(null)
 const guideUploadedDDLFiles = ref<Array<{ file_name: string; char_count: number; file_type: string; table_count: number }>>([])
 const guideUploadedRuleFiles = ref<Array<{ file_name: string; char_count: number; file_type: string; dataset_count: number }>>([])
-const guideTableRoles = reactive<Record<string, string>>({})
-const guidePatternTouched = ref(false)
 const guideStep = ref(1)
 const guideStepOptions = [
   { value: 1, label: '资料输入', description: '上传问卷、DDL、规则数据，选择业务关系表与生成策略。' },
@@ -1287,16 +1325,13 @@ const guideStepOptions = [
   { value: 3, label: '本体预览', description: '检查 canonical 本体对象、关系和缺陷语义分类。' },
   { value: 4, label: '视图应用', description: '查看标准化视图计划、属性图骨架并准备应用。' },
 ]
-const guidePatternOptions = [
-  { value: 'master-data-linking', label: '主数据关联' },
-  { value: 'process-trace', label: '过程追溯' },
-  { value: 'measurement-threshold-violation', label: '测量阈值判定' },
-  { value: 'case-rootcause-action', label: '案例根因闭环' },
-]
+const guidePatternOptions = ref<Array<{ value: string; label: string; description?: string }>>([])
+const guideSemanticTypeOptions = ref<any[]>([])
 const createEmptyGuideForm = () => ({
   table_source_mode: 'database' as 'database' | 'ddl',
   generation_strategy: 'structured_domain_pipeline',
   business_scenario: 'SFR_ROOTCAUSE',
+  semantic_type_code: '',
   source_id: '',
   schema: '',
   relation_tables: [] as string[],
@@ -1313,13 +1348,16 @@ const createEmptyGuideForm = () => ({
 const guideForm = reactive(createEmptyGuideForm())
 const handleGuideGenerationStrategyChange = (strategy: string) => {
   guideForm.business_scenario = strategy === 'llm_first'
-    ? 'GENERAL_RULES'
+    ? 'BUSINESS_SEMANTIC'
     : 'SFR_ROOTCAUSE'
+  if (strategy === 'llm_first') {
+    guideForm.semantic_type_code = guideForm.semantic_type_code || currentDomainType.value
+    void loadGuidePatternOptions(guideForm.semantic_type_code, true)
+  }
 }
 const selectedGuideTableBindings = computed<GuideTableBinding[]>(() =>
   guideForm.relation_tables.map(tableName => ({
-    table_name: tableName,
-    source_role: guideTableRoles[tableName] || 'other'
+    table_name: tableName
   }))
 )
 const activeGuideTables = computed<GuideTableOption[]>(() => (
@@ -1385,12 +1423,21 @@ const draggingNode = ref<any>(null)
 const dragOffset = reactive({ x: 0, y: 0 })
 const graphNodeSize = { width: 160, height: 70 }
 const graphArrowGap = 12
+// The canvas grows with the lowest entity.  The surrounding viewport remains
+// fixed and scrollable, so entities below the first screen are still reachable.
+const graphCanvasHeight = computed(() => {
+  const lowestNodeBottom = graphNodes.value.reduce((maxBottom, node) => {
+    const position = node.position || { y: 0 }
+    return Math.max(maxBottom, Number(position.y) || 0)
+  }, 0) + graphNodeSize.height
+  return Math.max(canvasSize.h, lowestNodeBottom + 100)
+})
 
 const getGraphCanvasPoint = (clientX: number, clientY: number) => {
   const svgRect = graphSvgRef.value?.getBoundingClientRect()
   if (!svgRect) return null
   const scaleX = canvasSize.w / svgRect.width
-  const scaleY = canvasSize.h / svgRect.height
+  const scaleY = graphCanvasHeight.value / svgRect.height
   return {
     x: (clientX - svgRect.left) * scaleX,
     y: (clientY - svgRect.top) * scaleY
@@ -1408,6 +1455,19 @@ const getNodeCenter = (nodeId: string) => {
     x: pos.x + graphNodeSize.width / 2,
     y: pos.y + graphNodeSize.height / 2
   }
+}
+
+const isRelatedGraphEdge = (edge: any) => {
+  if (!selectedNode.value) return false
+  return edge.source === selectedNode.value.id || edge.target === selectedNode.value.id
+}
+
+const isRelatedGraphNode = (nodeId: string) => {
+  if (!selectedNode.value || nodeId === selectedNode.value.id) return false
+  return graphEdges.value.some(edge =>
+    (edge.source === selectedNode.value.id && edge.target === nodeId)
+    || (edge.target === selectedNode.value.id && edge.source === nodeId)
+  )
 }
 
 const getNodeBoundaryPoint = (from: { x: number; y: number }, to: { x: number; y: number }, gap = 0) => {
@@ -1865,14 +1925,66 @@ const loadProcesses = async () => {
 const loadCurrentDomainDetail = async () => {
   if (!currentDomainId.value) {
     currentDomainDesc.value = ''
+    currentDomainType.value = 'BUSINESS'
+    currentBusinessTypeName.value = ''
+    currentBusinessTypeDesc.value = ''
+    guidePatternOptions.value = []
+    guideSemanticTypeOptions.value = []
     return
   }
   try {
     const res = await domainApi.get(currentDomainId.value)
     currentDomainDesc.value = res.data?.domain_desc || ''
+    currentDomainType.value = res.data?.domain_type || 'BUSINESS'
+    if (!guideForm.semantic_type_code) guideForm.semantic_type_code = currentDomainType.value
+    await Promise.all([loadGuideSemanticTypeOptions(), loadGuidePatternOptions(guideForm.semantic_type_code)])
   } catch (e) {
     currentDomainDesc.value = ''
+    guidePatternOptions.value = []
   }
+}
+
+const loadGuideSemanticTypeOptions = async () => {
+  const res = await businessTypeApi.list()
+  guideSemanticTypeOptions.value = (res.data || []).filter((item: any) => item.status === 'ACTIVE')
+}
+
+const loadGuidePatternOptions = async (semanticTypeCode = guideForm.semantic_type_code || currentDomainType.value, selectAll = false) => {
+  try {
+    const res = await businessTypeApi.get(semanticTypeCode)
+    currentBusinessTypeName.value = res.data?.type_name || semanticTypeCode
+    currentBusinessTypeDesc.value = res.data?.semantic_desc || ''
+    guidePatternOptions.value = (res.data?.semantic_patterns || []).map((pattern: any) => ({
+      value: pattern.pattern_code,
+      label: pattern.pattern_name,
+      description: pattern.description || ''
+    }))
+    const available = new Set(guidePatternOptions.value.map(item => item.value))
+    guideForm.enabled_patterns = guideForm.enabled_patterns.filter(item => available.has(item))
+    if (selectAll) guideForm.enabled_patterns = guidePatternOptions.value.map(item => item.value)
+  } catch (e) {
+    currentBusinessTypeName.value = ''
+    currentBusinessTypeDesc.value = ''
+    guidePatternOptions.value = []
+  }
+}
+
+const handleGuideSemanticTypeChange = async (semanticTypeCode: string) => {
+  guideForm.enabled_patterns = []
+  if (!semanticTypeCode) {
+    currentBusinessTypeName.value = ''
+    currentBusinessTypeDesc.value = ''
+    guidePatternOptions.value = []
+    return
+  }
+  await loadGuidePatternOptions(semanticTypeCode, true)
+}
+
+const guidePatternLabel = (patternCode: string) =>
+  guidePatternOptions.value.find(item => item.value === patternCode)?.label || patternCode
+
+const removeGuidePattern = (patternCode: string) => {
+  guideForm.enabled_patterns = guideForm.enabled_patterns.filter(item => item !== patternCode)
 }
 
 const formatGuideModelOption = (model: GuideModelOption) => `${model.config_name} / ${model.model_name}`
@@ -1905,49 +2017,10 @@ const summarizeRelationSource = (row: any) => {
   return parts.length ? parts.join('；') : '无'
 }
 
-const inferGuideTableRole = (tableName: string) => {
-  const upperName = (tableName || '').toUpperCase()
-  if (/(SPEC|LIMIT|RULE|THRESHOLD)/.test(upperName)) return 'rule_catalog'
-  if (/(CASE|FACA|RCA|KNOWLEDGE)/.test(upperName)) return 'case_library'
-  if (/(PROCESS|ROUTE|TRACE|HISTORY)/.test(upperName)) return 'process_history'
-  if (/(ALARM|EVENT|LOG)/.test(upperName) && !/PROCESS/.test(upperName)) return 'event_log'
-  if (/(TEST|SFR|APS|DARK|MEASURE|FTU|FTD|METRIC)/.test(upperName)) return 'measurement'
-  if (/(UNIT|MASTER|ITEM|MODEL|PRODUCT)/.test(upperName)) return 'entity_master'
-  return 'other'
-}
-
-const inferGuidePatternsFromRoles = () => {
-  const roles = new Set(selectedGuideTableBindings.value.map(item => item.source_role))
-  const patterns: string[] = []
-  if (roles.has('entity_master')) patterns.push('master-data-linking')
-  if (roles.has('process_history')) patterns.push('process-trace')
-  if (roles.has('measurement') && roles.has('rule_catalog')) patterns.push('measurement-threshold-violation')
-  if (roles.has('case_library')) patterns.push('case-rootcause-action')
-  return patterns
-}
-
-const syncGuideSelectionMetadata = () => {
-  guideForm.relation_tables.forEach(tableName => {
-    if (!guideTableRoles[tableName]) {
-      guideTableRoles[tableName] = inferGuideTableRole(tableName)
-    }
-  })
-  Object.keys(guideTableRoles).forEach(tableName => {
-    if (!guideForm.relation_tables.includes(tableName)) {
-      delete guideTableRoles[tableName]
-    }
-  })
-  if (!guidePatternTouched.value) {
-    guideForm.enabled_patterns = inferGuidePatternsFromRoles()
-  }
-}
-
 const resetGuideForm = () => {
   const emptyForm = createEmptyGuideForm()
   Object.assign(guideForm, emptyForm)
   guideStep.value = 1
-  Object.keys(guideTableRoles).forEach(key => delete guideTableRoles[key])
-  guidePatternTouched.value = false
   if (currentDomainDesc.value) {
     guideForm.business_document = currentDomainDesc.value
   }
@@ -2009,9 +2082,7 @@ const handleGuideTableSourceModeChange = async () => {
   guideForm.relation_tables = []
   guideForm.rule_table_name = ''
   guideForm.enabled_patterns = []
-  guidePatternTouched.value = false
   guideTableKeyword.value = ''
-  Object.keys(guideTableRoles).forEach(key => delete guideTableRoles[key])
   if (guideForm.table_source_mode === 'database') {
     guideDDLSchemaTables.value = []
     guideRuleDatasets.value = []
@@ -2023,18 +2094,12 @@ const handleGuideTableSourceModeChange = async () => {
   }
 }
 
-const handleGuidePatternChange = () => {
-  guidePatternTouched.value = true
-}
-
 const selectAllGuideTables = () => {
   guideForm.relation_tables = activeGuideTables.value.map(item => item.table_name)
-  syncGuideSelectionMetadata()
 }
 
 const clearGuideTableSelection = () => {
   guideForm.relation_tables = []
-  syncGuideSelectionMetadata()
 }
 
 const resetNaturalAdjustForm = () => {
@@ -2134,7 +2199,6 @@ const loadGuideTables = async () => {
     if (guideForm.rule_table_name && !guideTables.value.some(item => item.table_name === guideForm.rule_table_name)) {
       guideForm.rule_table_name = ''
     }
-    syncGuideSelectionMetadata()
   } catch (e) {
     guideTables.value = []
     guideForm.rule_table_name = ''
@@ -2148,14 +2212,12 @@ const handleGuideSourceChange = async () => {
   guideForm.schema = ''
   guideForm.relation_tables = []
   guideForm.enabled_patterns = []
-  guidePatternTouched.value = false
   guideSchemaOptions.value = []
   guideTables.value = []
   guideDDLSchemaTables.value = []
   guideForm.rule_table_name = ''
   guideRuleDatasets.value = []
   guideUploadedRuleFiles.value = []
-  Object.keys(guideTableRoles).forEach(key => delete guideTableRoles[key])
   await loadGuideSchemas()
 }
 
@@ -2164,8 +2226,6 @@ const handleGuideSchemaChange = async () => {
   guideForm.relation_tables = []
   guideForm.rule_table_name = ''
   guideForm.enabled_patterns = []
-  guidePatternTouched.value = false
-  Object.keys(guideTableRoles).forEach(key => delete guideTableRoles[key])
   await loadGuideTables()
 }
 
@@ -2265,7 +2325,6 @@ const handleGuideDDLFileChange = async (uploadFile: any) => {
       }
     ]
     guideForm.relation_tables = guideDDLSchemaTables.value.map(table => table.table_name)
-    syncGuideSelectionMetadata()
     ElMessage.success(`DDL文件已解析：当前累计 ${guideUploadedDDLFiles.value.length} 个文件、${guideDDLSchemaTables.value.length} 张表`)
   } catch (e) {
   } finally {
@@ -2332,6 +2391,7 @@ const generateOntologyGuide = async (autoApply = false) => {
     const res = await graphApi.generateOntologyGuide(currentDomainId.value, {
       generation_strategy: guideForm.generation_strategy,
       business_scenario: guideForm.business_scenario || null,
+      semantic_type_code: guideForm.generation_strategy === 'llm_first' ? (guideForm.semantic_type_code || null) : null,
       source_id: guideForm.table_source_mode === 'database' ? guideForm.source_id : null,
       schema: guideForm.table_source_mode === 'database' ? (guideForm.schema || null) : null,
       table_source_mode: guideForm.table_source_mode,
@@ -2570,11 +2630,14 @@ const resetDomainState = () => {
   guideDataSources.value = []
   guideSchemaOptions.value = []
   guideTables.value = []
-  Object.keys(guideTableRoles).forEach(key => delete guideTableRoles[key])
-  guidePatternTouched.value = false
   naturalAdjustDialogVisible.value = false
   naturalAdjustPreview.value = null
   currentDomainDesc.value = ''
+  currentDomainType.value = 'BUSINESS'
+  currentBusinessTypeName.value = ''
+  currentBusinessTypeDesc.value = ''
+  guidePatternOptions.value = []
+  guideSemanticTypeOptions.value = []
 }
 
 // ========== Dialogs ==========
@@ -2595,7 +2658,25 @@ const showAddRelation = () => {
   relationForm.value = createEmptyRelationForm()
   relationDialogVisible.value = true
 }
-const showAddProperty = () => { propertyDialogVisible.value = true }
+const showAddProperty = () => {
+  propertyDialogMode.value = 'create'
+  editingPropertyId.value = ''
+  propertyForm.value = createEmptyPropertyForm()
+  propertyDialogVisible.value = true
+}
+const showEditProperty = (prop: any) => {
+  propertyDialogMode.value = 'edit'
+  editingPropertyId.value = prop.property_id
+  propertyForm.value = {
+    property_name: prop.property_name || '',
+    property_display_name: prop.property_display_name || '',
+    data_type: prop.data_type || 'VARCHAR2',
+    is_primary_key: prop.is_primary_key || 'N',
+    is_nullable: prop.is_nullable || 'Y',
+    property_desc: prop.property_desc || ''
+  }
+  propertyDialogVisible.value = true
+}
 const showCreateProcess = () => { processDialogVisible.value = true }
 
 const openEntityEditor = (node: any) => {
@@ -2756,13 +2837,20 @@ const deleteRelation = async () => {
   } catch (e) {} finally { loading.value = false }
 }
 
-const addProperty = async () => {
+const saveProperty = async () => {
   if (!selectedNode.value) { ElMessage.warning('请先选择实体'); return }
   loading.value = true
   try {
-    await propertyApi.create(selectedNode.value.id, propertyForm.value)
-    ElMessage.success('属性创建成功')
+    if (propertyDialogMode.value === 'edit' && editingPropertyId.value) {
+      await propertyApi.update(editingPropertyId.value, propertyForm.value)
+      ElMessage.success('属性已更新')
+    } else {
+      await propertyApi.create(selectedNode.value.id, propertyForm.value)
+      ElMessage.success('属性创建成功')
+    }
     propertyDialogVisible.value = false
+    propertyDialogMode.value = 'create'
+    editingPropertyId.value = ''
     propertyForm.value = createEmptyPropertyForm()
     await selectNode(selectedNode.value)
     await loadGraphData()
@@ -2972,9 +3060,11 @@ const propertyDialogVisible = ref(false)
 const processDialogVisible = ref(false)
 const entityDialogMode = ref<'create' | 'edit'>('create')
 const relationDialogMode = ref<'create' | 'edit'>('create')
+const propertyDialogMode = ref<'create' | 'edit'>('create')
 const editingEntityId = ref('')
 const editingRelationId = ref('')
 const editingRelationTableName = ref('')
+const editingPropertyId = ref('')
 const entityForm = ref(createEmptyEntityForm())
 const relationForm = ref(createEmptyRelationForm())
 const propertyForm = ref(createEmptyPropertyForm())
@@ -2996,10 +3086,6 @@ watch(() => appStore.currentDomainId, async (domainId) => {
     await loadActiveSectionData()
   }
 }, { immediate: false })
-
-watch(() => [...guideForm.relation_tables], () => {
-  syncGuideSelectionMetadata()
-})
 
 watch(fixedBuildSection, async (section) => {
   activeTab.value = section || 'graph'
@@ -3027,11 +3113,18 @@ onBeforeUnmount(() => {
 .drag-hint { font-size: 12px; color: #999; margin-left: 8px; }
 .graph-container, .flow-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .graph-layout { flex: 1; display: flex; gap: 10px; min-height: 0; overflow: hidden; }
-.graph-area { flex: 1; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; overflow: hidden; }
-.svg-graph { width: 100%; height: 100%; }
-.graph-node { cursor: grab; user-select: none; }
+.graph-area { flex: 1; min-height: 0; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; overflow: auto; }
+.svg-graph { width: max-content; min-height: 100%; }
+.graph-node { cursor: grab; user-select: none; transition: opacity .18s ease; }
 .graph-node:active { cursor: grabbing; }
-.graph-edge { cursor: pointer; }
+.graph-node.is-selected rect { stroke: #f59e0b; stroke-width: 4; filter: drop-shadow(0 2px 5px rgba(245, 158, 11, .42)); }
+.graph-node.is-related rect { stroke: #409EFF; stroke-width: 3; filter: drop-shadow(0 1px 3px rgba(64, 158, 255, .28)); }
+.graph-node.is-muted { opacity: .22; }
+.graph-edge { cursor: pointer; transition: opacity .18s ease; }
+.graph-edge.is-related line { stroke: #409EFF; stroke-width: 3.5; }
+.graph-edge.is-related rect { stroke: #409EFF; fill: #ecf5ff; }
+.graph-edge.is-related text { fill: #1d5fa7; font-weight: 700; }
+.graph-edge.is-muted { opacity: .15; }
 .graph-connector { cursor: crosshair; }
 .property-panel { width: 320px; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 16px; overflow-y: auto; flex-shrink: 0; }
 .property-panel h4 { color: #1a3a5c; margin-bottom: 12px; }
@@ -3076,6 +3169,11 @@ onBeforeUnmount(() => {
 .guide-control-group { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .guide-control-label { font-size: 12px; font-weight: 600; color: #496684; }
 .guide-tag-checkboxes { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.guide-pattern-type-hint { margin: 0 0 8px; font-size: 12px; color: #71839a; }
+.guide-pattern-desc { color: #8a99aa; font-size: 12px; }
+.guide-mode-option-desc { float: right; margin-left: 12px; color: #8a99aa; font-size: 12px; }
+.guide-selected-patterns { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; font-size: 12px; color: #58718b; }
+.guide-pattern-empty { margin-top: 10px; font-size: 12px; color: #8a99aa; }
 .guide-table-search { margin-bottom: 10px; }
 .guide-table-list { height: 100%; min-height: 280px; max-height: 420px; overflow-y: auto; }
 .guide-checkbox-group { display: flex; flex-direction: column; gap: 8px; width: 100%; }

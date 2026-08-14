@@ -36,6 +36,12 @@ const routes = [
         meta: { title: '业务对象构建', icon: 'Share', isGroup: true },
         children: [
           {
+            path: 'types',
+            name: 'BusinessTypeSemantics',
+            component: () => import('../views/business/BusinessTypeSemanticManage.vue'),
+            meta: { title: '业务语义管理', icon: 'Tickets', parentMenu: '业务对象构建' }
+          },
+          {
             path: 'domains',
             name: 'BusinessDomains',
             component: () => import('../views/business/BusinessDomainManage.vue'),

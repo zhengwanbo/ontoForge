@@ -717,8 +717,21 @@ CREATE OR REPLACE VIEW {view_name} AS
         source_key = self._get_entity_primary_key(source_entity)
         target_key = self._get_entity_primary_key(target_entity)
         if not source_key or not target_key:
+            def describe_entity(entity: SysOntologyEntity) -> str:
+                display_name = (entity.entity_display_name or entity.entity_name or entity.entity_id).strip()
+                entity_name = (entity.entity_name or entity.entity_id).strip()
+                node_table = (entity.table_name or f"ONTO_NODE_{entity_name.upper()}").strip()
+                return f"「{display_name}」({entity_name}，节点表 {node_table})"
+
+            missing_sides = []
+            if not source_key:
+                missing_sides.append(f"源实体 {describe_entity(source_entity)} 未配置主键属性")
+            if not target_key:
+                missing_sides.append(f"目标实体 {describe_entity(target_entity)} 未配置主键属性")
             raise ValueError(
-                f"关系 {relation.relation_name or relation.relation_id} 的两端本体对象必须各自配置唯一主键后才能生成边表"
+                f"无法为关系「{relation.relation_name or relation.relation_id}」生成边表："
+                f"{'；'.join(missing_sides)}。"
+                "请前往“业务对象构建 > 本体关系构建”，点击对应本体，在属性列表中将唯一标识字段标记为 PK 后重新生成 DDL。"
             )
 
         source_table = source_entity.table_name or f"ONTO_NODE_{source_entity.entity_name.upper()}"

@@ -27,6 +27,29 @@ class SysDomain(Base):
     data_sources = relationship("SysDataSource", back_populates="business_domain")
 
 
+class SysBusinessType(Base):
+    """Configurable business-type semantics used by ontology generation."""
+    __tablename__ = "sys_business_type"
+
+    type_id = Column(String(50), primary_key=True, default=lambda: generate_id("btype"))
+    type_code = Column(String(50), nullable=False, unique=True)
+    type_name = Column(String(100), nullable=False)
+    semantic_desc = Column(String(2000))
+    semantic_patterns_json = Column(Text)  # [{code, name, description, required_roles, derived_entities}]
+    status = Column(String(20), default="ACTIVE")
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SysBusinessTypeSeed(Base):
+    """One-time marker so deleted preset types are not recreated on restart."""
+    __tablename__ = "sys_business_type_seed"
+
+    seed_key = Column(String(100), primary_key=True)
+    seeded_at = Column(DateTime, default=datetime.utcnow)
+
+
 class SysOntologyEntity(Base):
     __tablename__ = "sys_ontology_entity"
 

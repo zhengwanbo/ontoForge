@@ -716,6 +716,7 @@ async def generate_ontology_from_guide(
             table_source_mode=req.table_source_mode,
             generation_strategy=req.generation_strategy,
             business_scenario=req.business_scenario,
+            semantic_type_code=req.semantic_type_code,
             relation_tables=req.relation_tables,
             rule_table_name=req.rule_table_name,
             table_bindings=[item.model_dump() for item in req.table_bindings],

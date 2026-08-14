@@ -83,6 +83,40 @@ class DomainResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+# ====== 业务类型语义 ======
+class BusinessSemanticPattern(BaseModel):
+    pattern_code: str
+    pattern_name: str
+    description: Optional[str] = None
+
+
+class BusinessTypeCreate(BaseModel):
+    type_code: str
+    type_name: str
+    semantic_desc: Optional[str] = None
+    semantic_patterns: List[BusinessSemanticPattern] = []
+    status: str = "ACTIVE"
+
+
+class BusinessTypeUpdate(BaseModel):
+    type_name: Optional[str] = None
+    semantic_desc: Optional[str] = None
+    semantic_patterns: Optional[List[BusinessSemanticPattern]] = None
+    status: Optional[str] = None
+
+
+class BusinessTypeResponse(BaseModel):
+    type_id: str
+    type_code: str
+    type_name: str
+    semantic_desc: Optional[str] = None
+    semantic_patterns: List[Dict[str, Any]] = []
+    status: str
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 # ====== 本体实体 ======
 class EntityCreate(BaseModel):
     entity_name: str
@@ -604,6 +638,7 @@ class OntologyGuideGenerateRequest(BaseModel):
     table_source_mode: str = "database"
     generation_strategy: Optional[str] = "structured_domain_pipeline"
     business_scenario: Optional[str] = None
+    semantic_type_code: Optional[str] = None
     relation_tables: List[str]
     rule_table_name: Optional[str] = None
     table_bindings: List[OntologyGuideTableBinding] = []
