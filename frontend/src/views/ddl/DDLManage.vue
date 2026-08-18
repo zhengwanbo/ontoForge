@@ -198,13 +198,22 @@
 
     <el-dialog v-model="executionResultVisible" title="DDL 执行结果" width="1080px" top="5vh">
       <el-alert
-        v-if="executionResult"
-        :type="executionResult.failed ? 'error' : 'success'"
+        v-if="executionTaskStatus === 'RUNNING'"
+        type="info"
         :closable="false"
         show-icon
         style="margin-bottom: 14px"
       >
-        <template #title>共 {{ executionResult.total || 0 }} 条：成功 {{ executionResult.success || 0 }}，失败 {{ executionResult.failed || 0 }}，跳过 {{ executionResult.skipped || 0 }}</template>
+        <template #title>DDL 正在后台执行，可关闭此窗口后在“DDL历史”中查看状态与逐条 SQL 结果。</template>
+      </el-alert>
+      <el-alert
+        v-else-if="executionResult"
+        :type="executionTaskStatus === 'FAILED' || executionResult.failed ? 'error' : 'success'"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 14px"
+      >
+        <template #title>{{ executionTaskError || `共 ${executionResult.total || 0} 条：成功 ${executionResult.success || 0}，失败 ${executionResult.failed || 0}，跳过 ${executionResult.skipped || 0}` }}</template>
       </el-alert>
       <el-table :data="executionResult?.details || []" border stripe size="small" max-height="560">
         <el-table-column type="expand">
@@ -263,27 +272,29 @@
         </template>
       </el-alert>
       <el-empty v-if="!historyExecutionDetails.length" description="该历史记录未保存逐条执行明细；只有本次功能发布后的 DDL 执行会保留此信息。" />
-      <el-table v-else :data="historyExecutionDetails" border stripe size="small" max-height="560">
-        <el-table-column type="expand">
-          <template #default="{ row }"><pre class="execution-sql">{{ row.statement }};</pre></template>
-        </el-table-column>
-        <el-table-column prop="sequence_no" label="#" width="65" />
-        <el-table-column prop="object_type" label="对象类型" width="130" />
-        <el-table-column prop="object_name" label="对象名称" min-width="180" />
-        <el-table-column label="执行结果" width="100">
-          <template #default="{ row }"><el-tag :type="executionStatusType(row.status)" size="small">{{ executionStatusLabel(row.status) }}</el-tag></template>
-        </el-table-column>
-        <el-table-column label="说明 / 错误" min-width="300">
-          <template #default="{ row }">{{ row.error_message || row.message || (row.status === 'success' ? '执行成功' : '-') }}</template>
-        </el-table-column>
-      </el-table>
+      <template v-else>
+        <el-table :data="historyExecutionDetails" border stripe size="small" max-height="560">
+          <el-table-column type="expand">
+            <template #default="{ row }"><pre class="execution-sql">{{ row.statement }};</pre></template>
+          </el-table-column>
+          <el-table-column prop="sequence_no" label="#" width="65" />
+          <el-table-column prop="object_type" label="对象类型" width="130" />
+          <el-table-column prop="object_name" label="对象名称" min-width="180" />
+          <el-table-column label="执行结果" width="100">
+            <template #default="{ row }"><el-tag :type="executionStatusType(row.status)" size="small">{{ executionStatusLabel(row.status) }}</el-tag></template>
+          </el-table-column>
+          <el-table-column label="说明 / 错误" min-width="300">
+            <template #default="{ row }">{{ row.error_message || row.message || (row.status === 'success' ? '执行成功' : '-') }}</template>
+          </el-table-column>
+        </el-table>
+      </template>
       <template #footer><el-button type="primary" @click="historyExecutionVisible = false">关闭</el-button></template>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { domainApi, ddlApi, sourceApi } from '../../api'
 import { useAppStore } from '../../stores/app'
@@ -306,6 +317,9 @@ const executeLoading = ref(false)
 const executeDialogVisible = ref(false)
 const executionResultVisible = ref(false)
 const executionResult = ref<any>(null)
+const executionTaskStatus = ref('')
+const executionTaskError = ref('')
+let executionPollingTimer: ReturnType<typeof window.setTimeout> | undefined
 const logsDialogVisible = ref(false)
 const historySqlVisible = ref(false)
 const selectedHistorySql = ref<any>(null)
@@ -352,12 +366,14 @@ const getStmtTagType = (type: string) => {
 
 const ddlHistoryStatusLabel = (status: string) => ({
   GENERATED: '已生成',
+  RUNNING: '执行中',
   SUCCESS: '执行成功',
   FAILED: '执行失败'
 }[status] || status)
 
 const ddlHistoryStatusType = (status: string) => ({
   GENERATED: 'info',
+  RUNNING: 'warning',
   SUCCESS: 'success',
   FAILED: 'danger'
 }[status] || 'info')
@@ -535,6 +551,37 @@ const loadHistorySql = (row: any) => {
   ElMessage.success('已载入历史 DDL SQL，可继续查看、编辑或执行')
 }
 
+const stopExecutionPolling = () => {
+  if (executionPollingTimer) {
+    window.clearTimeout(executionPollingTimer)
+    executionPollingTimer = undefined
+  }
+}
+
+const pollExecutionStatus = async (logId: string) => {
+  try {
+    const res: any = await ddlApi.getExecutionStatus(logId)
+    const task = res.data || {}
+    executionTaskStatus.value = task.execution_result || ''
+    executionTaskError.value = task.error_message || ''
+    executionResult.value = task.result || { total: 0, success: 0, failed: 0, skipped: 0, details: [] }
+    if (task.execution_result === 'RUNNING') {
+      executionPollingTimer = window.setTimeout(() => pollExecutionStatus(logId), 1500)
+      return
+    }
+
+    await Promise.all([loadLogs(), reloadDomainContext()])
+    if (task.execution_result === 'FAILED') {
+      ElMessage.warning(task.error_message || `DDL执行完成，但有 ${task.result?.failed || 0} 条失败，请查看逐语句结果`)
+    } else {
+      ElMessage.success(`DDL执行完成: 成功${task.result?.success || 0}条, 跳过${task.result?.skipped || 0}条`)
+    }
+  } catch (e: any) {
+    executionTaskStatus.value = 'FAILED'
+    ElMessage.error(e?.message || '查询 DDL 后台执行状态失败')
+  }
+}
+
 const executeDDL = async () => {
   if (!executeForm.value.target_source_id) {
     ElMessage.warning('请选择目标对象数据库')
@@ -548,14 +595,15 @@ const executeDDL = async () => {
       execute_mode: executeForm.value.execute_mode,
       skip_existing: executeForm.value.skip_existing
     })
-    const result = res.data?.result || {}
-    executionResult.value = result
+    const task = res.data || {}
+    executionTaskStatus.value = task.execution_result || 'RUNNING'
+    executionTaskError.value = ''
+    executionResult.value = { total: 0, success: 0, failed: 0, skipped: 0, details: [] }
     executionResultVisible.value = true
-    if (result.failed) ElMessage.warning(`DDL执行完成，但有 ${result.failed} 条失败，请查看逐语句结果`)
-    else ElMessage.success(`DDL执行完成: 成功${result.success || 0}条, 跳过${result.skipped || 0}条`)
     executeDialogVisible.value = false
-    await loadLogs()
-    await reloadDomainContext()
+    ElMessage.success('DDL 已提交后台执行，可继续使用系统')
+    stopExecutionPolling()
+    await pollExecutionStatus(task.log_id)
   } catch (e: any) {
     ElMessage.error(e?.message || 'DDL执行失败')
   } finally {
@@ -571,6 +619,7 @@ watch(() => appStore.currentDomainId, async (domainId) => {
   ddlStats.value = { entityCount: 0, relationCount: 0, blueprintVersion: '' }
   relationWarnings.value = []
   executeForm.value.target_source_id = ''
+  stopExecutionPolling()
   await Promise.all([reloadDomainContext(), loadTargetDataSources()])
 })
 
@@ -580,6 +629,8 @@ onMounted(async () => {
     await Promise.all([reloadDomainContext(), loadTargetDataSources()])
   }
 })
+
+onBeforeUnmount(stopExecutionPolling)
 </script>
 
 <style scoped>

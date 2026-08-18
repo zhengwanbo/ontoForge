@@ -73,6 +73,10 @@ class DDLService:
             "relation_warnings": relation_warnings,
             "blueprint_id": blueprint_package.get("blueprint_id") if blueprint_package else None,
             "blueprint_version": blueprint_package.get("blueprint_version") if blueprint_package else None,
+            "entity_deployment_modes": {
+                entity.entity_id: ("VIEW" if self._can_generate_entity_view(entity) else "TABLE")
+                for entity in entities
+            },
         }
 
     def _filter_to_required_object_views(
@@ -145,10 +149,23 @@ class DDLService:
             )
             for item in primary
         }
+        # Node and edge implementation is generated deterministically from
+        # confirmed mappings. Treat TABLE and VIEW as the same implementation
+        # slot so an LLM-proposed CTAS cannot be appended beside a template
+        # view with the identical ONTO_* object name.
+        managed_object_names = {
+            (item.get("name") or "").strip().upper()
+            for item in primary
+            if (item.get("type") or "").strip().lower() in {"create_table", "create_view"}
+        }
         for item in secondary:
+            item_type = (item.get("type") or "").strip().lower()
+            item_name = (item.get("name") or "").strip().upper()
+            if item_type in {"create_table", "create_view"} and item_name in managed_object_names:
+                continue
             key = (
-                (item.get("type") or "").strip().lower(),
-                (item.get("name") or "").strip().upper(),
+                item_type,
+                item_name,
             )
             if key in existing_keys:
                 continue
@@ -175,7 +192,15 @@ class DDLService:
             cleanup.append({"type": "drop_graph", "name": name, "sql": f"DROP PROPERTY GRAPH {name};"})
         for name in names_by_type["create_view"]:
             cleanup.append({"type": "drop_view", "name": name, "sql": f"DROP VIEW {name};"})
-        for name in names_by_type["create_table"]:
+        # Oracle 26ai permits views as graph element objects. A node/edge that
+        # was deployed by an earlier version as a table can therefore be
+        # migrated in place to a view with the same ONTO_* name.  The executor
+        # probes USER_OBJECTS by type, so the inapplicable DROP is skipped.
+        table_cleanup_names = names_by_type["create_table"] + [
+            name for name in names_by_type["create_view"]
+            if name not in names_by_type["create_table"]
+        ]
+        for name in table_cleanup_names:
             cleanup.append({"type": "drop_table", "name": name, "sql": f"DROP TABLE {name} CASCADE CONSTRAINTS PURGE;"})
         return cleanup
 
@@ -289,17 +314,21 @@ class DDLService:
         statements = []
 
         for entity in entities:
-            if entity.build_type == "TABLE":
-                sql = self._generate_table_ddl(entity)
-                statements.append({
-                    "type": "create_table",
-                    "sql": sql,
-                    "name": entity.table_name
-                })
-            elif entity.build_type == "VIEW":
+            # Oracle 26ai can build SQL Property Graphs directly from views,
+            # including views with joins and window functions. Prefer a view
+            # whenever the ontology has a stable graph key; fall back to CTAS
+            # only for nodes that cannot safely expose such a key.
+            if self._can_generate_entity_view(entity):
                 sql = self._generate_view_ddl(entity)
                 statements.append({
                     "type": "create_view",
+                    "sql": sql,
+                    "name": entity.table_name
+                })
+            else:
+                sql = self._generate_table_ddl(entity)
+                statements.append({
+                    "type": "create_table",
                     "sql": sql,
                     "name": entity.table_name
                 })
@@ -309,12 +338,14 @@ class DDLService:
             for cs in comment_sql:
                 statements.append(cs)
 
-        # Generate relation tables for MANY_TO_MANY
+        # Oracle 26ai supports edge views. Every relation with a verified Join
+        # can therefore remain a live projection of its node objects instead
+        # of being materialized as a CTAS table.
         for relation in relations:
-            sql = self._generate_relation_table_ddl(relation, entities)
+            sql = self._generate_relation_edge_ddl(relation, entities)
             if sql:
                 statements.append({
-                    "type": "create_table",
+                    "type": "create_view",
                     "sql": sql,
                     "name": self._resolve_relation_storage_name(relation)
                 })
@@ -631,6 +662,10 @@ COMMENT ON TABLE {view_name} IS '{purpose}';"""
         token = token[:20] or "EDGE"
         return f"ONTO_EDGE_{token}_V"
 
+    def _can_generate_entity_view(self, entity: SysOntologyEntity) -> bool:
+        """A view-backed graph vertex needs an explicit, stable graph key."""
+        return bool(self._get_entity_primary_key(entity))
+
     def _generate_table_ddl(self, entity: SysOntologyEntity) -> str:
         """生成实体表DDL，数据直接来源于源数据表或实体映射SQL"""
         table_name = entity.table_name or f"ONTO_NODE_{entity.entity_name.upper()}"
@@ -659,13 +694,30 @@ ADD CONSTRAINT PK_{table_name} PRIMARY KEY ({', '.join(pk_columns)});"""
         return ddl
 
     def _generate_view_ddl(self, entity: SysOntologyEntity) -> str:
-        """生成实体视图DDL，数据直接来源于源数据表或实体映射SQL"""
-        view_name = entity.table_name or f"ONTO_NODE_{entity.entity_name.upper()}_V"
+        """Generate a live node view with one non-null row for every graph key."""
+        view_name = entity.table_name or f"ONTO_NODE_{entity.entity_name.upper()}"
         source_query = self._build_entity_source_query(entity)
+        pk_columns = [prop.property_name.upper() for prop in entity.properties if prop.is_primary_key == "Y"]
+        if not pk_columns:
+            raise ValueError(f"实体 {entity.entity_display_name or entity.entity_name} 缺少可用于视图节点的主键或属性")
+        null_predicate = " OR ".join(f"node_src.{column} IS NULL" for column in pk_columns)
+        partition_columns = ", ".join(f"node_src.{column}" for column in pk_columns)
         ddl = f"""-- 实体: {entity.entity_name} ({entity.entity_display_name})
--- 构建方式: Source-backed Management View
+-- 构建方式: Oracle 26ai Live Graph View
+-- 视图显式保留每个非空业务主键的一条记录，供 Property Graph KEY 使用。
 CREATE OR REPLACE VIEW {view_name} AS
-{source_query};"""
+SELECT
+    node_dedup.*
+FROM (
+    SELECT
+        node_src.*,
+        ROW_NUMBER() OVER (PARTITION BY {partition_columns} ORDER BY {partition_columns}) AS ONTO_KEY_RN
+    FROM (
+{source_query}
+    ) node_src
+    WHERE NOT ({null_predicate})
+) node_dedup
+WHERE node_dedup.ONTO_KEY_RN = 1;"""
 
         return ddl
 
@@ -706,8 +758,8 @@ CREATE OR REPLACE VIEW {view_name} AS
 
         return statements
 
-    def _generate_relation_table_ddl(self, relation: SysOntologyRelation, entities: List[SysOntologyEntity]) -> Optional[str]:
-        """从本体节点表及其主键生成 Oracle Property Graph 边表。"""
+    def _generate_relation_edge_ddl(self, relation: SysOntologyRelation, entities: List[SysOntologyEntity]) -> Optional[str]:
+        """Generate an Oracle 26ai live edge view from verified node joins."""
         entity_by_id = {entity.entity_id: entity for entity in entities}
         source_entity = entity_by_id.get(relation.source_entity_id)
         target_entity = entity_by_id.get(relation.target_entity_id)
@@ -729,7 +781,7 @@ CREATE OR REPLACE VIEW {view_name} AS
             if not target_key:
                 missing_sides.append(f"目标实体 {describe_entity(target_entity)} 未配置主键属性")
             raise ValueError(
-                f"无法为关系「{relation.relation_name or relation.relation_id}」生成边表："
+                f"无法为关系「{relation.relation_name or relation.relation_id}」生成边视图："
                 f"{'；'.join(missing_sides)}。"
                 "请前往“业务对象构建 > 本体关系构建”，点击对应本体，在属性列表中将唯一标识字段标记为 PK 后重新生成 DDL。"
             )
@@ -769,22 +821,17 @@ CREATE OR REPLACE VIEW {view_name} AS
         rel_table = self._resolve_relation_storage_name(relation)
         safe_name = (relation.relation_name or "").replace("'", "''")
         safe_desc = (relation.relation_desc or relation.relation_name or "关系数据").replace("'", "''")
-        ddl = f"""-- 关系表: {relation.relation_name or relation.relation_id}
+        ddl = f"""-- 关系边视图: {relation.relation_name or relation.relation_id}
 -- 源节点: {source_table}({source_key}) -> 目标节点: {target_table}({target_key})
 -- 关系 Join: {join_condition}
-CREATE TABLE {rel_table} AS
+CREATE OR REPLACE VIEW {rel_table} AS
 SELECT
     ROW_NUMBER() OVER (ORDER BY src.{source_key}, dst.{target_key}) AS EDGE_ID,
     src.{source_key} AS SOURCE_ID,
     dst.{target_key} AS TARGET_ID,
     '{safe_name}' AS RELATION_NAME,
     '{safe_desc}' AS RELATION_DESC
-{from_clause};
-
-ALTER TABLE {rel_table}
-ADD CONSTRAINT PK_{rel_table[:95]} PRIMARY KEY (EDGE_ID);
-
-COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
+{from_clause};"""
 
         return ddl
 
@@ -1156,7 +1203,21 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
                 # Verify every generated edge against the actual target database
                 # before creating it, so an empty or erroneous join never enters
                 # the property graph as a seemingly valid relationship.
-                edge_preflight = self._preflight_edge_join(cursor, stmt)
+                try:
+                    edge_preflight = self._preflight_edge_join(cursor, stmt)
+                except Exception as exc:
+                    # A malformed or stale Join must be visible in execution
+                    # history as this specific edge statement.  Previously it
+                    # escaped the loop and caused the async task to save only
+                    # an empty task-level failure record.
+                    results.append({
+                        "statement": stmt,
+                        "status": "failed",
+                        "error": str(exc),
+                        "message": "关系边 Join 预检查失败",
+                        **self._describe_ddl_statement(stmt),
+                    })
+                    continue
                 if edge_preflight is not None and edge_preflight["matched_count"] == 0:
                     blocked_edge_tables.add(edge_preflight["edge_table"])
                     results.append({
@@ -1225,24 +1286,24 @@ COMMENT ON TABLE {rel_table} IS '{safe_desc}';"""
         }
 
     def _get_edge_table_name(self, statement: str) -> str:
-        """Return a generated ONTO_EDGE table referenced by one DDL statement."""
-        match = re.search(r"(?i)\b(?:CREATE\s+TABLE|ALTER\s+TABLE|COMMENT\s+ON\s+TABLE)\s+(ONTO_EDGE_[A-Z0-9_$#]+)\b", statement or "")
+        """Return a generated ONTO_EDGE object referenced by one DDL statement."""
+        match = re.search(r"(?i)\b(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)|ALTER\s+TABLE|COMMENT\s+ON\s+TABLE)\s+(ONTO_EDGE_[A-Z0-9_$#]+)\b", statement or "")
         return match.group(1).upper() if match else ""
 
     def _preflight_edge_join(self, cursor, statement: str) -> Optional[Dict[str, Any]]:
-        """Count matches for generated edge CTAS statements before deployment.
+        """Count matches for generated edge table/view statements before deployment.
 
-        The extractor deliberately accepts only the CTAS shape emitted by
-        ``_generate_relation_table_ddl`` and safe Oracle identifiers.  Other
-        user-authored DDL is left untouched.
+        The extractor deliberately accepts only the source/target Join shape
+        emitted by ``_generate_relation_edge_ddl`` and safe Oracle identifiers.
+        Other user-authored DDL is left untouched.
         """
         direct_pattern = re.compile(
-            r"(?is)^\s*CREATE\s+TABLE\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
+            r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
             r"SELECT\b.*?\bFROM\s+([A-Z][A-Z0-9_$#]*)\s+src\s+"
             r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+dst\s+ON\s+(.+?)\s*$"
         )
         relation_table_pattern = re.compile(
-            r"(?is)^\s*CREATE\s+TABLE\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
+            r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(ONTO_EDGE_[A-Z0-9_$#]+)\s+AS\s+"
             r"SELECT\b.*?\b(FROM\s+([A-Z][A-Z0-9_$#]*)\s+rel\s+"
             r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+src\s+ON\s+(.+?)\s+"
             r"JOIN\s+([A-Z][A-Z0-9_$#]*)\s+dst\s+ON\s+(.+?))\s*$"

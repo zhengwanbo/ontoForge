@@ -214,6 +214,7 @@ export const ddlApi = {
   }),
   execute: (domainId: string, data: any) => api.post(`/ddl/domains/${domainId}/execute`, data),
   getLogs: (domainId?: string) => api.get('/ddl/logs', { params: { domain_id: domainId } }),
+  getExecutionStatus: (logId: string) => api.get(`/ddl/logs/${logId}/status`),
   getLogDetails: (logId: string) => api.get(`/ddl/logs/${logId}/details`)
 }
 

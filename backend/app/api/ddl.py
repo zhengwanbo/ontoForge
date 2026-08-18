@@ -1,8 +1,9 @@
+import asyncio
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.core.auth import get_current_user
 from app.schemas.schemas import ApiResponse, DDLGenerateRequest, DDLExecuteRequest, DDLLogResponse, DDLStatementLogResponse
 from app.models.models import (
@@ -87,6 +88,95 @@ def _sync_relation_deployment_status(
             # A valid mapping exists but this target has no corresponding edge
             # table, so the DDL page can make the redeployment requirement clear.
             mapping.mapping_status = "STALE"
+
+
+def _run_ddl_execution_task(
+    log_id: str,
+    domain_id: str,
+    ddl_content: str,
+    target_source_id: str,
+    execute_mode: str,
+    skip_existing: bool,
+) -> None:
+    """Run a DDL task outside the request worker and persist its final result."""
+    from app.services.ddl_service import DDLService
+
+    task_db = SessionLocal()
+    started_at = time.time()
+    try:
+        target_source = task_db.query(SysDataSource).filter(
+            SysDataSource.source_id == target_source_id,
+            SysDataSource.is_active == "Y",
+        ).first()
+        if not target_source:
+            raise ValueError("目标对象数据库不存在或未启用")
+
+        result = asyncio.run(DDLService(task_db).execute_ddl(
+            ddl_content,
+            target_source=target_source,
+            execute_mode=execute_mode,
+            skip_existing=skip_existing,
+        ))
+        execution_result = "SUCCESS" if (result.get("failed") or 0) == 0 else "FAILED"
+        error_message = (
+            f"{result.get('failed') or 0} 条 DDL 语句执行失败"
+            if execution_result == "FAILED" else None
+        )
+
+        log = task_db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
+        if not log:
+            return
+        log.execution_result = execution_result
+        log.error_message = error_message
+        log.execution_duration = time.time() - started_at
+        for sequence_no, detail in enumerate(result.get("details") or [], start=1):
+            task_db.add(SysDDLStatementLog(
+                log_id=log_id,
+                sequence_no=sequence_no,
+                statement=detail.get("statement") or "",
+                status=detail.get("status") or "failed",
+                object_type=detail.get("object_type"),
+                object_name=detail.get("object_name"),
+                message=detail.get("message"),
+                error_message=detail.get("error"),
+            ))
+
+        # Persist each SQL result before the optional deployment-state
+        # reconciliation. This guarantees that a metadata-query failure never
+        # turns an otherwise complete execution history into an empty list.
+        task_db.commit()
+        try:
+            _sync_entity_deployment_status(task_db, domain_id, target_source)
+            _sync_relation_deployment_status(task_db, domain_id, target_source)
+            task_db.commit()
+        except Exception:
+            # DDL execution is already fully recorded. Keep its result and
+            # leave status refresh for the next page reload/redeployment.
+            task_db.rollback()
+    except Exception as exc:
+        task_db.rollback()
+        log = task_db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
+        if log:
+            log.execution_result = "FAILED"
+            log.error_message = str(exc)
+            log.execution_duration = time.time() - started_at
+            has_statement_detail = task_db.query(SysDDLStatementLog).filter(
+                SysDDLStatementLog.log_id == log_id,
+            ).first()
+            if not has_statement_detail:
+                task_db.add(SysDDLStatementLog(
+                    log_id=log_id,
+                    sequence_no=1,
+                    statement=ddl_content,
+                    status="failed",
+                    object_type="DDL TASK",
+                    object_name="-",
+                    message="DDL 后台执行任务异常终止",
+                    error_message=str(exc),
+                ))
+            task_db.commit()
+    finally:
+        task_db.close()
 
 
 def _serialize_blueprint_payload(blueprint: Optional[SysOntologyBlueprint]) -> Optional[dict]:
@@ -358,7 +448,15 @@ async def generate_ddl(
         raise HTTPException(status_code=400, detail="未生成任何DDL语句，请检查本体、映射或部署设计配置")
 
     # Update entity status
+    entity_deployment_modes = ddl_result.get("entity_deployment_modes") or {}
     for entity in entities:
+        deployment_mode = entity_deployment_modes.get(entity.entity_id)
+        if deployment_mode in {"VIEW", "TABLE"}:
+            # Keep the existing ONTO_NODE_* object name so existing relation
+            # mappings remain valid; only its Oracle implementation changes.
+            entity.build_type = deployment_mode
+            if entity.entity_mapping:
+                entity.entity_mapping.build_type = deployment_mode
         if entity.status == "MAPPED":
             entity.status = "DDL_GENERATED"
     # 生成即保存脚本快照。这样即使用户暂未执行，也能在 DDL 页面回看并继续编辑。
@@ -379,11 +477,11 @@ async def generate_ddl(
 async def execute_ddl(
     domain_id: str,
     req: DDLExecuteRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """执行DDL"""
-    from app.services.ddl_service import DDLService
+    """Create a background DDL execution task and return without waiting for Oracle."""
 
     target_source = db.query(SysDataSource).filter(
         SysDataSource.source_id == req.target_source_id,
@@ -396,73 +494,30 @@ async def execute_ddl(
     if target_source.business_domain_id and target_source.business_domain_id != domain_id:
         raise HTTPException(status_code=400, detail="目标对象数据库不属于当前分析域")
 
-    ddl_service = DDLService(db)
-    start_time = time.time()
+    log = SysDDLLog(
+        log_id=generate_id("ddl"),
+        domain_id=domain_id,
+        ddl_content=req.ddl_content,
+        execution_result="RUNNING",
+        executed_by=current_user.get("username", "unknown"),
+        executed_at=datetime.utcnow(),
+    )
+    db.add(log)
+    db.commit()
 
-    try:
-        result = await ddl_service.execute_ddl(
-            req.ddl_content,
-            target_source=target_source,
-            execute_mode=req.execute_mode,
-            skip_existing=req.skip_existing,
-        )
-        duration = time.time() - start_time
-
-        execution_result = "SUCCESS" if (result.get("failed") or 0) == 0 else "FAILED"
-        error_message = None
-        if execution_result == "FAILED":
-            error_message = f"{result.get('failed') or 0} 条 DDL 语句执行失败"
-
-        # Log execution summary; individual statement details are returned to the UI.
-        log = SysDDLLog(
-            log_id=generate_id("ddl"),
-            domain_id=domain_id,
-            ddl_content=req.ddl_content,
-            execution_result=execution_result,
-            error_message=error_message,
-            executed_by=current_user.get("username", "unknown"),
-            executed_at=datetime.utcnow(),
-            execution_duration=duration
-        )
-        db.add(log)
-        db.flush()
-        for sequence_no, detail in enumerate(result.get("details") or [], start=1):
-            db.add(SysDDLStatementLog(
-                log_id=log.log_id,
-                sequence_no=sequence_no,
-                statement=detail.get("statement") or "",
-                status=detail.get("status") or "failed",
-                object_type=detail.get("object_type"),
-                object_name=detail.get("object_name"),
-                message=detail.get("message"),
-                error_message=detail.get("error"),
-            ))
-
-        # Reconcile every entity against the target schema.  This also repairs
-        # historical DRAFT/MAPPED rows when their ONTO_NODE_* table exists.
-        _sync_entity_deployment_status(db, domain_id, target_source)
-        _sync_relation_deployment_status(db, domain_id, target_source)
-
-        db.commit()
-
-        return ApiResponse(data={"result": result, "duration": duration})
-    except Exception as e:
-        duration = time.time() - start_time
-        # Log failure
-        log = SysDDLLog(
-            log_id=generate_id("ddl"),
-            domain_id=domain_id,
-            ddl_content=req.ddl_content,
-            execution_result="FAILED",
-            error_message=str(e),
-            executed_by=current_user.get("username", "unknown"),
-            executed_at=datetime.utcnow(),
-            execution_duration=duration
-        )
-        db.add(log)
-        db.commit()
-
-        return ApiResponse(code=500, message=f"DDL执行失败: {str(e)}", data={"duration": duration})
+    background_tasks.add_task(
+        _run_ddl_execution_task,
+        log.log_id,
+        domain_id,
+        req.ddl_content,
+        target_source.source_id,
+        req.execute_mode,
+        req.skip_existing,
+    )
+    return ApiResponse(message="DDL 已提交后台执行", data={
+        "log_id": log.log_id,
+        "execution_result": "RUNNING",
+    })
 
 
 @router.get("/logs", response_model=ApiResponse)
@@ -491,6 +546,42 @@ async def get_ddl_logs(
     return ApiResponse(data=data)
 
 
+@router.get("/logs/{log_id}/status", response_model=ApiResponse)
+async def get_ddl_execution_status(
+    log_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return current task state and persisted per-statement results."""
+    log = db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="DDL 执行任务不存在")
+    details = db.query(SysDDLStatementLog).filter(
+        SysDDLStatementLog.log_id == log_id,
+    ).order_by(SysDDLStatementLog.sequence_no.asc()).all()
+    result_details = [{
+        "statement": item.statement,
+        "status": item.status,
+        "object_type": item.object_type,
+        "object_name": item.object_name,
+        "message": item.message,
+        "error": item.error_message,
+    } for item in details]
+    return ApiResponse(data={
+        "log_id": log.log_id,
+        "execution_result": log.execution_result,
+        "error_message": log.error_message,
+        "duration": log.execution_duration,
+        "result": {
+            "total": len(result_details),
+            "success": sum(1 for item in result_details if item["status"] == "success"),
+            "failed": sum(1 for item in result_details if item["status"] == "failed"),
+            "skipped": sum(1 for item in result_details if item["status"] == "skipped"),
+            "details": result_details,
+        },
+    })
+
+
 @router.get("/logs/{log_id}/details", response_model=ApiResponse)
 async def get_ddl_log_details(
     log_id: str,
@@ -505,6 +596,18 @@ async def get_ddl_log_details(
     details = db.query(SysDDLStatementLog).filter(
         SysDDLStatementLog.log_id == log_id,
     ).order_by(SysDDLStatementLog.sequence_no.asc()).all()
+    # Historical async tasks from before statement-level failure persistence
+    # may only have a task summary. Do not render a misleading empty dialog.
+    if not details and log.execution_result == "FAILED" and log.error_message:
+        return ApiResponse(data=[{
+            "sequence_no": 1,
+            "statement": log.ddl_content or "",
+            "status": "failed",
+            "object_type": "DDL TASK",
+            "object_name": "-",
+            "message": "DDL 后台任务异常终止，未生成逐语句历史记录",
+            "error_message": log.error_message,
+        }])
     return ApiResponse(data=[DDLStatementLogResponse(
         sequence_no=item.sequence_no,
         statement=item.statement,
