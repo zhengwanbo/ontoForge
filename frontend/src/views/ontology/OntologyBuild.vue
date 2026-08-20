@@ -19,16 +19,22 @@
         <el-button type="danger" plain size="small" @click="clearOntologyData">清空本体</el-button>
         <el-button size="small" @click="loadGraphData">刷新</el-button>
         <el-button type="warning" size="small" @click="saveAllPositions">保存位置</el-button>
+        <div class="graph-zoom-tools" aria-label="本体关系图缩放控制">
+          <el-button size="small" title="缩小" @click="zoomOutGraph">−</el-button>
+          <span class="graph-zoom-value">{{ graphZoomPercent }}%</span>
+          <el-button size="small" title="放大" @click="zoomInGraph">＋</el-button>
+          <el-button size="small" plain @click="fitGraphToView">适配全图</el-button>
+        </div>
         <span class="drag-hint">💡 单击实体查看属性并显示连线锚点，拖拽锚点到目标实体可快速创建关系，双击关系边可编辑或删除</span>
       </div>
       <div class="graph-layout">
         <!-- SVG Canvas -->
-        <div class="graph-area" ref="graphAreaRef">
-          <div v-if="graphNodes.length > 0" class="svg-graph">
+        <div class="graph-area" ref="graphAreaRef" @wheel.ctrl.prevent="onGraphZoomWheel">
+          <div v-if="graphNodes.length > 0" class="svg-graph" :style="{ width: `${graphRenderedWidth}px`, minHeight: `${graphRenderedHeight}px` }">
             <svg
               ref="graphSvgRef"
-              :width="canvasSize.w"
-              :height="graphCanvasHeight"
+              :width="graphRenderedWidth"
+              :height="graphRenderedHeight"
               :viewBox="`0 0 ${canvasSize.w} ${graphCanvasHeight}`"
               @mousemove="onGraphMouseMove"
               @mouseup="onGraphMouseUp"
@@ -1424,10 +1430,18 @@ const naturalAdjustForm = reactive(createEmptyNaturalAdjustForm())
 
 // ========== Graph Node Drag ==========
 const graphSvgRef = ref<SVGElement | null>(null)
+const graphAreaRef = ref<HTMLElement | null>(null)
 const draggingNode = ref<any>(null)
 const dragOffset = reactive({ x: 0, y: 0 })
 const graphNodeSize = { width: 160, height: 70 }
 const graphArrowGap = 12
+const graphZoom = ref(1)
+const graphZoomPercent = computed(() => Math.round(graphZoom.value * 100))
+const graphRenderedWidth = computed(() => Math.round(canvasSize.w * graphZoom.value))
+const graphRenderedHeight = computed(() => Math.round(graphCanvasHeight.value * graphZoom.value))
+const GRAPH_ZOOM_MIN = 0.2
+const GRAPH_ZOOM_MAX = 2
+const GRAPH_ZOOM_STEP = 0.1
 // The canvas grows with the lowest entity.  The surrounding viewport remains
 // fixed and scrollable, so entities below the first screen are still reachable.
 const graphCanvasHeight = computed(() => {
@@ -1437,6 +1451,30 @@ const graphCanvasHeight = computed(() => {
   }, 0) + graphNodeSize.height
   return Math.max(canvasSize.h, lowestNodeBottom + 100)
 })
+
+const setGraphZoom = (value: number) => {
+  graphZoom.value = Math.max(GRAPH_ZOOM_MIN, Math.min(GRAPH_ZOOM_MAX, Number(value.toFixed(2))))
+}
+
+const zoomInGraph = () => setGraphZoom(graphZoom.value + GRAPH_ZOOM_STEP)
+const zoomOutGraph = () => setGraphZoom(graphZoom.value - GRAPH_ZOOM_STEP)
+
+const onGraphZoomWheel = (event: WheelEvent) => {
+  setGraphZoom(graphZoom.value + (event.deltaY < 0 ? GRAPH_ZOOM_STEP : -GRAPH_ZOOM_STEP))
+}
+
+const fitGraphToView = async () => {
+  await nextTick()
+  const area = graphAreaRef.value
+  if (!area) return
+  const fitScale = Math.min(
+    area.clientWidth / canvasSize.w,
+    area.clientHeight / graphCanvasHeight.value,
+  )
+  setGraphZoom(fitScale)
+  await nextTick()
+  area.scrollTo({ left: 0, top: 0, behavior: 'smooth' })
+}
 
 const getGraphCanvasPoint = (clientX: number, clientY: number) => {
   const svgRect = graphSvgRef.value?.getBoundingClientRect()
@@ -1971,6 +2009,7 @@ const loadGraphData = async () => {
     selectedNode.value = null
     selectedNodeProperties.value = []
     graphConnecting.value = null
+    await fitGraphToView()
   } catch (e) {}
 }
 
@@ -3184,12 +3223,14 @@ onBeforeUnmount(() => {
 .top-bar-end { justify-content: flex-end; }
 .tab-section { display: flex; align-items: center; gap: 10px; }
 .toolbar { display: flex; gap: 8px; padding: 8px 0; align-items: center; flex-shrink: 0; }
+.graph-zoom-tools { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; padding-left: 8px; border-left: 1px solid #dcdfe6; }
+.graph-zoom-value { min-width: 46px; text-align: center; color: #4f647b; font-size: 12px; font-variant-numeric: tabular-nums; }
 .drag-hint { font-size: 12px; color: #999; margin-left: 8px; }
 .graph-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .flow-container { flex: 1; display: flex; flex-direction: column; overflow: auto; }
 .graph-layout { flex: 1; display: flex; gap: 10px; min-height: 0; overflow: hidden; }
 .graph-area { flex: 1; min-height: 0; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; overflow: auto; }
-.svg-graph { width: max-content; min-height: 100%; }
+.svg-graph { min-width: 100%; }
 .graph-node { cursor: grab; user-select: none; transition: opacity .18s ease; }
 .graph-node:active { cursor: grabbing; }
 .graph-node.is-selected rect { stroke: #f59e0b; stroke-width: 4; filter: drop-shadow(0 2px 5px rgba(245, 158, 11, .42)); }

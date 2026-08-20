@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Application
     APP_NAME: str = "本体构建平台"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "1.1.0"
     API_PREFIX: str = "/api/v1"
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
