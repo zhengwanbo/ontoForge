@@ -10,10 +10,53 @@ from app.schemas.schemas import (
     UserCreate, UserUpdate, UserResponse,
     LLMConfigCreate, LLMConfigUpdate, LLMConfigResponse
 )
-from app.models.models import SysUser, SysLLMConfig, SysOperationLog, generate_id
+from app.models.models import SysUser, SysUserDomainPermission, SysDomain, SysLLMConfig, SysOperationLog, generate_id
 from app.services.llm_service import normalize_model_name
 
 router = APIRouter(prefix="/system", tags=["系统管理"])
+
+
+def _validate_user_domain_ids(db: Session, domain_ids: list[str]) -> list[str]:
+    normalized_ids = list(dict.fromkeys(domain_id.strip() for domain_id in domain_ids if domain_id.strip()))
+    if not normalized_ids:
+        return []
+    existing_ids = {
+        domain_id for (domain_id,) in db.query(SysDomain.domain_id)
+        .filter(SysDomain.domain_id.in_(normalized_ids))
+        .all()
+    }
+    missing_ids = set(normalized_ids) - existing_ids
+    if missing_ids:
+        raise HTTPException(status_code=400, detail="存在无效的业务分析域授权")
+    return normalized_ids
+
+
+def _replace_user_domain_permissions(db: Session, user_id: str, domain_ids: list[str]) -> None:
+    db.query(SysUserDomainPermission).filter(
+        SysUserDomainPermission.user_id == user_id,
+    ).delete(synchronize_session=False)
+    db.add_all([
+        SysUserDomainPermission(user_id=user_id, domain_id=domain_id)
+        for domain_id in domain_ids
+    ])
+
+
+def _serialize_user(db: Session, user: SysUser) -> dict:
+    domain_ids = [
+        row.domain_id for row in db.query(SysUserDomainPermission.domain_id)
+        .filter(SysUserDomainPermission.user_id == user.user_id)
+        .all()
+    ]
+    return UserResponse(
+        user_id=user.user_id,
+        username=user.username,
+        display_name=user.display_name,
+        email=user.email,
+        role=user.role,
+        status=user.status,
+        domain_ids=domain_ids,
+        created_at=user.created_at,
+    ).model_dump()
 
 
 def _validate_llm_limits(max_tokens: int | None, context_window_tokens: int | None) -> None:
@@ -74,15 +117,7 @@ async def list_users(
     current_user: dict = Depends(require_admin)
 ):
     users = db.query(SysUser).order_by(SysUser.created_at).all()
-    data = [UserResponse(
-        user_id=u.user_id,
-        username=u.username,
-        display_name=u.display_name,
-        email=u.email,
-        role=u.role,
-        status=u.status,
-        created_at=u.created_at
-    ).model_dump() for u in users]
+    data = [_serialize_user(db, user) for user in users]
     return ApiResponse(data=data)
 
 
@@ -105,17 +140,16 @@ async def create_user(
         role=req.role,
         status="ACTIVE"
     )
+    domain_ids = _validate_user_domain_ids(db, req.domain_ids)
+    if normalize_role(user.role) != "admin" and not domain_ids:
+        raise HTTPException(status_code=400, detail="请至少为非管理员用户分配一个业务分析域")
     db.add(user)
+    db.flush()
+    # admin is global by design; keep no redundant grant records for it.
+    if normalize_role(user.role) != "admin":
+        _replace_user_domain_permissions(db, user.user_id, domain_ids)
     db.commit()
-    return ApiResponse(data=UserResponse(
-        user_id=user.user_id,
-        username=user.username,
-        display_name=user.display_name,
-        email=user.email,
-        role=user.role,
-        status=user.status,
-        created_at=user.created_at
-    ).model_dump())
+    return ApiResponse(data=_serialize_user(db, user))
 
 
 @router.put("/users/{user_id}", response_model=ApiResponse)
@@ -128,8 +162,24 @@ async def update_user(
     user = db.query(SysUser).filter(SysUser.user_id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
-    for field, value in req.model_dump(exclude_unset=True).items():
+    update_data = req.model_dump(exclude_unset=True)
+    domain_ids = update_data.pop("domain_ids", None)
+    for field, value in update_data.items():
         setattr(user, field, value)
+    if domain_ids is not None:
+        valid_domain_ids = _validate_user_domain_ids(db, domain_ids)
+        if normalize_role(user.role) == "admin":
+            _replace_user_domain_permissions(db, user.user_id, [])
+        else:
+            if not valid_domain_ids:
+                raise HTTPException(status_code=400, detail="请至少为非管理员用户分配一个业务分析域")
+            _replace_user_domain_permissions(db, user.user_id, valid_domain_ids)
+    elif normalize_role(user.role) != "admin":
+        has_domain_permission = db.query(SysUserDomainPermission).filter(
+            SysUserDomainPermission.user_id == user.user_id,
+        ).first()
+        if not has_domain_permission:
+            raise HTTPException(status_code=400, detail="请至少为非管理员用户分配一个业务分析域")
     user.updated_at = datetime.utcnow()
     db.commit()
     return ApiResponse(message="用户已更新")

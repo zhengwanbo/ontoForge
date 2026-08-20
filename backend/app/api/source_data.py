@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.schemas.schemas import (
     ApiResponse,
     DataObjectCommentGenerateRequest, DataObjectCommentSaveRequest, GraphQueryRequest
@@ -68,6 +68,7 @@ async def get_graph_query_recommendations(
     current_user: dict = Depends(get_current_user),
 ):
     """Generate six common Graph SQL samples from the selected live Property Graph."""
+    ensure_domain_access(db, current_user, domain_id)
     source = db.query(SysDataSource).filter(
         SysDataSource.source_id == source_id,
         SysDataSource.is_active == "Y",
@@ -104,6 +105,7 @@ async def execute_graph_query(
     current_user: dict = Depends(get_current_user),
 ):
     """在选择的业务 Oracle 数据源上执行只读 Graph SQL。"""
+    ensure_domain_access(db, current_user, req.domain_id)
     source = db.query(SysDataSource).filter(
         SysDataSource.source_id == req.source_id,
         SysDataSource.is_active == "Y",
@@ -136,6 +138,8 @@ async def list_browse_data_sources(
     current_user: dict = Depends(get_current_user)
 ):
     """获取可用于源数据浏览的数据源列表"""
+    if domain_id:
+        ensure_domain_access(db, current_user, domain_id)
     from app.services.source_data_service import SourceDataService
 
     service = SourceDataService(db)

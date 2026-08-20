@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
 from app.core.database import SessionLocal, get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_authorized_domain_ids, get_current_user
 from app.schemas.schemas import ApiResponse, DDLGenerateRequest, DDLExecuteRequest, DDLLogResponse, DDLStatementLogResponse
 from app.models.models import (
     SysDDLLog,
@@ -375,6 +375,7 @@ async def get_ddl_context(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
@@ -414,6 +415,7 @@ async def generate_ddl(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """调用LLM生成DDL"""
     from app.services.ddl_service import DDLService
 
@@ -481,6 +483,7 @@ async def execute_ddl(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """Create a background DDL execution task and return without waiting for Oracle."""
 
     target_source = db.query(SysDataSource).filter(
@@ -528,7 +531,11 @@ async def get_ddl_logs(
     current_user: dict = Depends(get_current_user)
 ):
     query = db.query(SysDDLLog)
+    authorized_domain_ids = get_authorized_domain_ids(db, current_user)
+    if authorized_domain_ids is not None:
+        query = query.filter(SysDDLLog.domain_id.in_(authorized_domain_ids))
     if domain_id:
+        ensure_domain_access(db, current_user, domain_id)
         query = query.filter(SysDDLLog.domain_id == domain_id)
     logs = query.order_by(SysDDLLog.executed_at.desc()).limit(limit).all()
 
@@ -556,6 +563,7 @@ async def get_ddl_execution_status(
     log = db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="DDL 执行任务不存在")
+    ensure_domain_access(db, current_user, log.domain_id)
     details = db.query(SysDDLStatementLog).filter(
         SysDDLStatementLog.log_id == log_id,
     ).order_by(SysDDLStatementLog.sequence_no.asc()).all()
@@ -592,6 +600,7 @@ async def get_ddl_log_details(
     log = db.query(SysDDLLog).filter(SysDDLLog.log_id == log_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="DDL 历史记录不存在")
+    ensure_domain_access(db, current_user, log.domain_id)
 
     details = db.query(SysDDLStatementLog).filter(
         SysDDLStatementLog.log_id == log_id,

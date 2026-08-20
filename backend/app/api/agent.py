@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from io import BytesIO
 from sqlalchemy.orm import Session
 
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.core.database import get_db
 from app.schemas.schemas import (
     AgentSkillCreate,
@@ -14,10 +14,18 @@ from app.schemas.schemas import (
     ApiResponse,
 )
 from app.services.agent_service import AgentService
-from app.models.models import SysDataSource
+from app.models.models import SysAgentSkill, SysDataSource
 from app.services.source_data_service import SourceDataService
 
 router = APIRouter(prefix="/agent", tags=["智能体构建"])
+
+
+def _get_authorized_skill(db: Session, current_user: dict, skill_id: str) -> SysAgentSkill:
+    skill = db.query(SysAgentSkill).filter(SysAgentSkill.skill_id == skill_id).first()
+    if not skill:
+        raise HTTPException(status_code=404, detail="技能不存在")
+    ensure_domain_access(db, current_user, skill.domain_id)
+    return skill
 
 
 @router.get("/domains/{domain_id}/property-graphs", response_model=ApiResponse)
@@ -28,6 +36,7 @@ async def list_domain_property_graphs(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, domain_id)
     source = db.query(SysDataSource).filter(SysDataSource.source_id == source_id, SysDataSource.is_active == "Y").first()
     if not source:
         raise HTTPException(status_code=400, detail="数据源不存在或未启用")
@@ -50,6 +59,8 @@ async def list_agent_skills(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    if domain_id:
+        ensure_domain_access(db, current_user, domain_id)
     service = AgentService(db)
     return ApiResponse(data=service.list_skills(domain_id=domain_id))
 
@@ -60,6 +71,7 @@ async def list_managed_agent_skills(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, domain_id)
     return ApiResponse(data=AgentService(db).list_managed_skills(domain_id))
 
 
@@ -70,6 +82,7 @@ async def upload_managed_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, domain_id)
     try:
         content = await file.read()
         data = AgentService(db).upload_managed_skill(domain_id, file.filename or "agent_skill.zip", content, current_user.get("username", "unknown"))
@@ -87,6 +100,7 @@ async def delete_managed_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, domain_id)
     try:
         AgentService(db).delete_managed_skill(managed_skill_id, domain_id)
     except ValueError as exc:
@@ -121,6 +135,7 @@ async def test_managed_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, req.domain_id)
     try:
         data = await AgentService(db).test_managed_skill(managed_skill_id, req.model_dump(), current_user.get("username", "unknown"))
     except ValueError as exc:
@@ -136,6 +151,7 @@ async def get_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    _get_authorized_skill(db, current_user, skill_id)
     service = AgentService(db)
     try:
         data = service.get_skill(skill_id)
@@ -151,6 +167,7 @@ async def create_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, domain_id)
     service = AgentService(db)
     try:
         data = await service.create_skill(domain_id, req.model_dump(), current_user)
@@ -166,6 +183,7 @@ async def update_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    _get_authorized_skill(db, current_user, skill_id)
     service = AgentService(db)
     try:
         data = await service.update_skill(skill_id, req.model_dump(exclude_unset=True))
@@ -180,6 +198,7 @@ async def delete_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    _get_authorized_skill(db, current_user, skill_id)
     service = AgentService(db)
     try:
         service.delete_skill(skill_id)
@@ -194,6 +213,7 @@ async def download_agent_skill_package(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    _get_authorized_skill(db, current_user, skill_id)
     service = AgentService(db)
     try:
         package = await service.build_skill_package(skill_id)
@@ -215,6 +235,7 @@ async def test_agent_skill(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    _get_authorized_skill(db, current_user, skill_id)
     service = AgentService(db)
     try:
         data = await service.test_skill(skill_id, req.model_dump())

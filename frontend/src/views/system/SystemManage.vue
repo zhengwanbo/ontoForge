@@ -48,6 +48,17 @@
             <el-tag :type="row.role === 'admin' ? 'danger' : row.role === 'analyst' ? '' : 'info'" size="small">{{ row.role }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="可用业务分析域" min-width="220">
+          <template #default="{ row }">
+            <el-tag v-if="row.role === 'admin'" type="danger" size="small">全部分析域</el-tag>
+            <template v-else-if="row.domain_ids?.length">
+              <el-tag v-for="domainId in row.domain_ids" :key="domainId" size="small" class="domain-tag">
+                {{ domainNameById(domainId) }}
+              </el-tag>
+            </template>
+            <el-tag v-else type="warning" size="small">未授权</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="status" label="状态" width="80">
           <template #default="{ row }">
             <el-tag :type="row.status === 'ACTIVE' ? 'success' : 'danger'" size="small">{{ row.status }}</el-tag>
@@ -117,6 +128,15 @@
             <el-option label="只读用户 (viewer)" value="viewer" />
           </el-select>
         </el-form-item>
+        <el-form-item label="可用分析域">
+          <el-checkbox-group v-model="userForm.domain_ids" :disabled="userForm.role === 'admin'">
+            <el-checkbox v-for="domain in domains" :key="domain.domain_id" :label="domain.domain_id">
+              {{ domain.domain_name }}
+            </el-checkbox>
+          </el-checkbox-group>
+          <div class="form-tip" v-if="userForm.role === 'admin'">管理员默认可查看和管理全部业务分析域，无需单独授权。</div>
+          <div class="form-tip" v-else>请至少选择一个业务分析域；用户登录后只能访问这些分析域下的本体、映射、DDL 等内容。</div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="userDialogVisible = false">取消</el-button>
@@ -130,7 +150,7 @@
 import { ref, watch, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { systemApi } from '../../api'
+import { domainApi, systemApi } from '../../api'
 
 const route = useRoute()
 
@@ -176,7 +196,7 @@ const llmForm = ref(createEmptyLLMForm())
 const users = ref<any[]>([])
 const userDialogVisible = ref(false)
 const userDialogTitle = ref('新建用户')
-const userForm = ref({ username: '', display_name: '', email: '', password: '', role: 'analyst' })
+const userForm = ref({ username: '', display_name: '', email: '', password: '', role: 'analyst', domain_ids: [] as string[] })
 const isEditUser = ref(false)
 const editUserId = ref('')
 
@@ -189,6 +209,11 @@ const loadLLMConfigs = async () => {
 const loadUsers = async () => {
   try { const res = await systemApi.getUsers(); users.value = res.data || [] } catch (e) {}
 }
+const domains = ref<any[]>([])
+const loadDomains = async () => {
+  try { const res = await domainApi.list(); domains.value = res.data || [] } catch (e) {}
+}
+const domainNameById = (domainId: string) => domains.value.find(item => item.domain_id === domainId)?.domain_name || domainId
 const loadOperationLogs = async () => {
   try { const res = await systemApi.getOperationLogs(); operationLogs.value = res.data || [] } catch (e) {}
 }
@@ -274,14 +299,21 @@ const deleteLLM = async (configId: string) => {
 
 const showCreateUser = () => {
   userDialogTitle.value = '新建用户'
-  userForm.value = { username: '', display_name: '', email: '', password: '', role: 'analyst' }
+  userForm.value = { username: '', display_name: '', email: '', password: '', role: 'analyst', domain_ids: [] }
   isEditUser.value = false
   userDialogVisible.value = true
 }
 
 const editUser = (row: any) => {
   userDialogTitle.value = '编辑用户'
-  userForm.value = { username: row.username, display_name: row.display_name, email: row.email, password: '', role: row.role }
+  userForm.value = {
+    username: row.username,
+    display_name: row.display_name,
+    email: row.email,
+    password: '',
+    role: row.role,
+    domain_ids: [...(row.domain_ids || [])]
+  }
   editUserId.value = row.user_id
   isEditUser.value = true
   userDialogVisible.value = true
@@ -290,8 +322,17 @@ const editUser = (row: any) => {
 const saveUser = async () => {
   saving.value = true
   try {
+    if (userForm.value.role !== 'admin' && !userForm.value.domain_ids.length) {
+      ElMessage.warning('请至少选择一个可用业务分析域')
+      return
+    }
     if (isEditUser.value) {
-      await systemApi.updateUser(editUserId.value, { display_name: userForm.value.display_name, email: userForm.value.email, role: userForm.value.role })
+      await systemApi.updateUser(editUserId.value, {
+        display_name: userForm.value.display_name,
+        email: userForm.value.email,
+        role: userForm.value.role,
+        domain_ids: userForm.value.domain_ids
+      })
     } else {
       await systemApi.createUser(userForm.value)
     }
@@ -311,6 +352,7 @@ const disableUser = async (userId: string) => {
 }
 
 onMounted(() => {
+  loadDomains()
   loadDataForTab(activeTab.value)
 })
 </script>
@@ -321,4 +363,5 @@ onMounted(() => {
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .section-header h4 { margin: 0; font-size: 16px; color: #1a3a5c; }
 .form-tip { margin-top: 4px; color: #909399; font-size: 12px; line-height: 1.4; }
+.domain-tag { margin: 2px 4px 2px 0; }
 </style>

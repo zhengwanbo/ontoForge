@@ -39,6 +39,7 @@ class UserCreate(BaseModel):
     email: Optional[str] = None
     password: str
     role: str = "analyst"
+    domain_ids: List[str] = Field(default_factory=list)
 
 
 class UserUpdate(BaseModel):
@@ -46,6 +47,7 @@ class UserUpdate(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     status: Optional[str] = None
+    domain_ids: Optional[List[str]] = None
 
 
 class UserResponse(BaseModel):
@@ -55,6 +57,7 @@ class UserResponse(BaseModel):
     email: Optional[str] = None
     role: str
     status: str
+    domain_ids: List[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
 
 

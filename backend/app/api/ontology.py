@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.core.logging import get_logger
 from app.schemas.schemas import (
     ApiResponse, EntityCreate, EntityUpdate, EntityResponse,
@@ -41,6 +41,23 @@ def _normalize_relation_table_name(name: Optional[str]) -> str:
     if not token:
         return ""
     return token if token.startswith("ONTO_") else f"ONTO_EDGE_{token}"
+
+
+def _ensure_entity_access(db: Session, current_user: dict, entity: Optional[SysOntologyEntity]) -> None:
+    if entity:
+        ensure_domain_access(db, current_user, entity.domain_id)
+
+
+def _ensure_property_access(db: Session, current_user: dict, prop: Optional[SysOntologyProperty]) -> None:
+    if not prop:
+        return
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == prop.entity_id).first()
+    _ensure_entity_access(db, current_user, entity)
+
+
+def _ensure_relation_access(db: Session, current_user: dict, relation: Optional[SysOntologyRelation]) -> None:
+    if relation:
+        ensure_domain_access(db, current_user, relation.domain_id)
 
 
 def _build_relation_edge_view_name(relation_name: Optional[str], relation_id: Optional[str]) -> str:
@@ -203,6 +220,7 @@ async def list_entities(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     entities = db.query(SysOntologyEntity).filter(
         SysOntologyEntity.domain_id == domain_id
     ).order_by(SysOntologyEntity.created_at).all()
@@ -252,6 +270,7 @@ async def create_entity(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     # Check domain exists
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
@@ -315,6 +334,7 @@ async def update_entity(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
 
     payload = req.model_dump(exclude_unset=True)
 
@@ -355,6 +375,7 @@ async def delete_entity(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
 
     deleted_relation_count = _delete_entity_dependencies(db, [entity_id])
     db.query(SysOntologyEntity).filter(
@@ -375,6 +396,10 @@ async def list_properties(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     properties = db.query(SysOntologyProperty).filter(
         SysOntologyProperty.entity_id == entity_id
     ).order_by(SysOntologyProperty.order_num).all()
@@ -407,6 +432,7 @@ async def create_property(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
 
     # Check duplicate property name
     existing = db.query(SysOntologyProperty).filter(
@@ -457,6 +483,7 @@ async def update_property(
     prop = db.query(SysOntologyProperty).filter(SysOntologyProperty.property_id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="属性不存在")
+    _ensure_property_access(db, current_user, prop)
 
     for field, value in req.model_dump(exclude_unset=True).items():
         setattr(prop, field, value)
@@ -474,6 +501,7 @@ async def delete_property(
     prop = db.query(SysOntologyProperty).filter(SysOntologyProperty.property_id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="属性不存在")
+    _ensure_property_access(db, current_user, prop)
     entity_id = prop.entity_id
     property_mappings = db.query(SysPropertyMapping).filter(
         SysPropertyMapping.property_id == property_id
@@ -506,6 +534,7 @@ async def list_relations(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     relations = db.query(SysOntologyRelation).filter(
         SysOntologyRelation.domain_id == domain_id
     ).all()
@@ -532,6 +561,7 @@ async def create_relation(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     # Verify source and target entities exist
     source = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == req.source_entity_id).first()
     target = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == req.target_entity_id).first()
@@ -582,6 +612,7 @@ async def update_relation(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
+    _ensure_relation_access(db, current_user, relation)
 
     payload = req.model_dump(exclude_unset=True)
 
@@ -620,6 +651,7 @@ async def delete_relation(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
+    _ensure_relation_access(db, current_user, relation)
     db.query(SysRelationMapping).filter(
         SysRelationMapping.relation_id == relation_id,
     ).delete(synchronize_session=False)
@@ -636,6 +668,7 @@ async def clear_domain_ontology_data(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
@@ -744,6 +777,7 @@ async def generate_ontology_from_guide(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """结合业务文档和关系表，自动生成业务实体与关系"""
     from app.services.ontology_guide_service import OntologyGuideService
 
@@ -789,6 +823,7 @@ async def apply_ontology_guide_preview(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """直接应用当前 Guide 预览结果，不重新生成"""
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
@@ -821,6 +856,7 @@ async def parse_ontology_guide_document(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """上传并解析 Guide 文档正文"""
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
@@ -846,6 +882,7 @@ async def parse_ontology_guide_ddl(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """上传并解析数据库 DDL 文件，提取表结构作为 Guide 表信息来源"""
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
@@ -871,6 +908,7 @@ async def parse_ontology_guide_rule_data(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """上传并解析规则数据文件，用于缺陷识别范围与规则数据提取"""
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
@@ -896,6 +934,7 @@ async def generate_ontology_natural_adjustment(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """通过自然语言生成并应用本体对象/属性/关系调整计划"""
     from app.services.ontology_adjustment_service import OntologyAdjustmentService
 
@@ -923,6 +962,7 @@ async def apply_ontology_natural_adjustment(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """应用前端确认后的自然语言调整计划"""
     from app.services.ontology_adjustment_service import OntologyAdjustmentService
 
@@ -948,6 +988,7 @@ async def get_ontology_graph(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     entities = db.query(SysOntologyEntity).filter(
         SysOntologyEntity.domain_id == domain_id
     ).all()
@@ -1003,6 +1044,7 @@ async def update_entity_position(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     entity.graph_position = json.dumps(position)
     entity.updated_at = datetime.utcnow()
     db.commit()

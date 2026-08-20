@@ -3,7 +3,7 @@ from typing import Optional, List, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_authorized_domain_ids, get_current_user
 from app.schemas.schemas import ApiResponse, DomainCreate, DomainUpdate, DomainResponse
 from app.models.models import SysDomain, SysDataSource, generate_id
 from app.services.business_type_service import get_business_type_by_code
@@ -22,6 +22,9 @@ async def list_domains(
     current_user: dict = Depends(get_current_user)
 ):
     query = db.query(SysDomain)
+    authorized_domain_ids = get_authorized_domain_ids(db, current_user)
+    if authorized_domain_ids is not None:
+        query = query.filter(SysDomain.domain_id.in_(authorized_domain_ids))
     if status:
         query = query.filter(SysDomain.status == status)
     domains = query.order_by(SysDomain.created_at.desc()).all()
@@ -87,6 +90,7 @@ async def get_domain(
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
+    ensure_domain_access(db, current_user, domain_id)
     return ApiResponse(data=DomainResponse(
         domain_id=domain.domain_id,
         domain_name=domain.domain_name,
@@ -109,6 +113,7 @@ async def update_domain(
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
+    ensure_domain_access(db, current_user, domain_id)
     provided_fields = req.model_fields_set
     if "domain_name" in provided_fields:
         normalized_name = normalize_domain_name(req.domain_name)
@@ -154,6 +159,7 @@ async def delete_domain(
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
+    ensure_domain_access(db, current_user, domain_id)
 
     if domain.entities or domain.relations or domain.processes:
         raise HTTPException(status_code=400, detail="分析域下仍存在本体对象、关系或流程，无法删除")

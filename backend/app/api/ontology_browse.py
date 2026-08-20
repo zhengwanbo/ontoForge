@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.schemas.schemas import ApiResponse, CommentsUpdateRequest, SourceDataQueryRequest, SourceDataResponse, GraphInstanceQueryRequest, GraphInstanceLineageRequest
 from app.models.models import SysDataSource, SysOntologyEntity, SysOntologyRelation, SysOntologyProperty, SysDomain
 from app.services.source_data_service import SourceDataService
@@ -71,6 +71,7 @@ async def get_ontology_graph(
     current_user: dict = Depends(get_current_user)
 ):
     """从 Oracle Property Graph 数据字典读取实际拓扑。"""
+    ensure_domain_access(db, current_user, domain_id)
     source = db.query(SysDataSource).filter(
         SysDataSource.source_id == source_id,
         SysDataSource.is_active == "Y",
@@ -113,6 +114,7 @@ async def query_ontology_graph_instances(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    ensure_domain_access(db, current_user, req.domain_id)
     source = db.query(SysDataSource).filter(
         SysDataSource.source_id == req.source_id,
         SysDataSource.is_active == "Y",
@@ -134,6 +136,7 @@ async def query_ontology_graph_instances(
 
 @router.post("/graph/instances/lineage", response_model=ApiResponse)
 async def query_ontology_graph_instance_lineage(req: GraphInstanceLineageRequest, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    ensure_domain_access(db, current_user, req.domain_id)
     source = db.query(SysDataSource).filter(SysDataSource.source_id == req.source_id, SysDataSource.is_active == "Y").first()
     if not source or source.business_domain_id != req.domain_id:
         raise HTTPException(status_code=400, detail="目标对象数据库不属于当前业务分析域")

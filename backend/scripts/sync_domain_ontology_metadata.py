@@ -20,6 +20,7 @@ import oracledb
 
 TABLES = [
     "SYS_DOMAIN",
+    "SYS_PROCESS_DEF",
     "SYS_ONTOLOGY_ENTITY",
     "SYS_ONTOLOGY_PROPERTY",
     "SYS_ONTOLOGY_RELATION",
@@ -81,6 +82,7 @@ def select_rows(connection, table_name: str, table_columns: list[str], domain_id
     quoted = ", ".join(f'"{column}"' for column in table_columns)
     filters = {
         "SYS_DOMAIN": ("DOMAIN_ID = :domain_id", {}),
+        "SYS_PROCESS_DEF": ("DOMAIN_ID = :domain_id", {}),
         "SYS_ONTOLOGY_ENTITY": ("DOMAIN_ID = :domain_id", {}),
         "SYS_ONTOLOGY_PROPERTY": ("ENTITY_ID IN (SELECT ENTITY_ID FROM SYS_ONTOLOGY_ENTITY WHERE DOMAIN_ID = :domain_id)", {}),
         "SYS_ONTOLOGY_RELATION": ("DOMAIN_ID = :domain_id", {}),
@@ -123,6 +125,7 @@ def backup(path: Path, scoped_rows: dict[str, list[tuple[Any, ...]]], all_column
 
 def delete_target(cursor, domain_id: str) -> None:
     deletes = [
+        "DELETE FROM SYS_PROCESS_DEF WHERE DOMAIN_ID = :domain_id",
         "DELETE FROM SYS_DDL_STATEMENT_LOG WHERE LOG_ID IN (SELECT LOG_ID FROM SYS_DDL_LOG WHERE DOMAIN_ID = :domain_id)",
         "DELETE FROM SYS_DDL_LOG WHERE DOMAIN_ID = :domain_id",
         "DELETE FROM SYS_PROPERTY_MAPPING WHERE PROPERTY_ID IN (SELECT p.PROPERTY_ID FROM SYS_ONTOLOGY_PROPERTY p JOIN SYS_ONTOLOGY_ENTITY e ON e.ENTITY_ID = p.ENTITY_ID WHERE e.DOMAIN_ID = :domain_id)",
@@ -133,7 +136,6 @@ def delete_target(cursor, domain_id: str) -> None:
         "DELETE FROM SYS_ONTOLOGY_PROPERTY WHERE ENTITY_ID IN (SELECT ENTITY_ID FROM SYS_ONTOLOGY_ENTITY WHERE DOMAIN_ID = :domain_id)",
         "DELETE FROM SYS_ONTOLOGY_RELATION WHERE DOMAIN_ID = :domain_id",
         "DELETE FROM SYS_ONTOLOGY_ENTITY WHERE DOMAIN_ID = :domain_id",
-        "DELETE FROM SYS_DOMAIN WHERE DOMAIN_ID = :domain_id",
     ]
     for sql in deletes:
         cursor.execute(sql, {"domain_id": domain_id})
@@ -145,6 +147,25 @@ def insert_rows(cursor, table_name: str, table_columns: list[str], rows: list[tu
     names = ", ".join(f'"{column}"' for column in table_columns)
     binds = ", ".join(f":{index}" for index in range(1, len(table_columns) + 1))
     cursor.executemany(f'INSERT INTO "{table_name}" ({names}) VALUES ({binds})', rows)
+
+
+def merge_domain(cursor, table_columns: list[str], rows: list[tuple[Any, ...]]) -> None:
+    """Upsert the domain without deleting unrelated records that reference it."""
+    if not rows:
+        return
+    key = "DOMAIN_ID"
+    select_list = ", ".join(f":{index} AS \"{column}\"" for index, column in enumerate(table_columns, start=1))
+    non_key = [column for column in table_columns if column != key]
+    updates = ", ".join(f't.\"{column}\" = s.\"{column}\"' for column in non_key)
+    insert_columns = ", ".join(f'\"{column}\"' for column in table_columns)
+    insert_values = ", ".join(f's.\"{column}\"' for column in table_columns)
+    cursor.executemany(
+        f'''MERGE INTO SYS_DOMAIN t USING (SELECT {select_list} FROM DUAL) s
+            ON (t.DOMAIN_ID = s.DOMAIN_ID)
+            WHEN MATCHED THEN UPDATE SET {updates}
+            WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})''',
+        rows,
+    )
 
 
 def main() -> int:
@@ -175,7 +196,8 @@ def main() -> int:
         cursor = target.cursor()
         try:
             delete_target(cursor, args.domain_id)
-            for table in TABLES:
+            merge_domain(cursor, target_columns["SYS_DOMAIN"], source_rows["SYS_DOMAIN"])
+            for table in TABLES[1:]:
                 insert_rows(cursor, table, target_columns[table], source_rows[table])
             target.commit()
         except Exception:

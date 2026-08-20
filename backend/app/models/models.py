@@ -333,6 +333,15 @@ class SysUser(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class SysUserDomainPermission(Base):
+    """Business domains that a non-admin user is allowed to use."""
+    __tablename__ = "sys_user_domain_permission"
+
+    user_id = Column(String(50), ForeignKey("sys_user.user_id"), primary_key=True)
+    domain_id = Column(String(50), ForeignKey("sys_domain.domain_id"), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class SysDDLLog(Base):
     __tablename__ = "sys_ddl_log"
 

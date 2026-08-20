@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.schemas.schemas import (
     ApiResponse, ProcessCreate, ProcessUpdate, ProcessResponse,
     ProcessGuideGenerateRequest,
@@ -21,6 +21,7 @@ async def generate_process_guide(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="分析域不存在")
@@ -45,6 +46,7 @@ async def list_processes(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     processes = db.query(SysProcessDef).filter(
         SysProcessDef.domain_id == domain_id
     ).order_by(SysProcessDef.created_at.desc()).all()
@@ -72,6 +74,7 @@ async def create_process(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         from fastapi import HTTPException
@@ -116,6 +119,7 @@ async def update_process(
     process = db.query(SysProcessDef).filter(SysProcessDef.process_id == process_id).first()
     if not process:
         raise HTTPException(status_code=404, detail="流程不存在")
+    ensure_domain_access(db, current_user, process.domain_id)
 
     for field, value in req.model_dump(exclude_unset=True).items():
         setattr(process, field, value)
@@ -134,6 +138,7 @@ async def delete_process(
     process = db.query(SysProcessDef).filter(SysProcessDef.process_id == process_id).first()
     if not process:
         raise HTTPException(status_code=404, detail="流程不存在")
+    ensure_domain_access(db, current_user, process.domain_id)
     db.delete(process)
     db.commit()
     return ApiResponse(message="流程已删除")

@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db, SessionLocal
-from app.core.auth import get_current_user
+from app.core.auth import ensure_domain_access, get_current_user
 from app.core.logging import get_logger
 from app.schemas.schemas import (
     ApiResponse, PropertyMappingCreate, PropertyMappingUpdate,
@@ -23,6 +23,16 @@ from app.models.models import (
 
 router = APIRouter(prefix="/mapping", tags=["数据映射"])
 logger = get_logger(__name__)
+
+
+def _ensure_entity_access(db: Session, current_user: dict, entity: Optional[SysOntologyEntity]) -> None:
+    if entity:
+        ensure_domain_access(db, current_user, entity.domain_id)
+
+
+def _ensure_relation_access(db: Session, current_user: dict, relation: Optional[SysOntologyRelation]) -> None:
+    if relation:
+        ensure_domain_access(db, current_user, relation.domain_id)
 
 
 def _normalize_edge_table_name(value: Optional[str]) -> str:
@@ -1636,6 +1646,7 @@ async def get_latest_blueprint(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
     if not domain:
         raise HTTPException(status_code=404, detail="业务分析域不存在")
@@ -1688,14 +1699,15 @@ async def get_entity_mapping(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     mapping = db.query(SysEntityMapping).filter(
         SysEntityMapping.entity_id == entity_id
     ).first()
     if not mapping:
         # Create default
-        entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
-        if not entity:
-            raise HTTPException(status_code=404, detail="实体不存在")
         mapping = SysEntityMapping(
             mapping_id=generate_id("emap"),
             entity_id=entity_id,
@@ -1705,7 +1717,6 @@ async def get_entity_mapping(
         db.add(mapping)
         db.commit()
         db.refresh(mapping)
-    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     blueprint_payload = _load_latest_blueprint_payload(db, entity.domain_id) if entity else None
     blueprint_recommendation = _find_blueprint_entity_recommendation(blueprint_payload, entity) if entity else None
     blueprint_context = _build_blueprint_mapping_context(blueprint_payload, entity) if entity else {}
@@ -1732,6 +1743,10 @@ async def update_entity_mapping(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     payload = req.model_dump(exclude_unset=True)
     mapping = db.query(SysEntityMapping).filter(SysEntityMapping.entity_id == entity_id).first()
     if not mapping:
@@ -1754,16 +1769,14 @@ async def update_entity_mapping(
     db.commit()
 
     # Also update entity build_type
-    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
-    if entity:
-        entity.build_type = req.build_type
-        # Update table name based on build type
-        if req.build_type == "VIEW":
-            entity.table_name = f"ONTO_NODE_{entity.entity_name.upper()}_V"
-        else:
-            entity.table_name = f"ONTO_NODE_{entity.entity_name.upper()}"
-        _refresh_entity_status(db, entity_id)
-        db.commit()
+    entity.build_type = req.build_type
+    # Update table name based on build type
+    if req.build_type == "VIEW":
+        entity.table_name = f"ONTO_NODE_{entity.entity_name.upper()}_V"
+    else:
+        entity.table_name = f"ONTO_NODE_{entity.entity_name.upper()}"
+    _refresh_entity_status(db, entity_id)
+    db.commit()
 
     return ApiResponse(message="实体映射已更新")
 
@@ -1776,6 +1789,10 @@ async def get_property_mappings(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     mappings = (
         db.query(SysPropertyMapping, SysOntologyProperty.entity_id)
         .join(SysOntologyProperty, SysOntologyProperty.property_id == SysPropertyMapping.property_id)
@@ -1811,6 +1828,8 @@ async def update_property_mapping(
     prop = db.query(SysOntologyProperty).filter(SysOntologyProperty.property_id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="属性不存在")
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == prop.entity_id).first()
+    _ensure_entity_access(db, current_user, entity)
 
     mapping = db.query(SysPropertyMapping).filter(
         SysPropertyMapping.property_id == property_id
@@ -1929,6 +1948,7 @@ async def analyze_relation_join(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation or not relation.source_entity or not relation.target_entity:
         raise HTTPException(status_code=404, detail="关系或两端本体对象不存在")
+    _ensure_relation_access(db, current_user, relation)
 
     source_table = (req.source_table or _relation_entity_source_table(relation.source_entity)).strip().upper()
     target_table = (req.target_table or _relation_entity_source_table(relation.target_entity)).strip().upper()
@@ -1979,6 +1999,7 @@ async def get_relation_mapping(
     ).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
+    _ensure_relation_access(db, current_user, relation)
     mapping = db.query(SysRelationMapping).filter(
         SysRelationMapping.relation_id == relation_id
     ).first()
@@ -2025,6 +2046,7 @@ async def create_relation_mapping(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
+    _ensure_relation_access(db, current_user, relation)
     has_mapping_content = (
         bool(req.relation_table and req.relation_source_column and req.relation_target_column)
         if (req.mapping_mode or "DIRECT").upper() == "RELATION_TABLE"
@@ -2067,6 +2089,7 @@ async def update_relation_mapping(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
+    _ensure_relation_access(db, current_user, relation)
 
     payload = req.model_dump(exclude_unset=True)
     edge_table_name = payload.pop("edge_table_name", None)
@@ -2128,6 +2151,9 @@ async def auto_mapping(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    if entity.domain_id != req.domain_id:
+        raise HTTPException(status_code=400, detail="实体不属于当前业务分析域")
+    _ensure_entity_access(db, current_user, entity)
     logger.info(
         "Auto mapping entity loaded: entity_id=%s entity_name=%s display_name=%s",
         entity.entity_id,
@@ -2273,6 +2299,7 @@ async def bulk_auto_mapping(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     logger.info(
         "API bulk auto mapping requested: domain_id=%s source_id=%s schema=%s model_config_id=%s auto_apply=%s",
         domain_id,
@@ -2398,6 +2425,7 @@ async def bulk_apply_mappings(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     logger.info(
         "API bulk apply mappings requested: domain_id=%s entity_count=%s relation_count=%s",
         domain_id,
@@ -2535,6 +2563,7 @@ async def list_mapping_tasks(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     logger.info("API list mapping tasks requested: domain_id=%s", domain_id)
     latest_blueprint_payload = _load_latest_blueprint_payload(db, domain_id)
     latest_blueprint_version = latest_blueprint_payload.get("blueprint_version") if latest_blueprint_payload else None
@@ -2572,6 +2601,7 @@ async def clear_mapping_tasks(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    ensure_domain_access(db, current_user, domain_id)
     """清除指定分析域的数据映射操作任务快照，不影响已确认的映射配置。"""
     logger.info("API clear mapping tasks requested: domain_id=%s", domain_id)
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
@@ -2611,6 +2641,7 @@ async def get_mapping_task(
     task = db.query(SysMappingTask).filter(SysMappingTask.task_id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="映射任务不存在")
+    ensure_domain_access(db, current_user, task.domain_id)
     return ApiResponse(data={
         "task_id": task.task_id,
         "domain_id": task.domain_id,
@@ -2639,6 +2670,7 @@ async def confirm_mappings(
     entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
     confirmed_count = _apply_mappings_for_entity(db, entity, req.mappings, current_user)
     db.commit()
     return ApiResponse(message="映射确认完成", data={"confirmed_count": confirmed_count})
