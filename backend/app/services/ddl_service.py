@@ -1050,14 +1050,6 @@ SELECT
     def _build_entity_source_query(self, entity: SysOntologyEntity) -> str:
         entity_mapping = getattr(entity, "entity_mapping", None)
         explicit_sql = (entity_mapping.view_sql or "").strip() if entity_mapping and entity_mapping.view_sql else ""
-        if explicit_sql:
-            # Oracle VARCHAR2 必须声明长度；LLM 偶尔生成 CAST(NULL AS VARCHAR2)。
-            return re.sub(
-                r"(?i)CAST\(\s*NULL\s+AS\s+VARCHAR2\s*\)",
-                "CAST(NULL AS VARCHAR2(500))",
-                explicit_sql.rstrip(";"),
-            )
-
         mapped_properties = [
             prop for prop in (entity.properties or [])
             if getattr(prop, "mapping", None)
@@ -1066,25 +1058,45 @@ SELECT
                 or ((prop.mapping.mapping_type or "").upper() == "COMPUTED" and (prop.mapping.source_table or "").strip() and (prop.mapping.formula_expr or "").strip())
             )
         ]
-        if not mapped_properties:
-            raise ValueError(f"实体 {entity.entity_display_name or entity.entity_name} 缺少已确认的源数据映射，无法生成来源于源表的数据DDL")
 
         source_tables: List[str] = []
         for prop in mapped_properties:
             table_name = (prop.mapping.source_table or "").strip().upper()
             if table_name and table_name not in source_tables:
                 source_tables.append(table_name)
+
+        if explicit_sql:
+            # 全域映射任务会生成实体级 node_sql 以表达多表 Join、过滤或
+            # 复杂计算。但普通单表节点应以已确认的属性映射为准，避免早期
+            # LLM 为 LOB 字段写入 CAST(NULL ...) 后覆盖后续人工确认映射。
+            if len(source_tables) == 1 and self._is_plain_single_source_node_sql(explicit_sql, source_tables[0]):
+                return self._build_property_mapping_source_query(entity, mapped_properties, source_tables[0])
+            return self._reconcile_explicit_entity_sql(entity, explicit_sql)
+
+        if not mapped_properties:
+            raise ValueError(f"实体 {entity.entity_display_name or entity.entity_name} 缺少已确认的源数据映射，无法生成来源于源表的数据DDL")
         if len(source_tables) != 1:
             raise ValueError(
                 f"实体 {entity.entity_display_name or entity.entity_name} 使用了多个源表映射，请先在数据映射中维护 entity_mapping.view_sql，再生成DDL"
             )
+
+        return self._build_property_mapping_source_query(entity, mapped_properties, source_tables[0])
+
+    def _build_property_mapping_source_query(
+        self,
+        entity: SysOntologyEntity,
+        mapped_properties: List[SysOntologyProperty],
+        source_table: str,
+    ) -> str:
+        """Build a standard single-source node query from property mappings."""
+        mapped_property_ids = {prop.property_id for prop in mapped_properties}
 
         alias = "src"
         select_columns: List[str] = []
         for prop in (entity.properties or []):
             prop_name = (prop.property_name or "").strip().upper()
             mapping = getattr(prop, "mapping", None)
-            if mapping:
+            if mapping and prop.property_id in mapped_property_ids:
                 mapping_type = (mapping.mapping_type or "").strip().upper()
                 if mapping_type == "DIRECT" and (mapping.source_column or "").strip():
                     select_columns.append(f"    {alias}.{mapping.source_column.strip().upper()} AS {prop_name}")
@@ -1096,9 +1108,55 @@ SELECT
 
         return "SELECT\n{cols}\nFROM {table_name} {alias}".format(
             cols=",\n".join(select_columns),
-            table_name=source_tables[0],
+            table_name=source_table,
             alias=alias,
         )
+
+    def _is_plain_single_source_node_sql(self, sql: str, source_table: str) -> bool:
+        """Return whether node SQL is a simple projection that mappings can rebuild safely."""
+        normalized = " ".join((sql or "").upper().split())
+        if not normalized.startswith("SELECT "):
+            return False
+        if any(token in normalized for token in (" JOIN ", " WHERE ", " GROUP BY ", " HAVING ", " UNION ", " CONNECT BY ", " MODEL ")):
+            return False
+        return bool(re.search(rf"\bFROM\s+{re.escape(source_table.upper())}(?:\s+[A-Z][A-Z0-9_$#]*)?\s*$", normalized))
+
+    def _reconcile_explicit_entity_sql(self, entity: SysOntologyEntity, explicit_sql: str) -> str:
+        """Fill stale CAST(NULL ...) projection placeholders from confirmed mappings."""
+        sql = re.sub(
+            r"(?i)CAST\(\s*NULL\s+AS\s+VARCHAR2\s*\)",
+            "CAST(NULL AS VARCHAR2(500))",
+            explicit_sql.rstrip(";"),
+        )
+        for prop in entity.properties or []:
+            mapping = getattr(prop, "mapping", None)
+            if not mapping:
+                continue
+            mapping_type = (mapping.mapping_type or "").strip().upper()
+            property_name = (prop.property_name or "").strip().upper()
+            if not property_name:
+                continue
+            expression = ""
+            if mapping_type == "DIRECT" and (mapping.source_table or "").strip() and (mapping.source_column or "").strip():
+                table_name = mapping.source_table.strip().upper()
+                alias_match = re.search(
+                    rf"(?i)\bFROM\s+{re.escape(table_name)}\s+(?:AS\s+)?([A-Z][A-Z0-9_$#]*)\b",
+                    sql,
+                )
+                qualifier = alias_match.group(1) if alias_match else table_name
+                expression = f"{qualifier}.{mapping.source_column.strip().upper()}"
+            elif mapping_type == "COMPUTED" and (mapping.formula_expr or "").strip():
+                expression = mapping.formula_expr.strip()
+            if not expression:
+                continue
+            # Match a complete CAST(NULL AS <type>) AS <property> select item.
+            # The expression deliberately supports Oracle types with length or
+            # precision, including CLOB/BLOB and VARCHAR2(500).
+            placeholder = re.compile(
+                rf"(?is)CAST\s*\(\s*NULL\s+AS\s+[A-Z][A-Z0-9_]*(?:\s*\([^)]*\))?\s*\)\s+AS\s+{re.escape(property_name)}\b"
+            )
+            sql = placeholder.sub(f"{expression} AS {property_name}", sql)
+        return sql
 
     def _resolve_relation_storage_name(self, relation: SysOntologyRelation) -> str:
         if relation.relation_table_name:

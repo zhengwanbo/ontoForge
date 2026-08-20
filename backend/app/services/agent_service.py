@@ -180,14 +180,18 @@ class AgentService:
         self.db.delete(skill)
         self.db.commit()
 
-    def list_managed_skills(self) -> List[Dict[str, Any]]:
-        rows = self.db.query(SysManagedAgentSkill).order_by(
+    def list_managed_skills(self, domain_id: str) -> List[Dict[str, Any]]:
+        rows = self.db.query(SysManagedAgentSkill).filter(
+            SysManagedAgentSkill.domain_id == domain_id,
+        ).order_by(
             SysManagedAgentSkill.updated_at.desc(),
             SysManagedAgentSkill.created_at.desc(),
         ).all()
         return [self._serialize_managed_skill(item) for item in rows]
 
-    def upload_managed_skill(self, filename: str, content: bytes, uploaded_by: str) -> Dict[str, Any]:
+    def upload_managed_skill(self, domain_id: str, filename: str, content: bytes, uploaded_by: str) -> Dict[str, Any]:
+        if not self.db.query(SysDomain).filter(SysDomain.domain_id == domain_id, SysDomain.status == "ACTIVE").first():
+            raise ValueError("当前业务分析域不存在或未启用")
         if not filename.lower().endswith(".zip"):
             raise ValueError("仅支持上传 Agent Skill ZIP 文件")
         if not content or len(content) > 10 * 1024 * 1024:
@@ -216,6 +220,7 @@ class AgentService:
         metadata = self._extract_skill_metadata(skill_markdown, filename)
         record = SysManagedAgentSkill(
             managed_skill_id=generate_id("mskill"),
+            domain_id=domain_id,
             skill_name=metadata["skill_name"],
             skill_desc=metadata["skill_desc"],
             package_filename=self._safe_uploaded_filename(filename),
@@ -231,8 +236,11 @@ class AgentService:
         self.db.refresh(record)
         return self._serialize_managed_skill(record)
 
-    def delete_managed_skill(self, managed_skill_id: str):
-        record = self.db.query(SysManagedAgentSkill).filter(SysManagedAgentSkill.managed_skill_id == managed_skill_id).first()
+    def delete_managed_skill(self, managed_skill_id: str, domain_id: str):
+        record = self.db.query(SysManagedAgentSkill).filter(
+            SysManagedAgentSkill.managed_skill_id == managed_skill_id,
+            SysManagedAgentSkill.domain_id == domain_id,
+        ).first()
         if not record:
             raise ValueError("托管 Skill 不存在")
         self.db.query(SysManagedAgentSkillTestSession).filter(
@@ -260,6 +268,7 @@ class AgentService:
         """Use an uploaded Skill package with sampled, read-only source data for an agent test."""
         managed_skill = self.db.query(SysManagedAgentSkill).filter(
             SysManagedAgentSkill.managed_skill_id == managed_skill_id,
+            SysManagedAgentSkill.domain_id == payload.get("domain_id"),
             SysManagedAgentSkill.status == "ACTIVE",
         ).first()
         if not managed_skill:
@@ -301,6 +310,8 @@ class AgentService:
         if not question:
             question = "请开始测试会话，说明你将如何依据已加载 Skill 对当前数据源进行分析，并等待我的问题。"
         source = self.db.query(SysDataSource).filter(SysDataSource.source_id == payload["source_id"]).first()
+        if not source or source.business_domain_id != managed_skill.domain_id:
+            raise ValueError("所选对象数据库不属于当前 Skill 的业务分析域")
         if not is_session_start and self._needs_question_clarification(question):
             return self._save_managed_skill_clarification(
                 session=existing_session,
@@ -1188,6 +1199,7 @@ Skill：
     def _serialize_managed_skill(skill: SysManagedAgentSkill) -> Dict[str, Any]:
         return {
             "managed_skill_id": skill.managed_skill_id,
+            "domain_id": skill.domain_id,
             "skill_name": skill.skill_name,
             "skill_desc": skill.skill_desc,
             "package_filename": skill.package_filename,

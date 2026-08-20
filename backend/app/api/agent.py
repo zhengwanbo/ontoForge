@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from sqlalchemy.orm import Session
@@ -56,21 +56,23 @@ async def list_agent_skills(
 
 @router.get("/managed-skills", response_model=ApiResponse)
 async def list_managed_agent_skills(
+    domain_id: str = Query(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    return ApiResponse(data=AgentService(db).list_managed_skills())
+    return ApiResponse(data=AgentService(db).list_managed_skills(domain_id))
 
 
 @router.post("/managed-skills/upload", response_model=ApiResponse)
 async def upload_managed_agent_skill(
+    domain_id: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     try:
         content = await file.read()
-        data = AgentService(db).upload_managed_skill(file.filename or "agent_skill.zip", content, current_user.get("username", "unknown"))
+        data = AgentService(db).upload_managed_skill(domain_id, file.filename or "agent_skill.zip", content, current_user.get("username", "unknown"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
@@ -81,11 +83,12 @@ async def upload_managed_agent_skill(
 @router.delete("/managed-skills/{managed_skill_id}", response_model=ApiResponse)
 async def delete_managed_agent_skill(
     managed_skill_id: str,
+    domain_id: str = Query(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     try:
-        AgentService(db).delete_managed_skill(managed_skill_id)
+        AgentService(db).delete_managed_skill(managed_skill_id, domain_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return ApiResponse(message="Agent Skill 已删除")

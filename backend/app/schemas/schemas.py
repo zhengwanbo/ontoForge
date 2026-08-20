@@ -403,6 +403,7 @@ class AgentSkillResponse(BaseModel):
 
 
 class AgentSkillTestRequest(BaseModel):
+    domain_id: str
     llm_config_id: str
     source_id: str
     schema: Optional[str] = None

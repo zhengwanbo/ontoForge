@@ -242,7 +242,7 @@
             <div class="flow-editor-hint">
               优先使用两种连线方式：
               1. 从节点右侧连接点直接拖到目标节点。
-              2. 先后点击两个节点，再点“连接已选节点”。
+              2. 先后点击两个节点，再点“连接已选节点”。流程较长时可用滚轮缩放或拖动画布空白处平移查看。
             </div>
           </div>
           <div class="flow-editor-summary-stats">
@@ -269,7 +269,9 @@
             <el-button size="small" type="primary" plain :disabled="flowSelectedNodeIds.length !== 2" @click="connectSelectedFlowNodes">
               连接已选节点
             </el-button>
+            <el-button size="small" type="primary" plain @click="autoLayoutFlow">⇣ 自动纵向布局</el-button>
             <el-button size="small" plain :disabled="flowSelectedNodeIds.length === 0" @click="clearFlowSelection">清空选中</el-button>
+            <el-button size="small" type="danger" plain :disabled="!flowConfigNode" @click="deleteSelectedFlowNode">删除当前节点</el-button>
             <el-button size="small" @click="saveFlowToServer" :loading="savingFlow">💾 保存流程图</el-button>
             <el-button size="small" type="warning" @click="resetFlowFromServer" :disabled="!currentFlow.process_json">↩ 重置画布</el-button>
             <el-button size="small" type="danger" @click="deleteFlowProcess">🗑 删除流程图</el-button>
@@ -285,7 +287,8 @@
             @mouseup="onFlowMouseUp"
             @mouseleave="onFlowMouseUp"
           >
-            <svg width="100%" height="100%" :viewBox="`0 0 ${flowCanvasSize.w} ${flowCanvasSize.h}`">
+            <div ref="flowX6Ref" class="flow-x6-canvas"></div>
+            <svg v-if="false" width="100%" height="100%" :viewBox="`0 0 ${flowCanvasSize.w} ${flowCanvasSize.h}`">
               <defs>
                 <marker id="flowArrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
                   <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
@@ -1228,6 +1231,8 @@ import { ref, reactive, onMounted, onBeforeUnmount, computed, watch, nextTick } 
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, UploadFilled } from '@element-plus/icons-vue'
+import { Graph } from '@antv/x6'
+import dagre from '@dagrejs/dagre'
 import { entityApi, propertyApi, relationApi, graphApi, processApi, sourceApi, systemApi, domainApi, mappingApi, businessTypeApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
@@ -1594,6 +1599,7 @@ const onNodeClick = async (node: any) => {
 
 // ========== Flow Editor vars ==========
 const flowCanvasRef = ref<HTMLElement | null>(null)
+const flowX6Ref = ref<HTMLElement | null>(null)
 const flowCanvasSize = reactive({ w: 1600, h: 800 })
 const currentFlow = reactive<Record<string, any>>({})
 const flowNodes = ref<any[]>([])
@@ -1605,6 +1611,7 @@ const flowConnecting = ref<any>(null)
 const flowSelectedNodeIds = ref<string[]>([])
 const flowNodeCounter = ref(0)
 const flowNodeSize = { width: 150, height: 60 }
+let flowX6Graph: Graph | null = null
 
 const flowNodeTypes = [
   { type: 'start', label: '开始', icon: '▶', color: '#e8f5e9', borderColor: '#4caf50', fill: '#4caf50', stroke: '#388e3c', textColor: '#fff', rx: 30, ry: 30 },
@@ -1618,6 +1625,58 @@ const flowNodeTypes = [
 const getFlowNodeShape = (type: string) => {
   const found = flowNodeTypes.find(nt => nt.type === type)
   return found || flowNodeTypes[2]
+}
+
+const renderFlowWithX6 = () => {
+  const container = flowX6Ref.value
+  if (!container) return
+  flowX6Graph?.dispose()
+  flowX6Graph = new Graph({
+    container,
+    width: container.clientWidth || 900,
+    height: container.clientHeight || 620,
+    background: { color: '#f8fbff' },
+    grid: { visible: true, type: 'dot', args: { color: '#dbeafe', thickness: 1 } },
+    panning: true,
+    mousewheel: { enabled: true, modifiers: [] },
+    connecting: { allowBlank: false, allowLoop: false, allowMulti: false, snap: true, connector: 'rounded', connectionPoint: 'anchor' }
+  })
+  flowNodes.value.forEach((node: any) => {
+    const shape = getFlowNodeShape(node.type)
+    flowX6Graph!.addNode({
+      id: node.id, x: node.position?.x || 0, y: node.position?.y || 0, width: flowNodeSize.width, height: flowNodeSize.height,
+      shape: node.type === 'decision' ? 'polygon' : 'rect',
+      attrs: {
+        body: { fill: shape.fill, stroke: flowConfigNode.value?.id === node.id ? '#1d4ed8' : shape.stroke, strokeWidth: flowConfigNode.value?.id === node.id ? 3 : 2, rx: shape.rx, ry: shape.ry, refPoints: node.type === 'decision' ? '0,10 10,0 20,10 10,20' : undefined },
+        label: { text: `${shape.icon} ${node.label}\n${node.typeName || shape.label}`, fill: shape.textColor, fontSize: 12, fontWeight: 600, textWrap: { width: -18, height: -12, ellipsis: true } }
+      },
+      ports: { groups: { in: { position: 'top', attrs: { circle: { r: 5, magnet: true, stroke: '#60a5fa', strokeWidth: 2, fill: '#fff' } } }, out: { position: 'bottom', attrs: { circle: { r: 5, magnet: true, stroke: '#2563eb', strokeWidth: 2, fill: '#fff' } } } }, items: [{ id: 'in', group: 'in' }, { id: 'out', group: 'out' }] }
+    })
+  })
+  flowEdges.value.forEach((edge: any) => flowX6Graph!.addEdge({ source: { cell: edge.source, port: 'out' }, target: { cell: edge.target, port: 'in' }, attrs: { line: { stroke: '#64748b', strokeWidth: 2, targetMarker: { name: 'block', width: 8, height: 6 } } }, connector: { name: 'rounded' } }))
+  flowX6Graph.on('node:click', ({ node }: any) => { const current = flowNodes.value.find(item => item.id === node.id); if (current) selectFlowNode(current); renderFlowWithX6() })
+  flowX6Graph.on('node:moved', ({ node }: any) => { const current = flowNodes.value.find(item => item.id === node.id); if (current) current.position = node.position() })
+  flowX6Graph.on('edge:connected', ({ edge }: any) => {
+    const source = edge.getSourceCellId(); const target = edge.getTargetCellId()
+    if (source && target && createFlowEdge(source, target, false)) autoLayoutFlow()
+  })
+  // 保证纵向流程较长时，底部节点不会被固定高度画布裁切。
+  flowX6Graph.zoomToFit({ padding: 28, maxScale: 1 })
+}
+
+const autoLayoutFlow = () => {
+  if (!flowNodes.value.length) return
+  const layoutGraph = new dagre.graphlib.Graph()
+  layoutGraph.setGraph({ rankdir: 'TB', ranksep: 92, nodesep: 48, marginx: 56, marginy: 42 })
+  layoutGraph.setDefaultEdgeLabel(() => ({}))
+  flowNodes.value.forEach(node => layoutGraph.setNode(node.id, { width: flowNodeSize.width, height: flowNodeSize.height }))
+  flowEdges.value.forEach(edge => layoutGraph.setEdge(edge.source, edge.target))
+  dagre.layout(layoutGraph)
+  flowNodes.value.forEach(node => {
+    const positioned = layoutGraph.node(node.id)
+    if (positioned) node.position = { x: Math.max(24, positioned.x - flowNodeSize.width / 2), y: Math.max(24, positioned.y - flowNodeSize.height / 2) }
+  })
+  nextTick(renderFlowWithX6)
 }
 
 // Node ID generator
@@ -1800,6 +1859,7 @@ const createFlowEdge = (sourceId: string, targetId: string, showMessage = true) 
     return false
   }
   flowEdges.value.push({ source: sourceId, target: targetId })
+  autoLayoutFlow()
   if (showMessage) ElMessage.success('流程边已创建')
   return true
 }
@@ -1851,6 +1911,7 @@ const onFlowCanvasDrop = (e: DragEvent) => {
   flowNodes.value.push(newNode)
   flowConfigNode.value = newNode
   appendFlowSelection(newNode.id)
+  autoLayoutFlow()
 }
 
 const startFlowConnection = (e: MouseEvent, node: any) => {
@@ -1878,6 +1939,12 @@ const deleteFlowNode = (idx: number) => {
   flowNodes.value.splice(idx, 1)
   flowSelectedNodeIds.value = flowSelectedNodeIds.value.filter(id => id !== nodeId)
   if (flowConfigNode.value?.id === nodeId) flowConfigNode.value = null
+}
+
+const deleteSelectedFlowNode = () => {
+  const nodeId = flowConfigNode.value?.id
+  const index = flowNodes.value.findIndex(node => node.id === nodeId)
+  if (index >= 0) { deleteFlowNode(index); autoLayoutFlow() }
 }
 
 const connectSelectedFlowNodes = () => {
@@ -2902,6 +2969,7 @@ const openFlowEditor = (proc: any) => {
   flowDragging.value = null
   nextTick(() => {
     syncFlowCanvasSize()
+    autoLayoutFlow()
   })
 }
 
@@ -2913,6 +2981,8 @@ const closeFlowEditor = () => {
   clearFlowSelection()
   flowConnecting.value = null
   flowDragging.value = null
+  flowX6Graph?.dispose()
+  flowX6Graph = null
 }
 
 const saveFlowToServer = async () => {
@@ -2944,6 +3014,7 @@ const resetFlowFromServer = async () => {
       flowEdges.value = normalized.edges
       clearFlowSelection()
       flowConfigNode.value = null
+      autoLayoutFlow()
       ElMessage.success('已重置为服务器版本')
     } catch { ElMessage.error('解析失败') }
   }
@@ -3069,13 +3140,14 @@ const entityForm = ref(createEmptyEntityForm())
 const relationForm = ref(createEmptyRelationForm())
 const propertyForm = ref(createEmptyPropertyForm())
 const processForm = ref({ process_name: '', process_desc: '' })
+const handleFlowResize = () => { syncFlowCanvasSize(); flowX6Graph?.resize(flowX6Ref.value?.clientWidth || 1, flowX6Ref.value?.clientHeight || 1) }
 
 onMounted(() => {
   if (currentDomainId.value) {
     loadCurrentDomainDetail()
     loadActiveSectionData()
   }
-  window.addEventListener('resize', syncFlowCanvasSize)
+  window.addEventListener('resize', handleFlowResize)
 })
 
 watch(() => appStore.currentDomainId, async (domainId) => {
@@ -3100,7 +3172,9 @@ watch(() => currentFlow.process_id, async (processId) => {
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', syncFlowCanvasSize)
+  window.removeEventListener('resize', handleFlowResize)
+  flowX6Graph?.dispose()
+  flowX6Graph = null
 })
 </script>
 
@@ -3111,7 +3185,8 @@ onBeforeUnmount(() => {
 .tab-section { display: flex; align-items: center; gap: 10px; }
 .toolbar { display: flex; gap: 8px; padding: 8px 0; align-items: center; flex-shrink: 0; }
 .drag-hint { font-size: 12px; color: #999; margin-left: 8px; }
-.graph-container, .flow-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.graph-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.flow-container { flex: 1; display: flex; flex-direction: column; overflow: auto; }
 .graph-layout { flex: 1; display: flex; gap: 10px; min-height: 0; overflow: hidden; }
 .graph-area { flex: 1; min-height: 0; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; overflow: auto; }
 .svg-graph { width: max-content; min-height: 100%; }
@@ -3228,7 +3303,7 @@ onBeforeUnmount(() => {
 
 /* Flow Editor */
 .flow-breadcrumb { display: flex; align-items: center; gap: 8px; margin-left: 12px; font-size: 13px; }
-.flow-editor { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.flow-editor { flex: 1; display: flex; flex-direction: column; min-height: 620px; }
 .flow-editor-summary { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 12px 14px; margin-bottom: 8px; background: #fff; border: 1px solid #e8eef5; border-radius: 8px; }
 .flow-editor-summary h4 { margin: 0 0 6px; font-size: 15px; color: #1a3a5c; }
 .flow-editor-summary p { margin: 0; font-size: 12px; color: #66788a; line-height: 1.6; }
@@ -3244,6 +3319,7 @@ onBeforeUnmount(() => {
 .flow-editor-actions { display: flex; gap: 6px; }
 .flow-selection-state { display: inline-flex; align-items: center; padding: 0 8px; font-size: 12px; color: #5f6b7a; background: #eef5ff; border: 1px solid #cfe0ff; border-radius: 999px; }
 .flow-canvas { flex: 1; background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; overflow: hidden; min-height: 400px; }
+.flow-x6-canvas { width: 100%; height: 100%; min-height: 400px; }
 .flow-node-group { cursor: grab; }
 .flow-node-group:active { cursor: grabbing; }
 .flow-handle, .flow-handle-label { cursor: crosshair; }

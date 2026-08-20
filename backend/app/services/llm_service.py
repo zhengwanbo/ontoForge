@@ -1746,7 +1746,7 @@ class LLMService:
 {json.dumps(self._make_json_safe(prompt_payload), ensure_ascii=False, indent=2)}
 
 要求：
-- 语义视图必须服务于后续缺陷分析、追溯、归因和属性图查询。
+- 语义视图必须服务于后续业务分析、数据溯源域追溯、根因分析和属性图查询。
 - 不要为 source_wrap 草案默认生成 SQL，除非你判断它已经是完整业务语义视图。
 - 如果像 ProcessStep、Measurement、Violation 这类对象需要由多个来源拼接，请直接输出完整 SQL。
 - edge_view 的 sql 必须返回 EDGE_ID、SOURCE_ID、TARGET_ID。

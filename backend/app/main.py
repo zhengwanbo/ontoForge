@@ -46,6 +46,22 @@ def ensure_agent_skill_columns():
 ensure_agent_skill_columns()
 
 
+def ensure_managed_agent_skill_columns():
+    inspector = inspect(engine)
+    try:
+        columns = {item["name"].lower() for item in inspector.get_columns("sys_managed_agent_skill")}
+    except Exception:
+        columns = set()
+    if not columns:
+        return
+    with engine.begin() as connection:
+        if "domain_id" not in columns:
+            connection.execute(text("ALTER TABLE sys_managed_agent_skill ADD domain_id VARCHAR2(50)"))
+
+
+ensure_managed_agent_skill_columns()
+
+
 def ensure_llm_config_columns():
     inspector = inspect(engine)
     try:

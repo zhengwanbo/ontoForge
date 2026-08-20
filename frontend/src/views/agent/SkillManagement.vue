@@ -4,13 +4,16 @@
       <div>
         <div class="eyebrow">AGENT SKILL REGISTRY</div>
         <h2>技能管理</h2>
-        <p>上传和管理可被 Agent 使用的 Skill ZIP 包。每个包必须在根目录包含 <code>SKILL.md</code>。</p>
+        <p>上传和管理当前业务分析域可被 Agent 使用的 Skill ZIP 包。每个包必须在根目录包含 <code>SKILL.md</code>。</p>
       </div>
       <el-button :icon="Refresh" @click="loadSkills">刷新</el-button>
     </section>
 
+    <el-alert v-if="currentDomainId" :title="`当前业务分析域：${appStore.currentDomainName || currentDomainId}`" type="info" :closable="false" show-icon class="domain-alert" />
+    <el-alert v-else title="请先在左侧选择业务分析域，才能管理该分析域的 Agent Skill。" type="warning" :closable="false" show-icon class="domain-alert" />
+
     <el-card shadow="never" class="upload-card">
-      <el-upload drag accept=".zip,application/zip" :auto-upload="false" :show-file-list="false" :disabled="uploading" :on-change="handleFileChange">
+      <el-upload drag accept=".zip,application/zip" :auto-upload="false" :show-file-list="false" :disabled="uploading || !currentDomainId" :on-change="handleFileChange">
         <el-icon class="upload-icon"><UploadFilled /></el-icon>
         <div class="el-upload__text">将 Agent Skill ZIP 拖到这里，或 <em>点击选择文件</em></div>
         <template #tip><div class="el-upload__tip">支持最大 10MB 的 ZIP；必须包含根目录 <code>SKILL.md</code>，最多 30 个文件。</div></template>
@@ -34,19 +37,23 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { agentApi } from '../../api'
+import { useAppStore } from '../../stores/app'
 
+const appStore = useAppStore()
+const currentDomainId = computed(() => appStore.currentDomainId || '')
 const skills = ref<any[]>([])
 const loading = ref(false)
 const uploading = ref(false)
 
 const loadSkills = async () => {
+  if (!currentDomainId.value) { skills.value = []; return }
   loading.value = true
   try {
-    const res = await agentApi.listManagedSkills()
+    const res = await agentApi.listManagedSkills(currentDomainId.value)
     skills.value = res.data || []
   } catch (_) {
     skills.value = []
@@ -55,13 +62,14 @@ const loadSkills = async () => {
   }
 }
 const handleFileChange = async (file: any) => {
+  if (!currentDomainId.value) { ElMessage.warning('请先选择当前业务分析域'); return }
   const raw = file.raw as File | undefined
   if (!raw) return
   if (!raw.name.toLowerCase().endsWith('.zip')) { ElMessage.warning('请上传 ZIP 格式的 Agent Skill 包'); return }
   if (raw.size > 10 * 1024 * 1024) { ElMessage.warning('Skill ZIP 不能超过 10MB'); return }
   uploading.value = true
   try {
-    await agentApi.uploadManagedSkill(raw)
+    await agentApi.uploadManagedSkill(currentDomainId.value, raw)
     ElMessage.success('Agent Skill 已上传并完成 SKILL.md 校验')
     await loadSkills()
   } catch (_) {
@@ -77,7 +85,7 @@ const removeSkill = async (skill: any) => {
     return
   }
   try {
-    await agentApi.deleteManagedSkill(skill.managed_skill_id)
+    await agentApi.deleteManagedSkill(skill.managed_skill_id, currentDomainId.value)
     ElMessage.success('Agent Skill 已删除')
     await loadSkills()
   } catch (_) {}
@@ -85,9 +93,10 @@ const removeSkill = async (skill: any) => {
 const formatSize = (value: number) => value >= 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(2)} MB` : `${Math.max(0, Math.round(value / 1024))} KB`
 const formatDate = (value: string) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '-'
 
+watch(currentDomainId, loadSkills)
 onMounted(loadSkills)
 </script>
 
 <style scoped>
-.skill-management-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.page-header code, .el-upload__tip code { color: #2563eb; }.upload-card, .list-card { border-color: #e4eaf2; }.upload-card { margin-bottom: 16px; }.upload-icon { margin-bottom: 10px; color: #2563eb; font-size: 42px; }.card-header { display: flex; align-items: center; justify-content: space-between; } @media (max-width: 760px) { .page-header { align-items: flex-start; flex-direction: column; } }
+.skill-management-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.page-header code, .el-upload__tip code { color: #2563eb; }.domain-alert { margin-bottom: 16px; }.upload-card, .list-card { border-color: #e4eaf2; }.upload-card { margin-bottom: 16px; }.upload-icon { margin-bottom: 10px; color: #2563eb; font-size: 42px; }.card-header { display: flex; align-items: center; justify-content: space-between; } @media (max-width: 760px) { .page-header { align-items: flex-start; flex-direction: column; } }
 </style>

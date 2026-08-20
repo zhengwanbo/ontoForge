@@ -72,6 +72,8 @@ export const sourceApi = {
     tableName: string,
     data: { schema?: string; table_comment?: string | null; column_comments: Array<{ column_name: string; comments: string }> }
   ) => api.post(`/source/datasources/${sourceId}/tables/${encodeURIComponent(tableName)}/annotation/save`, data),
+  getGraphQueryRecommendations: (domainId: string, sourceId: string, params?: { schema?: string; graph_name?: string }) =>
+    api.get('/source/graph-query/recommendations', { params: { domain_id: domainId, source_id: sourceId, ...params } }),
   executeGraphQuery: (data: { domain_id: string; source_id: string; schema?: string; graph_sql: string; row_limit: number }) =>
     api.post('/source/graph-query', data, { timeout: 120000 }),
 }
@@ -228,13 +230,14 @@ export const browseApi = {
 // ====== Agent Skill API ======
 export const agentApi = {
   listSkills: (domainId?: string) => api.get('/agent/skills', { params: { domain_id: domainId } }),
-  listManagedSkills: () => api.get('/agent/managed-skills'),
-  uploadManagedSkill: (file: File) => {
+  listManagedSkills: (domainId: string) => api.get('/agent/managed-skills', { params: { domain_id: domainId } }),
+  uploadManagedSkill: (domainId: string, file: File) => {
     const formData = new FormData()
+    formData.append('domain_id', domainId)
     formData.append('file', file)
     return api.post('/agent/managed-skills/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
   },
-  deleteManagedSkill: (managedSkillId: string) => api.delete(`/agent/managed-skills/${managedSkillId}`),
+  deleteManagedSkill: (managedSkillId: string, domainId: string) => api.delete(`/agent/managed-skills/${managedSkillId}`, { params: { domain_id: domainId } }),
   listManagedSkillTestSessions: () => api.get('/agent/managed-skill-test-sessions'),
   getManagedSkillTestSession: (sessionId: string) => api.get(`/agent/managed-skill-test-sessions/${sessionId}`),
   testManagedSkill: (managedSkillId: string, data: any) => api.post(`/agent/managed-skills/${managedSkillId}/test`, data),

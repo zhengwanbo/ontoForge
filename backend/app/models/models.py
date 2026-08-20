@@ -211,6 +211,7 @@ class SysManagedAgentSkill(Base):
     __tablename__ = "sys_managed_agent_skill"
 
     managed_skill_id = Column(String(50), primary_key=True, default=lambda: generate_id("mskill"))
+    domain_id = Column(String(50), ForeignKey("sys_domain.domain_id"), nullable=True)
     skill_name = Column(String(200), nullable=False)
     skill_desc = Column(String(2000))
     package_filename = Column(String(255), nullable=False)

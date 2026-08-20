@@ -256,7 +256,7 @@ const loadDomainResources = async () => {
   }
   try {
     const [skillRes, sourceRes] = await Promise.all([
-      agentApi.listManagedSkills(),
+      agentApi.listManagedSkills(currentDomainId.value),
       sourceApi.listDataSources(currentDomainId.value)
     ])
     managedSkills.value = (skillRes.data || []).filter((item: any) => item.status === 'ACTIVE')
@@ -361,6 +361,7 @@ const sendMessage = async () => {
   }
   try {
     const res = await agentApi.testManagedSkill(form.value.managed_skill_id, {
+      domain_id: currentDomainId.value,
       llm_config_id: form.value.llm_config_id,
       source_id: form.value.source_id,
       schema: form.value.schema || null,

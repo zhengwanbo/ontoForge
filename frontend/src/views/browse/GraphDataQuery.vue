@@ -8,11 +8,20 @@
       <div class="query-form">
         <el-select v-model="domainId" placeholder="选择业务分析域" @change="handleDomainChange"><el-option v-for="domain in domains" :key="domain.domain_id" :label="domain.domain_name" :value="domain.domain_id" /></el-select>
         <el-select v-model="sourceId" placeholder="选择目标 Oracle 数据库" filterable :disabled="!domainId" @change="handleSourceChange"><el-option v-for="source in sources" :key="source.source_id" :label="`${source.source_name} / ${source.schema_name || source.username}`" :value="source.source_id" /></el-select>
-        <el-select v-model="schema" placeholder="Schema（可选）" filterable :disabled="!sourceId"><el-option v-for="item in schemas" :key="item" :label="item" :value="item" /></el-select>
+        <el-select v-model="schema" placeholder="Schema（可选）" filterable :disabled="!sourceId" @change="loadGraphRecommendations"><el-option v-for="item in schemas" :key="item" :label="item" :value="item" /></el-select>
+        <el-select v-model="graphName" placeholder="选择 Oracle 属性图" filterable :disabled="!sourceId || !graphOptions.length" @change="loadGraphRecommendations"><el-option v-for="item in graphOptions" :key="item.graph_name" :label="item.graph_name" :value="item.graph_name" /></el-select>
         <el-input-number v-model="rowLimit" :min="1" :max="1000" controls-position="right" />
         <el-button type="primary" :loading="executing" :disabled="!canExecute" @click="executeQuery">执行 Graph SQL</el-button>
       </div>
       <div class="form-hint">只允许包含 <code>GRAPH_TABLE</code> 的只读 <code>SELECT / WITH</code> 查询；结果列建议命名为 <code>SOURCE_ID</code>、<code>TARGET_ID</code>、<code>RELATION_NAME</code>。</div>
+      <div v-if="recommendations.length" class="recommendation-area">
+        <div class="recommendation-heading"><span>常用业务图查询</span><el-tag size="small" effect="plain">{{ graphName || '当前属性图' }}</el-tag></div>
+        <div class="recommendation-list">
+          <button v-for="item in recommendations" :key="item.id" type="button" class="recommendation-item" :class="{ selected: selectedRecommendationId === item.id }" @click="selectRecommendation(item)">
+            <strong>{{ item.title }}</strong><span>{{ item.description }}</span>
+          </button>
+        </div>
+      </div>
       <el-input v-model="graphSql" type="textarea" :rows="10" resize="vertical" class="sql-editor" />
     </el-card>
 
@@ -51,6 +60,10 @@ const appStore = useAppStore()
 const domainId = ref(appStore.currentDomainId || '')
 const sourceId = ref('')
 const schema = ref('')
+const graphName = ref('')
+const graphOptions = ref<any[]>([])
+const recommendations = ref<any[]>([])
+const selectedRecommendationId = ref('')
 const rowLimit = ref(200)
 const domains = ref<any[]>([])
 const sources = ref<any[]>([])
@@ -141,9 +154,20 @@ const renderGraph = async () => {
 const resizeGraph = () => graphChart?.resize()
 const loadDomains = async () => { try { const res = await domainApi.list('ACTIVE'); domains.value = res.data || [] } catch (_) {} }
 const loadSources = async () => { if (!domainId.value) return; try { const res = await sourceApi.listDataSources(domainId.value); sources.value = (res.data || []).filter((item: any) => (item.db_type || '').toLowerCase() === 'oracle'); sourceId.value = sources.value.find((item: any) => item.is_default === 'Y')?.source_id || sources.value[0]?.source_id || ''; await loadSchemas() } catch (_) { sources.value = [] } }
-const loadSchemas = async () => { if (!sourceId.value) { schemas.value = []; return }; try { const res = await sourceApi.getSchemas(sourceId.value); schemas.value = res.data?.schemas || []; schema.value = res.data?.default_schema || schemas.value[0] || '' } catch (_) { schemas.value = [] } }
-const handleDomainChange = async () => { const domain = domains.value.find(item => item.domain_id === domainId.value); appStore.setCurrentDomain(domainId.value, domain?.domain_name || ''); result.value = null; sourceId.value = ''; schema.value = ''; await loadSources() }
-const handleSourceChange = async () => { result.value = null; await loadSchemas() }
+const selectRecommendation = (item: any, clearResult = true) => { graphSql.value = item.sql || ''; selectedRecommendationId.value = item.id || ''; if (item.graph_name) graphName.value = item.graph_name; if (clearResult) result.value = null }
+const loadGraphRecommendations = async () => {
+  if (!domainId.value || !sourceId.value) { graphOptions.value = []; recommendations.value = []; graphName.value = ''; return }
+  try {
+    const res: any = await sourceApi.getGraphQueryRecommendations(domainId.value, sourceId.value, { schema: schema.value || undefined, graph_name: graphName.value || undefined })
+    graphOptions.value = res.data?.graphs || []
+    graphName.value = res.data?.graph_name || ''
+    recommendations.value = res.data?.recommendations || []
+    if (recommendations.value.length) selectRecommendation(recommendations.value[0], false)
+  } catch (_) { graphOptions.value = []; recommendations.value = []; graphName.value = '' }
+}
+const loadSchemas = async () => { if (!sourceId.value) { schemas.value = []; await loadGraphRecommendations(); return }; try { const res = await sourceApi.getSchemas(sourceId.value); schemas.value = res.data?.schemas || []; schema.value = res.data?.default_schema || schemas.value[0] || '' } catch (_) { schemas.value = [] } finally { await loadGraphRecommendations() } }
+const handleDomainChange = async () => { const domain = domains.value.find(item => item.domain_id === domainId.value); appStore.setCurrentDomain(domainId.value, domain?.domain_name || ''); result.value = null; sourceId.value = ''; schema.value = ''; graphName.value = ''; await loadSources() }
+const handleSourceChange = async () => { result.value = null; graphName.value = ''; await loadSchemas() }
 const executeQuery = async () => { if (!canExecute.value) return; executing.value = true; try { const res = await sourceApi.executeGraphQuery({ domain_id: domainId.value, source_id: sourceId.value, schema: schema.value || undefined, graph_sql: graphSql.value, row_limit: rowLimit.value }); selectedQueryNode.value = null; result.value = res.data; void renderGraph(); ElMessage.success(`查询完成，返回 ${res.data?.rows?.length || 0} 行`) } catch (_) {} finally { executing.value = false } }
 watch(() => appStore.currentDomainId, async (currentDomainId) => {
   if (currentDomainId === domainId.value) return
@@ -151,6 +175,7 @@ watch(() => appStore.currentDomainId, async (currentDomainId) => {
   result.value = null
   sourceId.value = ''
   schema.value = ''
+  graphName.value = ''
   await loadSources()
 })
 watch(result, value => { if (!value) { selectedQueryNode.value = null; graphChart?.dispose(); graphChart = null } })
@@ -159,5 +184,5 @@ onBeforeUnmount(() => { window.removeEventListener('resize', resizeGraph); graph
 </script>
 
 <style scoped>
-.graph-query-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.query-card, .graph-result-card, .table-result-card { border-color: #e4eaf2; }.query-form { display: grid; grid-template-columns: 1.2fr 1.3fr 1fr 105px auto; gap: 10px; }.form-hint { margin: 10px 0; color: #64748b; font-size: 12px; }.form-hint code { color: #2563eb; }.sql-editor :deep(textarea) { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; }.result-alert { margin: 16px 0; }.result-layout { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; }.card-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.result-meta { color: #64748b; font-size: 12px; }.graph-canvas { height: 590px; overflow: hidden; background: radial-gradient(circle at 1px 1px, #d6e0eb 1px, transparent 1.2px); background-size: 22px 22px; }.node-detail, .node-detail-placeholder { margin: 12px 14px 14px; padding: 12px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }.node-detail-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: #0f172a; font-size: 13px; }.node-detail-dot { width: 10px; height: 10px; border-radius: 50%; }.node-detail-properties { background: #fff; }.node-detail-placeholder { color: #64748b; font-size: 12px; }.table-result-card { min-width: 0; } @media (max-width: 1200px) { .query-form, .result-layout { grid-template-columns: 1fr; }.graph-canvas { height: 460px; } }
+.graph-query-page { min-height: calc(100vh - 86px); padding: 8px 0 20px; }.page-header { margin: 8px 0 16px; }.eyebrow { color: #2563eb; font-size: 11px; font-weight: 800; letter-spacing: .14em; }.page-header h2 { margin: 4px 0; color: #0f172a; font-size: 25px; }.page-header p { margin: 0; color: #64748b; font-size: 13px; }.query-card, .graph-result-card, .table-result-card { border-color: #e4eaf2; }.query-form { display: grid; grid-template-columns: 1.1fr 1.25fr 1fr 1fr 105px auto; gap: 10px; }.form-hint { margin: 10px 0; color: #64748b; font-size: 12px; }.form-hint code { color: #2563eb; }.recommendation-area { margin: 14px 0; padding: 12px; border: 1px solid #dbeafe; border-radius: 10px; background: #f8fbff; }.recommendation-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; color: #1e3a5f; font-size: 13px; font-weight: 700; }.recommendation-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.recommendation-item { min-height: 68px; padding: 9px 10px; text-align: left; border: 1px solid #dbe4f0; border-radius: 8px; color: #334155; background: #fff; cursor: pointer; }.recommendation-item:hover, .recommendation-item.selected { border-color: #3b82f6; background: #eff6ff; }.recommendation-item strong, .recommendation-item span { display: block; }.recommendation-item strong { margin-bottom: 4px; color: #1e3a5f; font-size: 12px; }.recommendation-item span { color: #64748b; font-size: 11px; line-height: 1.4; }.sql-editor :deep(textarea) { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; }.result-alert { margin: 16px 0; }.result-layout { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; }.card-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }.result-meta { color: #64748b; font-size: 12px; }.graph-canvas { height: 590px; overflow: hidden; background: radial-gradient(circle at 1px 1px, #d6e0eb 1px, transparent 1.2px); background-size: 22px 22px; }.node-detail, .node-detail-placeholder { margin: 12px 14px 14px; padding: 12px; border: 1px solid #e2e8f0; border-radius: 10px; background: #f8fafc; }.node-detail-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: #0f172a; font-size: 13px; }.node-detail-dot { width: 10px; height: 10px; border-radius: 50%; }.node-detail-properties { background: #fff; }.node-detail-placeholder { color: #64748b; font-size: 12px; }.table-result-card { min-width: 0; } @media (max-width: 1200px) { .query-form, .result-layout, .recommendation-list { grid-template-columns: 1fr; }.graph-canvas { height: 460px; } }
 </style>

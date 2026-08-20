@@ -150,6 +150,51 @@ def _drop_generated_objects(db: Session, object_names: Dict[str, Set[str]]) -> D
     }
 
 
+def _delete_entity_dependencies(db: Session, entity_ids: List[str]) -> int:
+    """Delete ontology children in database foreign-key order.
+
+    Oracle does not infer SQLAlchemy's delete-orphan ordering for every legacy
+    relationship. In particular, SYS_PROPERTY_MAPPING references
+    SYS_ONTOLOGY_PROPERTY without a database cascade. Explicit bulk deletes
+    make both one-entity deletion and domain-wide clearing deterministic.
+    """
+    entity_ids = [entity_id for entity_id in entity_ids if entity_id]
+    if not entity_ids:
+        return 0
+
+    relation_ids = [item[0] for item in db.query(SysOntologyRelation.relation_id).filter(
+        or_(
+            SysOntologyRelation.source_entity_id.in_(entity_ids),
+            SysOntologyRelation.target_entity_id.in_(entity_ids),
+        )
+    ).all()]
+    property_ids = [item[0] for item in db.query(SysOntologyProperty.property_id).filter(
+        SysOntologyProperty.entity_id.in_(entity_ids),
+    ).all()]
+
+    if relation_ids:
+        db.query(SysRelationMapping).filter(
+            SysRelationMapping.relation_id.in_(relation_ids),
+        ).delete(synchronize_session=False)
+    if property_ids:
+        db.query(SysPropertyMapping).filter(
+            SysPropertyMapping.property_id.in_(property_ids),
+        ).delete(synchronize_session=False)
+    db.query(SysEntityMapping).filter(
+        SysEntityMapping.entity_id.in_(entity_ids),
+    ).delete(synchronize_session=False)
+    if relation_ids:
+        db.query(SysOntologyRelation).filter(
+            SysOntologyRelation.relation_id.in_(relation_ids),
+        ).delete(synchronize_session=False)
+    if property_ids:
+        db.query(SysOntologyProperty).filter(
+            SysOntologyProperty.property_id.in_(property_ids),
+        ).delete(synchronize_session=False)
+    db.flush()
+    return len(relation_ids)
+
+
 # ====== 实体管理 ======
 
 @router.get("/domains/{domain_id}/entities", response_model=ApiResponse)
@@ -311,19 +356,10 @@ async def delete_entity(
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
 
-    # 关系的源/目标实体外键未配置数据库级联删除。先逐条删除关联关系，
-    # 以便 ORM 同时清理关系映射，避免残留边或外键约束阻止实体删除。
-    related_relations = db.query(SysOntologyRelation).filter(
-        or_(
-            SysOntologyRelation.source_entity_id == entity_id,
-            SysOntologyRelation.target_entity_id == entity_id,
-        )
-    ).all()
-    deleted_relation_count = len(related_relations)
-    for relation in related_relations:
-        db.delete(relation)
-
-    db.delete(entity)
+    deleted_relation_count = _delete_entity_dependencies(db, [entity_id])
+    db.query(SysOntologyEntity).filter(
+        SysOntologyEntity.entity_id == entity_id,
+    ).delete(synchronize_session=False)
     db.commit()
     return ApiResponse(
         message="实体及关联关系已删除",
@@ -584,7 +620,12 @@ async def delete_relation(
     relation = db.query(SysOntologyRelation).filter(SysOntologyRelation.relation_id == relation_id).first()
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
-    db.delete(relation)
+    db.query(SysRelationMapping).filter(
+        SysRelationMapping.relation_id == relation_id,
+    ).delete(synchronize_session=False)
+    db.query(SysOntologyRelation).filter(
+        SysOntologyRelation.relation_id == relation_id,
+    ).delete(synchronize_session=False)
     db.commit()
     return ApiResponse(message="关系已删除")
 
@@ -662,20 +703,19 @@ async def clear_domain_ontology_data(
     )
     drop_result = _drop_generated_objects(db, generated_objects)
 
-    for relation in relations:
-        db.delete(relation)
-
-    for entity in entities:
-        db.delete(entity)
-
-    for blueprint in blueprints:
-        db.delete(blueprint)
-
-    for task in mapping_tasks:
-        db.delete(task)
-
-    for ddl_log in ddl_logs:
-        db.delete(ddl_log)
+    _delete_entity_dependencies(db, [entity.entity_id for entity in entities])
+    db.query(SysOntologyEntity).filter(
+        SysOntologyEntity.domain_id == domain_id,
+    ).delete(synchronize_session=False)
+    db.query(SysOntologyBlueprint).filter(
+        SysOntologyBlueprint.domain_id == domain_id,
+    ).delete(synchronize_session=False)
+    db.query(SysMappingTask).filter(
+        SysMappingTask.domain_id == domain_id,
+    ).delete(synchronize_session=False)
+    db.query(SysDDLLog).filter(
+        SysDDLLog.domain_id == domain_id,
+    ).delete(synchronize_session=False)
 
     db.commit()
     return ApiResponse(
