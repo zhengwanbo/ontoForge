@@ -449,6 +449,24 @@ class BusinessRuleUpdate(BusinessRuleCreate):
     pass
 
 
+class MetricDefinitionCreate(BaseModel):
+    entity_id: str
+    metric_code: str
+    metric_name: str
+    metric_category: str = "BUSINESS"
+    metric_desc: Optional[str] = None
+    calculation_expr: Optional[str] = None
+    aggregation_method: Optional[str] = None
+    calculation_period: Optional[str] = None
+    unit: Optional[str] = None
+    threshold_config: Optional[str] = None
+    status: str = "ACTIVE"
+
+
+class MetricDefinitionUpdate(MetricDefinitionCreate):
+    pass
+
+
 # ====== LLM配置 ======
 class LLMConfigCreate(BaseModel):
     config_name: str

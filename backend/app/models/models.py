@@ -285,6 +285,28 @@ class SysBusinessRule(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class SysMetricDefinition(Base):
+    """Business metric semantics defined against an ontology entity."""
+    __tablename__ = "sys_metric_definition"
+
+    metric_id = Column(String(50), primary_key=True, default=lambda: generate_id("metric"))
+    domain_id = Column(String(50), ForeignKey("sys_domain.domain_id"), nullable=False)
+    entity_id = Column(String(50), ForeignKey("sys_ontology_entity.entity_id"), nullable=False)
+    metric_code = Column(String(100), nullable=False)
+    metric_name = Column(String(200), nullable=False)
+    metric_category = Column(String(50), default="BUSINESS")
+    metric_desc = Column(String(2000))
+    calculation_expr = Column(Text)
+    aggregation_method = Column(String(50))  # COUNT / SUM / AVG / RATIO / CUSTOM
+    calculation_period = Column(String(100))
+    unit = Column(String(50))
+    threshold_config = Column(Text)  # JSON: target / warning / critical
+    status = Column(String(20), default="ACTIVE")
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SysLLMConfig(Base):
     __tablename__ = "sys_llm_config"
 

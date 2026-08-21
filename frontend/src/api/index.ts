@@ -265,6 +265,10 @@ export const processApi = {
 // ====== Business Rules & Activities API ======
 export const businessRuleApi = {
   catalog: (domainId: string) => api.get(`/business-rules/domains/${domainId}/catalog`),
+  listMetrics: (domainId: string) => api.get(`/business-rules/domains/${domainId}/metrics`),
+  createMetric: (domainId: string, data: any) => api.post(`/business-rules/domains/${domainId}/metrics`, data),
+  updateMetric: (id: string, data: any) => api.put(`/business-rules/metrics/${id}`, data),
+  deleteMetric: (id: string) => api.delete(`/business-rules/metrics/${id}`),
   listActivities: (domainId: string) => api.get(`/business-rules/domains/${domainId}/activities`),
   createActivity: (domainId: string, data: any) => api.post(`/business-rules/domains/${domainId}/activities`, data),
   updateActivity: (id: string, data: any) => api.put(`/business-rules/activities/${id}`, data),
