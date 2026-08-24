@@ -789,6 +789,10 @@ async def generate_ontology_from_guide(
             schema=req.schema,
             table_source_mode=req.table_source_mode,
             generation_strategy=req.generation_strategy,
+            generation_mode=req.generation_mode,
+            base_blueprint_id=req.base_blueprint_id,
+            document_generation_phase=req.document_generation_phase,
+            design_blueprint_id=req.design_blueprint_id,
             business_scenario=req.business_scenario,
             semantic_type_code=req.semantic_type_code,
             relation_tables=req.relation_tables,
@@ -816,6 +820,40 @@ async def generate_ontology_from_guide(
     return ApiResponse(data=data)
 
 
+@router.get("/domains/{domain_id}/guide/blueprints", response_model=ApiResponse)
+async def list_ontology_guide_blueprints(
+    domain_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """List Guide versions that can be selected as a logical baseline."""
+    ensure_domain_access(db, current_user, domain_id)
+    records = db.query(SysOntologyBlueprint).filter(
+        SysOntologyBlueprint.domain_id == domain_id,
+    ).order_by(SysOntologyBlueprint.version_no.desc(), SysOntologyBlueprint.created_at.desc()).all()
+    data = []
+    for item in records:
+        try:
+            summary = json.loads(item.summary_json or "{}")
+        except Exception:
+            summary = {}
+        try:
+            payload = json.loads(item.blueprint_json or "{}")
+        except Exception:
+            payload = {}
+        data.append({
+            "blueprint_id": item.blueprint_id,
+            "version_no": item.version_no,
+            "status": item.status,
+            "created_at": item.created_at,
+            "summary": summary,
+            "generation_phase": payload.get("generation_phase"),
+            "source_design_blueprint_id": payload.get("source_design_blueprint_id"),
+            "source_design_blueprint_version": payload.get("source_design_blueprint_version"),
+        })
+    return ApiResponse(data=data)
+
+
 @router.post("/domains/{domain_id}/guide/apply", response_model=ApiResponse)
 async def apply_ontology_guide_preview(
     domain_id: str,
@@ -837,10 +875,11 @@ async def apply_ontology_guide_preview(
             domain_id=domain_id,
             blueprint=req.blueprint or {},
             overwrite_existing=req.overwrite_existing,
+            logical_only=req.logical_only,
             created_by=current_user.get("username", "unknown"),
         )
         if req.blueprint_id:
-            service.mark_blueprint_status(req.blueprint_id, "APPLIED")
+            service.mark_blueprint_status(req.blueprint_id, "LOGICAL_CONFIRMED" if req.logical_only else "APPLIED")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

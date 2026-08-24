@@ -1,4 +1,5 @@
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,6 +20,10 @@ class OntologyGraphMappingDesignTest(unittest.TestCase):
     def setUp(self) -> None:
         self.llm_service = LLMService.__new__(LLMService)
         self.ddl_service = DDLService.__new__(DDLService)
+
+    def test_graph_mapping_prompt_serializes_oracle_interval_samples(self) -> None:
+        safe = self.llm_service._make_json_safe({"interval_value": timedelta(days=1, seconds=2)})
+        self.assertEqual("1 day, 0:00:02", safe["interval_value"])
 
     def test_normalizes_complete_node_and_edge_design(self) -> None:
         entities = [

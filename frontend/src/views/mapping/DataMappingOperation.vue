@@ -10,7 +10,7 @@
       <div class="hero-stats">
         <div class="stat-card">
           <div class="stat-value">{{ entities.length }}</div>
-          <div class="stat-label">本体对象</div>
+          <div class="stat-label">逻辑本体对象</div>
         </div>
         <div class="stat-card">
           <div class="stat-value">{{ result?.summary?.ready_count || 0 }}</div>
@@ -86,7 +86,7 @@
           />
         </div>
         <div class="long-task-tip">
-          全域映射是长耗时操作。系统会按分析域下全部本体对象逐个读取业务数据源、构造候选表并调用大模型，可能持续数分钟。
+          全域映射是长耗时操作。系统仅处理最近一次“数据补全设计”中标记为有数据支撑的对象；逻辑保留对象不会发送给大模型映射，可能持续数分钟。
         </div>
         <div v-if="activeTaskDetail" class="active-task-box">
           <div class="active-task-head">
@@ -157,6 +157,14 @@
               <span>实体候选</span>
               <strong>{{ latestBlueprintEntityCandidateCount }}</strong>
             </div>
+            <div v-if="['data_enrichment', 'integrated'].includes(latestBlueprint.generation_mode)" class="summary-item">
+              <span>可自动映射实体</span>
+              <strong>{{ latestBlueprint.data_support?.data_supported_entity_count || 0 }}</strong>
+            </div>
+            <div v-if="['data_enrichment', 'integrated'].includes(latestBlueprint.generation_mode)" class="summary-item">
+              <span>逻辑保留实体</span>
+              <strong>{{ latestBlueprint.data_support?.logical_only_entity_count || 0 }}</strong>
+            </div>
             <div class="summary-item">
               <span>关系候选</span>
               <strong>{{ latestBlueprintRelationCandidateCount }}</strong>
@@ -170,6 +178,8 @@
             <div class="design-item">规则摘要：{{ latestBlueprintRuleSummary }}</div>
             <div class="design-item">结构化范围：指标族 {{ latestBlueprintFocusFamilies }}；站位 {{ latestBlueprintFocusStations }}</div>
             <div class="design-item">实体候选用于确认对象来源和推荐构建方式；关系候选用于辅助确认本体节点方向及边表引用的两端节点主键。</div>
+            <div v-if="latestBlueprint.generation_mode === 'data_enrichment'" class="design-item">数据补全蓝图会区分“可自动映射”和“逻辑保留”：全域自动映射仅处理已有数据表、字段和关系依据的对象；逻辑保留对象须在补充数据后再进行人工或自动映射。</div>
+            <div v-else-if="latestBlueprint.generation_mode === 'integrated'" class="design-item">一体化生成已同时使用需求文档和业务数据表：本轮生成的实体、属性与关系均进入自动映射范围，具体字段来源和 Join 在映射过程中校验。</div>
             <div class="design-item">标准化视图计划：{{ latestBlueprintViewSummary }}</div>
           </div>
         </el-card>
@@ -192,6 +202,10 @@
             <div class="summary-item">
               <span>空结果对象</span>
               <strong>{{ result.summary?.empty_count || 0 }}</strong>
+            </div>
+            <div class="summary-item">
+              <span>逻辑保留未映射</span>
+              <strong>{{ result.summary?.skipped_no_data_support_count || 0 }}</strong>
             </div>
             <div class="summary-item">
               <span>失败对象</span>
@@ -757,7 +771,8 @@ const loadLatestBlueprint = async () => {
     return
   }
   try {
-    const res = await mappingApi.getLatestBlueprint(currentDomainId.value)
+    // 映射必须以数据补全设计为准，不能被后续逻辑设计或一体化设计覆盖。
+    const res = await mappingApi.getLatestDataSupportBlueprint(currentDomainId.value)
     latestBlueprint.value = res.data || null
   } catch (e) {
     latestBlueprint.value = null

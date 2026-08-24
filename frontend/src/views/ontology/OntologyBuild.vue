@@ -25,6 +25,10 @@
           <el-button size="small" title="放大" @click="zoomInGraph">＋</el-button>
           <el-button size="small" plain @click="fitGraphToView">适配全图</el-button>
         </div>
+        <div v-if="hasDataSupportClassification" class="data-support-legend">
+          <span><i class="legend-dot is-supported" />有数据支撑</span>
+          <span><i class="legend-dot is-logical" />逻辑保留 / 待补数据</span>
+        </div>
         <span class="drag-hint">💡 单击实体查看属性并显示连线锚点，拖拽锚点到目标实体可快速创建关系，双击关系边可编辑或删除</span>
       </div>
       <div class="graph-layout">
@@ -142,6 +146,12 @@
             <p><strong>状态:</strong>
               <el-tag :type="selectedNode.status === 'DEPLOYED' ? 'success' : 'info'" size="small">{{ selectedNode.status }}</el-tag>
             </p>
+            <p v-if="selectedNode.dataSupportStatus"><strong>数据支撑:</strong>
+              <el-tag :type="selectedNode.dataSupportStatus === 'DATA_SUPPORTED' ? 'success' : 'info'" size="small">
+                {{ selectedNode.dataSupportStatus === 'DATA_SUPPORTED' ? '有数据支撑' : '逻辑保留 / 待补数据' }}
+              </el-tag>
+            </p>
+            <p v-if="selectedNode.dataSupportReason"><strong>依据:</strong> {{ selectedNode.dataSupportReason }}</p>
             <p><strong>表名:</strong> <code>{{ selectedNode.tableName || '-' }}</code></p>
             <p><strong>描述:</strong> {{ selectedNode.desc || '无' }}</p>
           </div>
@@ -522,14 +532,44 @@
             </p>
           </div>
           <div class="guide-banner-side">
+            <span v-if="guideModeChosen">生成方式：{{ guideForm.workflow_mode === 'integrated' ? '一体化生成' : '分步骤生成' }}</span>
+            <span v-if="guideModeChosen && guideForm.workflow_mode === 'stepwise'">阶段：{{ isStepwiseLogicDesign ? '本体逻辑设计' : '数据补全设计' }}</span>
             <span>覆盖同名对象说明</span>
             <el-switch v-model="guideForm.overwrite_existing" />
           </div>
         </section>
-        <section class="guide-steps-shell">
+        <section v-if="!guideModeChosen" class="guide-mode-entry">
+          <div class="guide-mode-entry-title">选择本次本体生成方式</div>
+          <div class="guide-mode-entry-desc">先确定采用一次完成，还是按逻辑设计与数据补全分阶段建设。</div>
+          <el-segmented
+            v-model="guideForm.workflow_mode"
+            :options="[
+              { label: '1. 一体化生成', value: 'integrated' },
+              { label: '2. 分步骤生成', value: 'stepwise' }
+            ]"
+            @change="handleGuideWorkflowModeChange"
+          />
+          <div v-if="guideForm.workflow_mode === 'stepwise'" class="guide-stage-selector">
+            <div class="guide-control-label">选择当前分步骤阶段</div>
+            <el-segmented
+              v-model="guideForm.stepwise_stage"
+              :options="[
+                { label: '1. 本体逻辑设计', value: 'logic_design' },
+                { label: '2. 数据补全设计', value: 'data_enrichment' }
+              ]"
+              @change="handleGuideStepwiseStageChange"
+            />
+          </div>
+          <div class="guide-mode-entry-hint">
+            {{ guideWorkflowHint }}
+          </div>
+          <el-button type="primary" @click="confirmGuideGenerationMode">{{ guideForm.workflow_mode === 'integrated' ? '进入一体化生成' : '进入分步骤生成' }}</el-button>
+        </section>
+
+        <section v-else class="guide-steps-shell">
           <div class="guide-steps-nav">
             <button
-              v-for="step in guideStepOptions"
+              v-for="step in visibleGuideStepOptions"
               :key="step.value"
               type="button"
               class="guide-step-chip"
@@ -549,8 +589,14 @@
           </div>
         </section>
 
-        <section v-if="guideStep === 1" class="guide-step-body">
-          <section class="guide-toolbar">
+        <section v-if="guideModeChosen && guideStep === 1" class="guide-step-body">
+          <section v-if="isDataEnrichmentDesign" class="guide-toolbar">
+            <el-select v-model="guideForm.base_blueprint_id" placeholder="选择已确认的逻辑本体基线" filterable class="guide-toolbar-item">
+              <el-option v-for="blueprint in logicalBlueprintOptions" :key="blueprint.blueprint_id" :label="`逻辑本体 v${blueprint.version_no} · ${blueprint.status} · 实体${blueprint.summary?.entity_count || 0}`" :value="blueprint.blueprint_id" />
+            </el-select>
+            <div class="guide-panel-hint" style="grid-column: span 3;">选择上一步确认的逻辑本体设计作为基线。数据补全只补齐可落地的 MVP 对象、属性来源和关系来源，不会静默替换已确认的业务定义。</div>
+          </section>
+          <section v-if="guideForm.generation_mode !== 'document_first'" class="guide-toolbar">
             <el-segmented
               v-model="guideForm.table_source_mode"
               :options="[
@@ -617,15 +663,14 @@
               <el-option label="LLM模型辅助" value="llm_first" />
             </el-select>
             <el-select
-              v-if="guideForm.generation_strategy === 'llm_first'"
               v-model="guideForm.semantic_type_code"
               clearable
-              :placeholder="guideSemanticTypeOptions.length ? '选择本次业务语义' : '正在加载业务语义配置'"
+              :placeholder="guideGenerationSemanticOptions.length ? '选择本次业务语义' : '正在加载可用业务语义配置'"
               class="guide-toolbar-item"
               @change="handleGuideSemanticTypeChange"
             >
               <el-option
-                v-for="semanticType in guideSemanticTypeOptions"
+                v-for="semanticType in guideGenerationSemanticOptions"
                 :key="semanticType.type_code"
                 :label="semanticType.type_name"
                 :value="semanticType.type_code"
@@ -634,24 +679,16 @@
                 <span v-if="semanticType.semantic_desc" class="guide-mode-option-desc">{{ semanticType.semantic_desc }}</span>
               </el-option>
             </el-select>
-            <el-select
-              v-else
-              v-model="guideForm.business_scenario"
-              clearable
-              placeholder="业务目标"
-              class="guide-toolbar-item"
-            >
-              <el-option label="SFR根因分析" value="SFR_ROOTCAUSE" />
-              <el-option label="缺陷分析" value="DEFECT_ANALYSIS" />
-            </el-select>
             <div class="guide-panel-hint guide-toolbar-item" style="grid-column: span 2;">
-              {{ guideForm.generation_strategy === 'llm_first'
+              {{ isStepwiseLogicDesign
+                ? `本体逻辑设计只基于需求文档与业务语义，当前使用「${currentBusinessTypeName || '未配置'}」进行逻辑对象和边设计。`
+                : guideForm.generation_strategy === 'llm_first'
                 ? `LLM 模型辅助将按所选业务语义「${currentBusinessTypeName || '未配置'}」生成本体对象和关系。`
-                : '结构化领域生成会优先执行问卷/DDL/规则数据的结构化分析，再生成 canonical 本体与标准化视图计划。' }}
+                : `结构化领域生成将按所选业务语义「${currentBusinessTypeName || '未配置'}」执行质量规则、缺陷归因与过程追溯分析。` }}
             </div>
           </section>
 
-          <section v-if="guideForm.table_source_mode === 'database'" class="guide-toolbar">
+          <section v-if="guideForm.generation_mode !== 'document_first' && guideForm.table_source_mode === 'database'" class="guide-toolbar">
             <el-select
               v-model="guideForm.rule_table_name"
               placeholder="可选：单独指定规则表"
@@ -690,20 +727,21 @@
               <div v-if="guideUploadedDocument" class="guide-upload-meta">
                 已解析文件：{{ guideUploadedDocument.file_name }}
                 <span>类型 {{ guideUploadedDocument.file_type || '-' }}</span>
+                <span>格式 Markdown</span>
                 <span>{{ guideUploadedDocument.char_count }} 字</span>
               </div>
               <el-input
                 v-model="guideForm.business_document"
                 type="textarea"
                 :rows="17"
-                placeholder="粘贴业务说明、流程说明、对象定义、关系规则等文档内容。结构化 Guide 会优先抽取业务边界、关键站位、规则范围和追溯链路。"
+                placeholder="粘贴或编辑 Markdown 格式的业务说明、流程说明、对象定义、关系规则等内容。结构化 Guide 会优先抽取业务边界、关键站位、规则范围和追溯链路。"
               />
               <div class="guide-panel-hint">
-                支持上传 `txt / md / docx / pdf` 文档，解析结果会自动追加到当前说明文档输入框。建议文档中包含：业务对象定义、对象间约束、关键关系、口径说明、典型分析问题。
+                支持上传 `txt / md / docx / pdf` 文档，解析结果会自动转换或保留为 Markdown 后追加到说明框；DOCX 的标题、列表和表格会尽量保留。建议文档中包含：业务对象定义、对象间约束、关键关系、口径说明、典型分析问题。
               </div>
             </section>
 
-            <section class="guide-table-panel">
+            <section v-if="guideForm.generation_mode !== 'document_first'" class="guide-table-panel">
               <div class="guide-panel-head">
                 <span class="guide-panel-title">业务关系表</span>
                 <div class="guide-panel-actions">
@@ -808,19 +846,65 @@
                 <div v-else class="guide-pattern-empty">请按本次业务目标手工勾选需要带入 LLM 提示词的语义模式。</div>
               </div>
             </section>
+            <section v-else class="guide-table-panel guide-document-only-panel">
+              <div class="guide-panel-title">本体逻辑设计阶段不需要源数据表</div>
+              <div class="guide-panel-hint">请在左侧文档中清楚描述业务对象、对象间关系、业务事件、指标口径与典型问题。确认逻辑本体后，可在“分步骤生成 → 数据补全设计”阶段接入数据库、DDL、规则表和样例数据。</div>
+              <el-alert type="info" :closable="false" show-icon title="本阶段不会生成属性映射、关系 Join、节点/边 SQL 或 DDL，避免在尚未取得数据依据时产生虚假的物理实现。" />
+            </section>
           </div>
         </section>
 
-        <section v-else-if="guideStep === 2" class="guide-step-body">
+        <section v-else-if="guideModeChosen && guideStep === 2" class="guide-step-body">
           <el-empty v-if="!guidePreview" description="请先在第 1 步生成本体对象与关系建议。" :image-size="76" />
+          <div v-else-if="isDocumentDesignPreview" class="guide-preview">
+            <el-alert type="warning" :closable="false" show-icon title="请确认高层本体设计文档。确认后系统才会生成逻辑实体、属性和关系。" />
+            <el-alert
+              v-if="guidePreview.ontology_design_document?.generation_mode === 'fallback'"
+              type="error"
+              :closable="false"
+              show-icon
+              :title="`大模型未返回可解析的设计文档，当前内容仅为保底设计壳。${guidePreview.ontology_design_document?.generation_error || '请检查模型配置或重新生成后，再确认设计。'}`"
+            />
+            <div class="guide-preview-grid" style="margin-top: 12px">
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">业务范围、目标与边界</div>
+                <div class="guide-preview-summary">覆盖范围：{{ guidePreview.ontology_design_document?.mvp_scope || '-' }}</div>
+                <div class="guide-preview-summary">范围说明：{{ guidePreview.ontology_design_document?.scope_reasoning || '-' }}</div>
+                <div class="guide-preview-summary">目标：{{ (guidePreview.ontology_design_document?.business_scope?.goals || []).join(' / ') || '-' }}</div>
+                <div class="guide-preview-summary">不在范围：{{ (guidePreview.ontology_design_document?.business_scope?.out_of_scope || []).join(' / ') || '-' }}</div>
+              </section>
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">核心对象及逻辑属性建议</div>
+                <div v-for="item in guidePreview.ontology_design_document?.core_object_definitions || guidePreview.ontology_design_document?.included_entities || []" :key="item.entityName" class="guide-preview-summary">
+                  {{ item.entityDisplayName || item.entityName }}：{{ item.definition || item.reason || '-' }}；标识 {{ (item.candidateBusinessKeys || []).join(' / ') || '-' }}
+                </div>
+              </section>
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">对象关系、生命周期、事件与规则</div>
+                <div v-for="item in guidePreview.ontology_design_document?.logical_relationships || guidePreview.ontology_design_document?.included_relations || []" :key="`${item.sourceEntityName}-${item.relationName}-${item.targetEntityName}`" class="guide-preview-summary">
+                  {{ item.sourceEntityName ? `${item.sourceEntityName} → ` : '' }}{{ item.relationName }}{{ item.targetEntityName ? ` → ${item.targetEntityName}` : '' }}：{{ item.cardinality || item.reason || '-' }}
+                </div>
+                <div class="guide-preview-summary">事件：{{ (guidePreview.ontology_design_document?.lifecycle_event_metric_rule_terms?.events || []).join(' / ') || '-' }}</div>
+                <div class="guide-preview-summary">指标：{{ (guidePreview.ontology_design_document?.lifecycle_event_metric_rule_terms?.metrics || []).join(' / ') || '-' }}</div>
+              </section>
+              <section class="guide-preview-panel">
+                <div class="guide-panel-title">确认项、假设项与后续数据需求</div>
+                <div class="guide-preview-summary">待确认：{{ (guidePreview.ontology_design_document?.confirmation_items?.pending || []).join(' / ') || '-' }}</div>
+                <div class="guide-preview-summary">假设项：{{ (guidePreview.ontology_design_document?.confirmation_items?.assumptions || []).join(' / ') || '-' }}</div>
+                <div class="guide-preview-summary">缺失信息：{{ (guidePreview.ontology_design_document?.confirmation_items?.missing_information || []).join(' / ') || '-' }}</div>
+                <div v-for="item in guidePreview.ontology_design_document?.required_data_table_types || []" :key="item.tableType" class="guide-preview-summary">{{ item.tableType }}：{{ item.purpose || item.example || '-' }}</div>
+              </section>
+            </div>
+          </div>
           <div v-else-if="isLlmFirstGuide" class="guide-preview">
             <div class="guide-preview-grid">
               <section class="guide-preview-panel">
                 <div class="guide-panel-title">业务语义范围确认</div>
                 <div class="guide-preview-summary">生成策略：LLM模型辅助</div>
                 <div class="guide-preview-summary">业务类型：{{ currentBusinessTypeName || '-' }}</div>
+                <div v-if="guidePreview.source_design_blueprint_id" class="guide-preview-summary">来源设计文档：{{ guidePreview.source_design_blueprint_id }}（v{{ guidePreview.source_design_blueprint_version || '-' }}）</div>
                 <div class="guide-preview-summary">本次语义模式：{{ guideForm.enabled_patterns.map(guidePatternLabel).join(' / ') || '未选择' }}</div>
-                <div class="guide-preview-summary">MVP 范围：{{ guidePreview.ontology_design_document?.mvp_scope || '模型未返回范围说明' }}</div>
+                <div class="guide-preview-summary">{{ guidePreview.generation_mode === 'document_first' ? '文档覆盖范围' : 'MVP 范围' }}：{{ guidePreview.ontology_design_document?.mvp_scope || '模型未返回范围说明' }}</div>
                 <div class="guide-preview-summary">范围说明：{{ guidePreview.ontology_design_document?.scope_reasoning || '-' }}</div>
               </section>
 
@@ -917,7 +1001,7 @@
           </div>
         </section>
 
-        <section v-else-if="guideStep === 3" class="guide-step-body">
+        <section v-else-if="guideModeChosen && guideStep === 3" class="guide-step-body">
           <el-empty v-if="!guidePreview" description="请先生成预览结果。" :image-size="76" />
           <section v-else class="guide-preview">
             <div class="guide-preview-head">
@@ -925,6 +1009,11 @@
                 <el-tag size="small" type="success">Canonical Model</el-tag>
                 <span>实体 {{ guidePreview.entities?.length || 0 }}</span>
                 <span>关系 {{ guidePreview.relations?.length || 0 }}</span>
+                <template v-if="isDataEnrichmentDesign">
+                  <span>数据支撑实体 {{ guidePreview.data_support?.data_supported_entity_count || 0 }}</span>
+                  <span>逻辑保留实体 {{ guidePreview.data_support?.logical_only_entity_count || 0 }}</span>
+                  <span>数据支撑关系 {{ guidePreview.data_support?.data_supported_relation_count || 0 }}</span>
+                </template>
                 <span>对象分组 {{ guidePreview.canonical_model?.entity_groups?.length || 0 }}</span>
               </div>
               <div v-if="guidePreview.apply_result" class="guide-apply-summary">
@@ -961,6 +1050,13 @@
                   <el-table-column prop="entityDisplayName" label="显示名" min-width="140" />
                   <el-table-column prop="entityName" label="实体名" min-width="160" />
                   <el-table-column prop="buildType" label="构建方式" width="100" />
+                  <el-table-column v-if="isDataEnrichmentDesign" label="数据支撑" width="120">
+                    <template #default="{ row }">
+                      <el-tag size="small" :type="row.data_support_status === 'DATA_SUPPORTED' ? 'success' : 'info'">
+                        {{ row.data_support_status === 'DATA_SUPPORTED' ? '可自动映射' : '逻辑保留' }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="来源表" min-width="180" show-overflow-tooltip>
                     <template #default="{ row }">{{ (row.sourceHints || []).join(', ') || '-' }}</template>
                   </el-table-column>
@@ -974,16 +1070,42 @@
                   <el-table-column prop="relationName" label="关系名称" min-width="120" />
                   <el-table-column prop="targetEntityName" label="目标实体" min-width="130" />
                   <el-table-column prop="relationType" label="关系类型" width="120" />
+                  <el-table-column v-if="isDataEnrichmentDesign" label="数据支撑" width="120">
+                    <template #default="{ row }">
+                      <el-tag size="small" :type="row.data_support_status === 'DATA_SUPPORTED' ? 'success' : (row.data_support_status === 'DATA_CANDIDATE' ? 'warning' : 'info')">
+                        {{ row.data_support_status === 'DATA_SUPPORTED' ? '可自动映射' : (row.data_support_status === 'DATA_CANDIDATE' ? '待确认 Join' : '逻辑保留') }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="证据表" min-width="180" show-overflow-tooltip>
                     <template #default="{ row }">{{ (row.evidenceTables || []).join(', ') || '-' }}</template>
                   </el-table-column>
+                </el-table>
+              </section>
+
+              <section v-if="isDataEnrichmentDesign" class="guide-preview-panel">
+                <div class="guide-panel-title">属性来源建议</div>
+                <el-table :data="dataEnrichmentPropertySources" border stripe size="small" max-height="260">
+                  <el-table-column prop="entityDisplayName" label="本体对象" min-width="130" />
+                  <el-table-column prop="propertyDisplayName" label="属性" min-width="130" />
+                  <el-table-column prop="source" label="来源表.字段" min-width="190" show-overflow-tooltip />
+                  <el-table-column prop="transform" label="转换/说明" min-width="180" show-overflow-tooltip />
+                </el-table>
+              </section>
+
+              <section v-if="isDataEnrichmentDesign" class="guide-preview-panel">
+                <div class="guide-panel-title">关系来源建议</div>
+                <el-table :data="dataEnrichmentRelationSources" border stripe size="small" max-height="260">
+                  <el-table-column prop="relation" label="本体关系" min-width="220" show-overflow-tooltip />
+                  <el-table-column prop="source" label="实际数据依据" min-width="260" show-overflow-tooltip />
+                  <el-table-column prop="status" label="状态" width="110" />
                 </el-table>
               </section>
             </div>
           </section>
         </section>
 
-        <section v-else class="guide-step-body">
+        <section v-else-if="guideModeChosen && guideStep === 4" class="guide-step-body">
           <el-empty v-if="!guidePreview" description="请先生成预览结果。" :image-size="76" />
           <section v-else class="guide-preview">
             <div class="guide-preview-grid">
@@ -1046,16 +1168,17 @@
       </div>
       <template #footer>
         <el-button @click="guideDialogVisible = false">关闭</el-button>
-        <el-button :disabled="guideGenerating || guideApplying" @click="reloadGuidePreview">重新加载预览</el-button>
-        <el-button v-if="guideStep > 1" @click="moveGuideStep(-1)">上一步</el-button>
+        <el-button v-if="guideModeChosen" :disabled="guideGenerating || guideApplying" @click="reloadGuidePreview">重新加载预览</el-button>
+        <el-button v-if="guideModeChosen && guideStep > 1" @click="moveGuideStep(-1)">上一步</el-button>
         <el-button
-          v-if="guideStep < 4 && canEnterGuideStep(guideStep + 1)"
+          v-if="guideModeChosen && guideStep < 4 && canEnterGuideStep(guideStep + 1)"
           @click="moveGuideStep(1)"
         >
           下一步
         </el-button>
-        <el-button type="primary" plain :loading="guideGenerating" @click="generateOntologyGuidePreview">生成本体对象</el-button>
-        <el-button type="success" :loading="guideApplying" :disabled="!guidePreview?.entities?.length" @click="applyOntologyGuide">应用生成结果</el-button>
+        <el-button v-if="guideModeChosen" type="primary" plain :loading="guideGenerating" @click="generateOntologyGuidePreview">{{ isStepwiseLogicDesign ? (isDocumentDesignPreview ? '重新生成高层本体设计文档' : '生成高层本体设计文档') : (isDataEnrichmentDesign ? '生成数据补全设计' : '生成本体对象') }}</el-button>
+        <el-button v-if="guideModeChosen && isDocumentDesignPreview" type="success" :loading="guideGenerating" @click="confirmDocumentDesign">确认高层设计并生成本体对象</el-button>
+        <el-button v-if="guideModeChosen && !isDocumentDesignPreview" type="success" :loading="guideApplying" :disabled="!guidePreview?.entities?.length" @click="applyOntologyGuide">{{ isStepwiseLogicDesign ? '确认并创建逻辑本体' : (isDataEnrichmentDesign ? '确认数据补全设计并应用' : '应用生成结果') }}</el-button>
       </template>
     </el-dialog>
 
@@ -1300,6 +1423,8 @@ const currentBusinessTypeName = ref('')
 const currentBusinessTypeDesc = ref('')
 const graphNodes = ref<any[]>([])
 const graphEdges = ref<any[]>([])
+const dataSupportByEntityName = ref<Record<string, { status: string; reason: string }>>({})
+const hasDataSupportClassification = computed(() => Object.keys(dataSupportByEntityName.value).length > 0)
 const selectedNode = ref<any>(null)
 const selectedNodeProperties = ref<any[]>([])
 const processes = ref<any[]>([])
@@ -1322,6 +1447,7 @@ const guideTables = ref<GuideTableOption[]>([])
 const guideDDLSchemaTables = ref<GuideDDLTable[]>([])
 const guideRuleDatasets = ref<GuideRuleDataset[]>([])
 const guideModelOptions = ref<GuideModelOption[]>([])
+const logicalBlueprintOptions = ref<any[]>([])
 const guideTableKeyword = ref('')
 const guidePreview = ref<any>(null)
 const guideRunState = ref<'idle' | 'running' | 'success' | 'warning' | 'error'>('idle')
@@ -1330,18 +1456,32 @@ const guideUploadedDocument = ref<{ file_name: string; char_count: number; file_
 const guideUploadedDDLFiles = ref<Array<{ file_name: string; char_count: number; file_type: string; table_count: number }>>([])
 const guideUploadedRuleFiles = ref<Array<{ file_name: string; char_count: number; file_type: string; dataset_count: number }>>([])
 const guideStep = ref(1)
+const guideModeChosen = ref(false)
+const documentDesignBlueprintId = ref('')
 const guideStepOptions = [
-  { value: 1, label: '资料输入', description: '上传问卷、DDL、规则数据，选择业务关系表与生成策略。' },
-  { value: 2, label: '分析确认', description: '确认结构化分析出的场景、规则范围、关键表和重点站位。' },
-  { value: 3, label: '本体预览', description: '检查 canonical 本体对象、关系和缺陷语义分类。' },
-  { value: 4, label: '视图应用', description: '查看标准化视图计划、属性图骨架并准备应用。' },
+  { value: 1, label: '资料输入', description: '输入需求文档、业务语义以及当前阶段所需的数据对象。' },
+  { value: 2, label: '分析确认', description: '确认设计范围、数据依据与待人工确认内容。' },
+  { value: 3, label: '本体浏览', description: '检查本体对象、属性、关系及其来源建议。' },
+  { value: 4, label: '视图应用', description: '查看可部署的视图与属性图设计。' },
 ]
 const guidePatternOptions = ref<Array<{ value: string; label: string; description?: string }>>([])
 const guideSemanticTypeOptions = ref<any[]>([])
+const guideGenerationSemanticOptions = computed(() => {
+  if (guideForm.generation_strategy === 'llm_first') return guideSemanticTypeOptions.value
+  return guideSemanticTypeOptions.value.filter((item: any) => {
+    const patternCodes = new Set((item.semantic_patterns || []).map((pattern: any) => pattern.pattern_code))
+    return patternCodes.has('measurement-threshold-violation') && patternCodes.has('case-rootcause-action')
+  })
+})
 const createEmptyGuideForm = () => ({
+  // workflow_mode is a UI-level choice; generation_mode keeps the compatible API contract.
+  workflow_mode: 'integrated' as 'integrated' | 'stepwise',
+  stepwise_stage: 'logic_design' as 'logic_design' | 'data_enrichment',
+  generation_mode: 'integrated' as 'document_first' | 'data_enrichment' | 'integrated',
+  base_blueprint_id: '',
   table_source_mode: 'database' as 'database' | 'ddl',
   generation_strategy: 'structured_domain_pipeline',
-  business_scenario: 'SFR_ROOTCAUSE',
+  business_scenario: 'DEFECT_ROOTCAUSE',
   semantic_type_code: '',
   source_id: '',
   schema: '',
@@ -1357,13 +1497,64 @@ const createEmptyGuideForm = () => ({
   overwrite_existing: false
 })
 const guideForm = reactive(createEmptyGuideForm())
+const isStepwiseLogicDesign = computed(() =>
+  guideForm.workflow_mode === 'stepwise' && guideForm.stepwise_stage === 'logic_design'
+)
+const isDataEnrichmentDesign = computed(() =>
+  guideForm.workflow_mode === 'stepwise' && guideForm.stepwise_stage === 'data_enrichment'
+)
+const guideWorkflowHint = computed(() => {
+  if (guideForm.workflow_mode === 'integrated') {
+    return '同时输入需求文档、业务数据对象、关系表和规则数据，在一次生成中形成可落地的 MVP 本体、属性来源与关系来源建议。'
+  }
+  if (guideForm.stepwise_stage === 'logic_design') {
+    return '仅上传需求文档并选择业务语义。先生成高层本体设计文档，确认后再生成逻辑本体对象、属性和边设计；本阶段不产生字段映射、Join 或 DDL。'
+  }
+  return '选择已确认的逻辑本体设计，再提供业务数据对象、DDL、规则表或补充描述，形成最小 MVP 的实体属性来源与关系来源建议，为数据映射提供依据。'
+})
+const syncGuideGenerationMode = () => {
+  guideForm.generation_mode = guideForm.workflow_mode === 'integrated'
+    ? 'integrated'
+    : guideForm.stepwise_stage === 'logic_design'
+      ? 'document_first'
+      : 'data_enrichment'
+  if (guideForm.generation_mode === 'document_first') {
+    // 文档逻辑设计统一由 LLM 根据文档与业务语义完成，不调用数据驱动的结构化流水线。
+    guideForm.generation_strategy = 'llm_first'
+    guideForm.business_scenario = 'BUSINESS_SEMANTIC'
+  }
+}
+const handleGuideWorkflowModeChange = async () => {
+  syncGuideGenerationMode()
+  guidePreview.value = null
+  guideStep.value = 1
+  if (isDataEnrichmentDesign.value) await loadLogicalBlueprintOptions()
+}
+const handleGuideStepwiseStageChange = async () => {
+  syncGuideGenerationMode()
+  guidePreview.value = null
+  guideStep.value = 1
+  if (isDataEnrichmentDesign.value) await loadLogicalBlueprintOptions()
+}
+const confirmGuideGenerationMode = () => {
+  syncGuideGenerationMode()
+  guideModeChosen.value = true
+  guideStep.value = 1
+}
 const handleGuideGenerationStrategyChange = (strategy: string) => {
   guideForm.business_scenario = strategy === 'llm_first'
     ? 'BUSINESS_SEMANTIC'
-    : 'SFR_ROOTCAUSE'
+    : 'DEFECT_ROOTCAUSE'
   if (strategy === 'llm_first') {
     guideForm.semantic_type_code = guideForm.semantic_type_code || currentDomainType.value
     void loadGuidePatternOptions(guideForm.semantic_type_code, true)
+  } else {
+    guideForm.semantic_type_code = ''
+    guideForm.business_scenario = 'DEFECT_ROOTCAUSE'
+    guideForm.enabled_patterns = []
+    currentBusinessTypeName.value = ''
+    currentBusinessTypeDesc.value = ''
+    guidePatternOptions.value = []
   }
 }
 const selectedGuideTableBindings = computed<GuideTableBinding[]>(() =>
@@ -1393,8 +1584,17 @@ const filteredGuideTables = computed(() => {
     (table.owner || '').toLowerCase().includes(keyword)
   )
 })
+// 首次资料输入时还没有可确认或可浏览的内容，避免把后续不可用步骤
+// 以禁用态堆在界面上；生成预览后再按当前阶段开放相应步骤。
+const visibleGuideStepOptions = computed(() => {
+  if (!guidePreview.value) return guideStepOptions.filter(item => item.value === 1)
+  return guideStepOptions.filter(item => canEnterGuideStep(item.value))
+})
 const activeGuideStepDescription = computed(() =>
-  guideStepOptions.find(item => item.value === guideStep.value)?.description || ''
+  visibleGuideStepOptions.value.find(item => item.value === guideStep.value)?.description || ''
+)
+const isDocumentDesignPreview = computed(() =>
+  isStepwiseLogicDesign.value && guidePreview.value?.generation_phase === 'design'
 )
 const isLlmFirstGuide = computed(() => guidePreview.value?.generation_strategy === 'llm_first')
 const availableGuideHistorySources = computed(() => {
@@ -1998,8 +2198,36 @@ const connectSelectedFlowNodes = () => {
 const loadGraphData = async () => {
   if (!currentDomainId.value) return
   try {
-    const res = await graphApi.getOntologyGraph(currentDomainId.value)
+    const [res, blueprintRes] = await Promise.all([
+      graphApi.getOntologyGraph(currentDomainId.value),
+      // 数据补全结果可能不是当前“最新”蓝图；必须按生成阶段单独查询，
+      // 否则后续的一体化/逻辑设计会覆盖图谱中的数据支撑着色依据。
+      mappingApi.getLatestDataSupportBlueprint(currentDomainId.value).catch(() => ({ data: null })),
+    ])
+    const latestBlueprint = blueprintRes.data || {}
+    const supportIndex: Record<string, { status: string; reason: string }> = {}
+    for (const entity of latestBlueprint.entities || []) {
+      const entityName = String(entity?.entity_name || entity?.entityName || '').trim().toLowerCase()
+      const status = String(entity?.data_support_status || '').trim()
+      if (entityName && status) {
+        supportIndex[entityName] = {
+          status,
+          reason: String(entity?.data_support_reason || ''),
+        }
+      }
+    }
+    dataSupportByEntityName.value = supportIndex
     graphNodes.value = res.data?.nodes || []
+    graphNodes.value.forEach((node: any) => {
+      const support = supportIndex[String(node.name || '').trim().toLowerCase()]
+      node.dataSupportStatus = support?.status || ''
+      node.dataSupportReason = support?.reason || ''
+      if (support?.status === 'DATA_SUPPORTED') {
+        node.color = '#2f9e73'
+      } else if (support?.status) {
+        node.color = '#7b8798'
+      }
+    })
     graphEdges.value = res.data?.edges || []
     graphNodes.value.forEach((node, idx) => {
       if (!node.position || (node.position.x === 200 && node.position.y === 200)) {
@@ -2053,6 +2281,10 @@ const loadCurrentDomainDetail = async () => {
 const loadGuideSemanticTypeOptions = async () => {
   const res = await businessTypeApi.list()
   guideSemanticTypeOptions.value = (res.data || []).filter((item: any) => item.status === 'ACTIVE')
+  if (guideForm.generation_strategy === 'structured_domain_pipeline') {
+    const availableCodes = new Set(guideGenerationSemanticOptions.value.map((item: any) => item.type_code))
+    if (!availableCodes.has(guideForm.semantic_type_code)) guideForm.semantic_type_code = ''
+  }
 }
 
 const loadGuidePatternOptions = async (semanticTypeCode = guideForm.semantic_type_code || currentDomainType.value, selectAll = false) => {
@@ -2123,10 +2355,33 @@ const summarizeRelationSource = (row: any) => {
   return parts.length ? parts.join('；') : '无'
 }
 
+const dataEnrichmentPropertySources = computed(() =>
+  (guidePreview.value?.entities || []).flatMap((entity: any) =>
+    (entity.properties || []).map((property: any) => ({
+      entityDisplayName: entity.entityDisplayName || entity.entityName || '-',
+      propertyDisplayName: property.propertyDisplayName || property.propertyName || '-',
+      source: property.sourceTable && property.sourceColumn
+        ? `${property.sourceTable}.${property.sourceColumn}`
+        : '待人工确认',
+      transform: property.transformRule || property.mappingRule || property.description || '-',
+    }))
+  )
+)
+const dataEnrichmentRelationSources = computed(() =>
+  (guidePreview.value?.relations || []).map((relation: any) => ({
+    relation: `${relation.sourceEntityDisplayName || relation.sourceEntityName || '-'} → ${relation.relationDisplayName || relation.relationName || '-'} → ${relation.targetEntityDisplayName || relation.targetEntityName || '-'}`,
+    source: summarizeRelationSource(relation),
+    status: relation.requiresHumanConfirmation || relation.needsHumanConfirmation ? '待人工确认' : '已生成建议',
+  }))
+)
+
 const resetGuideForm = () => {
   const emptyForm = createEmptyGuideForm()
   Object.assign(guideForm, emptyForm)
+  syncGuideGenerationMode()
   guideStep.value = 1
+  guideModeChosen.value = false
+  documentDesignBlueprintId.value = ''
   if (currentDomainDesc.value) {
     guideForm.business_document = currentDomainDesc.value
   }
@@ -2153,7 +2408,10 @@ const canEnterGuideStep = (step: number) => {
   if (!guidePreview.value) return false
   if (step === 2) return isLlmFirstGuide.value || !!(guidePreview.value.document_facts || guidePreview.value.rule_analysis || guidePreview.value.schema_analysis)
   if (step === 3) return Array.isArray(guidePreview.value.entities) && guidePreview.value.entities.length > 0
-  if (step === 4) return !!guidePreview.value.view_plan || !!guidePreview.value.deployment_design
+  if (step === 4) {
+    return guidePreview.value.generation_mode !== 'document_first'
+      && (!!guidePreview.value.view_plan || !!guidePreview.value.deployment_design)
+  }
   return false
 }
 
@@ -2182,6 +2440,12 @@ const loadLatestGuidePreview = async () => {
   if (!currentDomainId.value) return null
   const previewRes = await mappingApi.getLatestBlueprint(currentDomainId.value)
   return previewRes.data || null
+}
+
+const loadLogicalBlueprintOptions = async () => {
+  if (!currentDomainId.value) return
+  const res = await graphApi.listOntologyGuideBlueprints(currentDomainId.value)
+  logicalBlueprintOptions.value = (res.data || []).filter((item: any) => item.status === 'LOGICAL_CONFIRMED')
 }
 
 const handleGuideTableSourceModeChange = async () => {
@@ -2342,7 +2606,7 @@ const openOntologyGuide = async () => {
   }
   guideDialogVisible.value = true
   resetGuideForm()
-  await Promise.all([loadCurrentDomainDetail(), loadGuideModels()])
+  await Promise.all([loadCurrentDomainDetail(), loadGuideModels(), loadLogicalBlueprintOptions()])
   if (!guideForm.business_document && currentDomainDesc.value) {
     guideForm.business_document = currentDomainDesc.value
   }
@@ -2366,20 +2630,20 @@ const handleGuideDocumentFileChange = async (uploadFile: any) => {
   guideUploadLoading.value = true
   try {
     const res = await graphApi.parseOntologyGuideDocument(currentDomainId.value, file)
-    const parsedText = (res.data?.text || '').trim()
-    if (!parsedText) {
+    const parsedMarkdown = (res.data?.markdown || res.data?.text || '').trim()
+    if (!parsedMarkdown) {
       ElMessage.warning('文档未解析出有效内容')
       return
     }
     guideForm.business_document = guideForm.business_document.trim()
-      ? `${guideForm.business_document.trim()}\n\n${parsedText}`
-      : parsedText
+      ? `${guideForm.business_document.trim()}\n\n${parsedMarkdown}`
+      : parsedMarkdown
     guideUploadedDocument.value = {
       file_name: res.data?.file_name || file.name,
-      char_count: Number(res.data?.char_count || parsedText.length),
+      char_count: Number(res.data?.char_count || parsedMarkdown.length),
       file_type: res.data?.file_type || ''
     }
-    ElMessage.success(`文档已解析并写入说明框：${guideUploadedDocument.value.file_name}`)
+    ElMessage.success(`文档已转换为 Markdown 并写入说明框：${guideUploadedDocument.value.file_name}`)
   } catch (e) {
   } finally {
     guideUploadLoading.value = false
@@ -2467,25 +2731,33 @@ const handleGuideRuleFileChange = async (uploadFile: any) => {
   }
 }
 
-const generateOntologyGuide = async (autoApply = false) => {
+const generateOntologyGuide = async (autoApply = false, documentPhase: 'design' | 'ontology' = 'ontology') => {
   if (!currentDomainId.value) {
     ElMessage.warning('请先选择业务分析域')
     return
   }
-  if (guideForm.table_source_mode === 'database' && !guideForm.source_id) {
+  if (guideForm.generation_mode !== 'document_first' && guideForm.table_source_mode === 'database' && !guideForm.source_id) {
     ElMessage.warning('请选择数据库连接')
     return
   }
-  if (guideForm.table_source_mode === 'ddl' && !guideDDLSchemaTables.value.length) {
+  if (guideForm.generation_mode !== 'document_first' && guideForm.table_source_mode === 'ddl' && !guideDDLSchemaTables.value.length) {
     ElMessage.warning('请先上传并解析数据库DDL文件')
     return
   }
-  if (!guideForm.relation_tables.length) {
+  if (guideForm.generation_mode !== 'document_first' && !guideForm.relation_tables.length) {
     ElMessage.warning('请至少选择一张业务关系表')
     return
   }
   if (!guideForm.business_document.trim()) {
     ElMessage.warning('请输入业务说明文档')
+    return
+  }
+  if (!guideForm.semantic_type_code) {
+    ElMessage.warning('请选择本次生成使用的业务语义')
+    return
+  }
+  if (guideForm.generation_mode === 'data_enrichment' && !guideForm.base_blueprint_id) {
+    ElMessage.warning('请选择已确认的逻辑本体基线')
     return
   }
 
@@ -2495,9 +2767,13 @@ const generateOntologyGuide = async (autoApply = false) => {
   guideRunMessage.value = autoApply ? '正在生成并应用结果，请稍候…' : '正在生成建议，请稍候…'
   try {
     const res = await graphApi.generateOntologyGuide(currentDomainId.value, {
+      generation_mode: guideForm.generation_mode,
+      base_blueprint_id: guideForm.generation_mode === 'data_enrichment' ? guideForm.base_blueprint_id : null,
+      document_generation_phase: guideForm.generation_mode === 'document_first' ? documentPhase : 'ontology',
+      design_blueprint_id: guideForm.generation_mode === 'document_first' && documentPhase === 'ontology' ? documentDesignBlueprintId.value : null,
       generation_strategy: guideForm.generation_strategy,
       business_scenario: guideForm.business_scenario || null,
-      semantic_type_code: guideForm.generation_strategy === 'llm_first' ? (guideForm.semantic_type_code || null) : null,
+      semantic_type_code: guideForm.semantic_type_code || null,
       source_id: guideForm.table_source_mode === 'database' ? guideForm.source_id : null,
       schema: guideForm.table_source_mode === 'database' ? (guideForm.schema || null) : null,
       table_source_mode: guideForm.table_source_mode,
@@ -2522,6 +2798,7 @@ const generateOntologyGuide = async (autoApply = false) => {
         ...postPayload,
         apply_result: postPayload?.apply_result || null,
       }
+      if (postPayload.generation_phase === 'design') documentDesignBlueprintId.value = postPayload.blueprint_id || ''
     }
 
     try {
@@ -2529,13 +2806,17 @@ const generateOntologyGuide = async (autoApply = false) => {
       if (hasGuidePreviewContent(latestPreview)) {
         guidePreview.value = {
           ...latestPreview,
+          generation_phase: latestPreview.generation_phase || postPayload.generation_phase,
           apply_result: res.data?.apply_result || null,
         }
+        if (guidePreview.value.generation_phase === 'design') documentDesignBlueprintId.value = guidePreview.value.blueprint_id || documentDesignBlueprintId.value
         if (canEnterGuideStep(2)) {
           guideStep.value = 2
         }
         guideRunState.value = 'success'
-        guideRunMessage.value = `已生成预览：实体 ${guidePreview.value?.entities?.length || 0} 个，关系 ${guidePreview.value?.relations?.length || 0} 条。`
+        guideRunMessage.value = isDocumentDesignPreview.value
+          ? '高层本体设计文档已生成，请确认后再生成本体对象。'
+          : `已生成预览：实体 ${guidePreview.value?.entities?.length || 0} 个，关系 ${guidePreview.value?.relations?.length || 0} 条。`
       } else if (!hasGuidePreviewContent(guidePreview.value)) {
         guideRunState.value = 'warning'
         guideRunMessage.value = '已生成成功，但最新预览结果为空，请稍后重试刷新预览。'
@@ -2615,7 +2896,15 @@ const reloadGuidePreview = async () => {
 }
 
 const generateOntologyGuidePreview = async () => {
-  await generateOntologyGuide(false)
+  await generateOntologyGuide(false, guideForm.generation_mode === 'document_first' ? 'design' : 'ontology')
+}
+
+const confirmDocumentDesign = async () => {
+  if (!documentDesignBlueprintId.value) {
+    ElMessage.warning('本体设计文档标识缺失，请重新生成设计文档')
+    return
+  }
+  await generateOntologyGuide(false, 'ontology')
 }
 
 const applyOntologyGuide = async () => {
@@ -2638,14 +2927,15 @@ const applyOntologyGuide = async () => {
         relations: guidePreview.value?.relations || [],
       },
       overwrite_existing: guideForm.overwrite_existing,
+      logical_only: guideForm.generation_mode === 'document_first',
     })
     guidePreview.value = {
       ...guidePreview.value,
-      blueprint_status: 'APPLIED',
+      blueprint_status: guideForm.generation_mode === 'document_first' ? 'LOGICAL_CONFIRMED' : 'APPLIED',
       apply_result: res.data?.apply_result,
     }
     guideRunState.value = 'success'
-    guideRunMessage.value = `已应用当前预览：新增实体 ${res.data?.apply_result?.entities?.created || 0} 个，新增关系 ${res.data?.apply_result?.relations?.created || 0} 条。`
+    guideRunMessage.value = `${guideForm.generation_mode === 'document_first' ? '逻辑本体已确认' : '已应用当前预览'}：新增实体 ${res.data?.apply_result?.entities?.created || 0} 个，新增关系 ${res.data?.apply_result?.relations?.created || 0} 条。`
     await loadGraphData()
     ElMessage.success(
       `已应用当前预览：新增实体 ${res.data?.apply_result?.entities?.created || 0} 个，新增关系 ${res.data?.apply_result?.relations?.created || 0} 条`
@@ -3225,6 +3515,11 @@ onBeforeUnmount(() => {
 .toolbar { display: flex; gap: 8px; padding: 8px 0; align-items: center; flex-shrink: 0; }
 .graph-zoom-tools { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; padding-left: 8px; border-left: 1px solid #dcdfe6; }
 .graph-zoom-value { min-width: 46px; text-align: center; color: #4f647b; font-size: 12px; font-variant-numeric: tabular-nums; }
+.data-support-legend { display: inline-flex; align-items: center; gap: 10px; margin-left: 4px; padding-left: 8px; border-left: 1px solid #dcdfe6; color: #61748b; font-size: 12px; white-space: nowrap; }
+.data-support-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.legend-dot.is-supported { background: #2f9e73; }
+.legend-dot.is-logical { background: #7b8798; }
 .drag-hint { font-size: 12px; color: #999; margin-left: 8px; }
 .graph-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .flow-container { flex: 1; display: flex; flex-direction: column; overflow: auto; }
@@ -3260,6 +3555,10 @@ onBeforeUnmount(() => {
 .guide-banner-empty { color: #999; font-weight: 400; }
 .guide-banner-desc { margin: 8px 0 0; font-size: 12px; line-height: 1.7; color: #60748b; }
 .guide-banner-side { display: flex; align-items: center; gap: 10px; white-space: nowrap; font-size: 12px; color: #4d647f; }
+.guide-mode-entry { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; padding: 28px 30px; background: linear-gradient(135deg, #f7fbff 0%, #f0f6ff 100%); border: 1px solid #d6e5ff; border-radius: 12px; }
+.guide-mode-entry-title { font-size: 18px; font-weight: 600; color: #1a3a5c; }
+.guide-mode-entry-desc, .guide-mode-entry-hint { font-size: 13px; line-height: 1.7; color: #627993; }
+.guide-mode-entry-hint { max-width: 760px; padding: 10px 12px; background: rgba(255, 255, 255, .75); border-radius: 8px; }
 .guide-steps-shell { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; background: linear-gradient(135deg, #fffdf7 0%, #fff9ef 100%); border: 1px solid #f0dec3; border-radius: 12px; }
 .guide-steps-nav { display: flex; flex-wrap: wrap; gap: 10px; }
 .guide-step-chip { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; border: 1px solid #d8e3f0; background: #fff; color: #6b7d92; font-size: 12px; cursor: pointer; transition: all .18s ease; }
@@ -3271,6 +3570,7 @@ onBeforeUnmount(() => {
 .guide-step-label { font-weight: 600; }
 .guide-step-caption { font-size: 12px; color: #7a6b4f; line-height: 1.7; }
 .guide-toolbar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; align-items: center; }
+.guide-stage-selector { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr); gap: 12px; align-items: center; padding: 12px 14px; margin-bottom: 12px; background: #f6f9fd; border: 1px solid #dfe9f5; border-radius: 10px; }
 .guide-toolbar-item { width: 100%; }
 .guide-step-body { display: flex; flex-direction: column; gap: 14px; }
 .guide-layout { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.9fr); gap: 14px; min-height: 360px; }
@@ -3368,6 +3668,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1100px) {
   .guide-toolbar,
+  .guide-stage-selector,
   .guide-layout,
   .guide-preview-grid,
   .natural-adjust-grid {

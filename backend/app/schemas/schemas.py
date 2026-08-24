@@ -659,9 +659,13 @@ class OntologyGuideGenerateRequest(BaseModel):
     schema: Optional[str] = None
     table_source_mode: str = "database"
     generation_strategy: Optional[str] = "structured_domain_pipeline"
+    generation_mode: str = "integrated"  # document_first / data_enrichment / integrated
+    base_blueprint_id: Optional[str] = None
+    document_generation_phase: str = "ontology"  # design / ontology
+    design_blueprint_id: Optional[str] = None
     business_scenario: Optional[str] = None
     semantic_type_code: Optional[str] = None
-    relation_tables: List[str]
+    relation_tables: List[str] = []
     rule_table_name: Optional[str] = None
     table_bindings: List[OntologyGuideTableBinding] = []
     ddl_tables: List[OntologyGuideDDLTable] = []
@@ -681,6 +685,7 @@ class OntologyGuideApplyRequest(BaseModel):
     blueprint_id: Optional[str] = None
     blueprint: dict
     overwrite_existing: bool = False
+    logical_only: bool = False
 
 
 class OntologyNaturalAdjustRequest(BaseModel):

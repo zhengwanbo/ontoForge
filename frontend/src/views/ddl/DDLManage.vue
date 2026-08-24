@@ -121,6 +121,26 @@
       :title="`有 ${relationWarnings.length} 条关系缺少可验证 Join，未生成边表：${relationWarnings.map(item => item.relation_name).join('、')}`"
     />
 
+    <el-card v-if="ddlValidationIssues.length" class="ddl-validation-card" shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>DDL 生成前校验问题</span>
+          <el-tag type="danger" size="small">{{ ddlValidationIssues.length }} 项需修复</el-tag>
+        </div>
+      </template>
+      <div class="validation-intro">以下问题会阻止生成可执行的节点、边或属性图 DDL。点击“去修复”可直接进入对应的数据映射配置。</div>
+      <el-table :data="ddlValidationIssues" border stripe size="small" max-height="360">
+        <el-table-column prop="scope" label="类型" width="90">
+          <template #default="{ row }"><el-tag :type="row.scope === 'RELATION' ? 'warning' : 'danger'" size="small">{{ row.scope === 'RELATION' ? '关系' : '实体' }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="title" label="错误位置" min-width="220" />
+        <el-table-column prop="message" label="具体错误" min-width="420" />
+        <el-table-column label="操作" width="155" fixed="right">
+          <template #default="{ row }"><el-button type="primary" link @click="navigateToValidationIssue(row)">{{ row.action_label || '去修复' }}</el-button></template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <div v-if="ddlContent" class="ddl-content">
       <div class="ddl-stats">
         <el-descriptions :column="4" border size="small">
@@ -295,11 +315,13 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { domainApi, ddlApi, sourceApi } from '../../api'
 import { useAppStore } from '../../stores/app'
 
 const appStore = useAppStore()
+const router = useRouter()
 const currentDomainId = ref(appStore.currentDomainId || '')
 const domains = ref<any[]>([])
 const ontologyEntities = ref<any[]>([])
@@ -308,6 +330,7 @@ const latestBlueprint = ref<any>(null)
 const ddlContent = ref('')
 const ddlStatements = ref<any[]>([])
 const relationWarnings = ref<any[]>([])
+const ddlValidationIssues = ref<any[]>([])
 const ddlStats = ref<any>({ entityCount: 0, relationCount: 0, blueprintVersion: '' })
 const ddlLogs = ref<any[]>([])
 const targetDataSources = ref<any[]>([])
@@ -471,6 +494,7 @@ const handleDomainChange = async () => {
   ddlStatements.value = []
   ddlStats.value = { entityCount: 0, relationCount: 0, blueprintVersion: '' }
   relationWarnings.value = []
+  ddlValidationIssues.value = []
   executeForm.value.target_source_id = ''
   await Promise.all([reloadDomainContext(), loadTargetDataSources()])
 }
@@ -484,11 +508,8 @@ const generateDDL = async () => {
     ElMessage.warning('当前分析域下没有本体对象，无法生成DDL')
     return
   }
-  if (hasEntitySourceGap.value) {
-    ElMessage.warning('存在未配置源数据映射的实体，请先在数据映射中确认属性映射或维护实体级 view_sql')
-    return
-  }
   generateLoading.value = true
+  ddlValidationIssues.value = []
   try {
     const res = await ddlApi.generate(currentDomainId.value)
     ddlContent.value = res.data?.full_ddl || ''
@@ -505,10 +526,23 @@ const generateDDL = async () => {
     }
     ElMessage.success('DDL生成完成')
   } catch (e: any) {
-    ElMessage.error(e?.message || 'DDL生成失败')
+    const detail = e?.response?.data?.detail
+    if (Array.isArray(detail?.issues)) {
+      ddlValidationIssues.value = detail.issues
+      ElMessage.warning(detail.message || `DDL 生成前校验发现 ${detail.issues.length} 个问题`)
+    } else {
+      ElMessage.error(typeof detail === 'string' ? detail : (e?.message || 'DDL生成失败'))
+    }
   } finally {
     generateLoading.value = false
   }
+}
+
+const navigateToValidationIssue = (issue: any) => {
+  const target = issue?.navigate_to || {}
+  const query = { ...(target.query || {}) } as Record<string, string>
+  if (currentDomainId.value) query.domain_id = currentDomainId.value
+  router.push({ path: target.path || '/mapping/manage', query })
 }
 
 const showExecuteDialog = () => {
@@ -664,6 +698,17 @@ onBeforeUnmount(stopExecutionPolling)
 .context-card,
 .ddl-content {
   min-width: 0;
+}
+
+.ddl-validation-card {
+  margin: 12px 0;
+  border-color: #f3c6c6;
+}
+
+.validation-intro {
+  margin: 0 0 12px;
+  color: #8a3b3b;
+  font-size: 13px;
 }
 
 .card-header {

@@ -24,7 +24,30 @@
       >
         <el-option v-for="schema in schemaOptions" :key="schema" :label="schema" :value="schema" />
       </el-select>
+      <el-button type="warning" plain :loading="ddlReadinessChecking" :disabled="!currentDomainId" @click="checkDdlReadiness">
+        映射关系检查
+      </el-button>
     </div>
+
+    <el-card v-if="ddlReadinessIssues.length" class="ddl-readiness-card" shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>映射关系检查结果</span>
+          <el-tag type="danger" size="small">{{ ddlReadinessIssues.length }} 项待修复</el-tag>
+        </div>
+      </template>
+      <div class="ddl-readiness-intro">检查标准与 DDL 生成一致。请逐项确认实体主键、属性来源、边表名以及关系 Join / 关系表配置。</div>
+      <el-table :data="ddlReadinessIssues" border stripe size="small" max-height="320">
+        <el-table-column label="类型" width="88">
+          <template #default="{ row }"><el-tag size="small" :type="row.scope === 'RELATION' ? 'warning' : 'danger'">{{ row.scope === 'RELATION' ? '关系' : '实体' }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="title" label="问题位置" min-width="210" />
+        <el-table-column prop="message" label="问题说明" min-width="400" />
+        <el-table-column label="操作" width="140" fixed="right">
+          <template #default="{ row }"><el-button type="primary" link @click="focusDdlReadinessIssue(row)">{{ row.action_label || '定位并修改' }}</el-button></template>
+        </el-table-column>
+      </el-table>
+    </el-card>
 
     <div v-if="currentEntityId" class="mapping-content">
       <el-alert
@@ -536,6 +559,9 @@ const saveLoading = ref(false)
 const relationSaveLoading = ref(false)
 const showOnlyManualReview = ref(false)
 const lastSavedSnapshot = ref('')
+const ddlReadinessChecking = ref(false)
+const ddlReadinessIssues = ref<any[]>([])
+const focusedRelationFromCheck = ref('')
 
 const mappedCount = computed(() => mappingTable.value.filter(row => row.source_table && row.source_column).length)
 const totalPropertyCount = computed(() => mappingTable.value.length)
@@ -579,7 +605,13 @@ const manualReviewRelationCount = computed(() => relationMappingTable.value.filt
 const visibleMappingRows = computed(() => showOnlyManualReview.value ? mappingTable.value.filter(needsPropertyReview) : mappingTable.value)
 const visibleRelationRows = computed(() => showOnlyManualReview.value ? relationMappingTable.value.filter(needsRelationReview) : relationMappingTable.value)
 const mappingRowClassName = ({ row }: { row: MappingRow }) => needsPropertyReview(row) ? 'manual-review-row' : ''
-const relationRowClassName = ({ row }: { row: RelationMappingRow }) => needsRelationReview(row) ? 'manual-review-row' : ''
+const focusedRelationId = computed(() => focusedRelationFromCheck.value || (typeof route.query.relation_id === 'string' ? route.query.relation_id : ''))
+const relationRowClassName = ({ row }: { row: RelationMappingRow }) => {
+  const classes = []
+  if (needsRelationReview(row)) classes.push('manual-review-row')
+  if (focusedRelationId.value && row.relation_id === focusedRelationId.value) classes.push('ddl-validation-focus-row')
+  return classes.join(' ')
+}
 const currentEntitySourceTables = computed(() => Array.from(new Set(
   mappingTable.value
     .filter(row => row.source_table && row.source_column && ['DIRECT', 'COMPUTED'].includes((row.mapping_type || '').toUpperCase()))
@@ -986,10 +1018,39 @@ const handleDomainChange = async () => {
   currentEntityId.value = ''
   mappingTable.value = []
   syncSnapshot()
+  ddlReadinessIssues.value = []
+  focusedRelationFromCheck.value = ''
   await loadEntities()
   await loadMappingGraph()
   if (entities.value.length > 0) {
     currentEntityId.value = entities.value[0].entity_id
+    await handleEntityChange()
+  }
+}
+
+const checkDdlReadiness = async () => {
+  if (!currentDomainId.value) return
+  ddlReadinessChecking.value = true
+  try {
+    const res = await mappingApi.checkDdlReadiness(currentDomainId.value)
+    ddlReadinessIssues.value = res.data?.issues || []
+    if (!ddlReadinessIssues.value.length) {
+      ElMessage.success('映射关系检查通过，当前配置满足 DDL 生成要求')
+    } else {
+      ElMessage.warning(`检查发现 ${ddlReadinessIssues.value.length} 个问题，请逐项确认修改`)
+    }
+  } catch (e: any) {
+    ElMessage.error(e?.message || '映射关系检查失败')
+  } finally {
+    ddlReadinessChecking.value = false
+  }
+}
+
+const focusDdlReadinessIssue = async (issue: any) => {
+  const entityId = issue?.entity_id || issue?.source_entity_id || issue?.target_entity_id
+  focusedRelationFromCheck.value = issue?.relation_id || ''
+  if (entityId && entities.value.some(entity => entity.entity_id === entityId)) {
+    currentEntityId.value = entityId
     await handleEntityChange()
   }
 }
@@ -1556,6 +1617,17 @@ onMounted(async () => {
   margin-bottom: 14px;
 }
 
+.ddl-readiness-card {
+  margin: 14px 0;
+  border-color: #f3c6c6;
+}
+
+.ddl-readiness-intro {
+  margin: 0 0 12px;
+  color: #8a3b3b;
+  font-size: 13px;
+}
+
 .manual-review-hint {
   margin-top: 6px;
   color: #a36a00;
@@ -1565,6 +1637,11 @@ onMounted(async () => {
 
 :deep(.el-table .manual-review-row > td.el-table__cell) {
   background: #fff8e6 !important;
+}
+
+:deep(.el-table .ddl-validation-focus-row > td.el-table__cell) {
+  background: #fff1f0 !important;
+  box-shadow: inset 0 1px #f56c6c, inset 0 -1px #f56c6c;
 }
 
 .ontology-node {

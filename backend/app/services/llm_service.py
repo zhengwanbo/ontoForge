@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
@@ -1116,6 +1116,11 @@ class LLMService:
             return value.isoformat(sep=" ", timespec="seconds")
         if isinstance(value, date):
             return value.isoformat()
+        if isinstance(value, timedelta):
+            # Oracle INTERVAL values may be returned as timedelta instances in
+            # source-table samples.  They are prompt data, so preserve a stable
+            # readable value instead of letting json.dumps abort graph design.
+            return str(value)
         if isinstance(value, Decimal):
             return float(value) if value.as_tuple().exponent < 0 else int(value)
         if isinstance(value, bytes):
@@ -1344,18 +1349,32 @@ class LLMService:
         table_roles: List[Dict[str, Any]],
         semantic_patterns: Optional[List[Dict[str, Any]]] = None,
         config_id: Optional[str] = None,
+        document_only: bool = False,
+        manufacturing_defect_mode: bool = False,
     ) -> Dict[str, Any]:
         config = self._get_config_by_id(config_id) if config_id else self._get_default_config()
         if config_id and not config:
             raise ValueError("所选大模型配置不存在或未启用")
 
+        entity_scope_instruction = (
+            "文档先行时，完整覆盖业务文档已明确提及的对象，并补充由业务事件、生命周期、层级、指标、规则和案例语义能够合理推断的对象；不得因“MVP”而任意省略。"
+            if document_only else "只生成设计文档中明确纳入首期范围的实体，除非某个缺失实体是支撑这些核心实体落地所必需的最小补充对象。"
+        )
+        domain_rule_instruction = (
+            "如果 rule_summary.has_concrete_rule_data = true，必须优先依据其中给出的缺陷识别范围、规格族、指标名和上下限语义来设计缺陷相关实体，不要退回泛化命名。"
+            if manufacturing_defect_mode else "如提供了规则摘要，应按当前业务语义理解其中的业务口径、目标、状态或评价规则，不得套用其他领域模板。"
+        )
+        master_table_instruction = (
+            "文档先行不依赖源表；不得因缺少表结构而缩减业务对象。"
+            if document_only else "表名含 WAREHOUSE、STORE、RETAIL 且具有主键的表是默认主数据实体；即使设计文档遗漏，也必须生成对应候选。"
+        )
         system_prompt = """你是一个资深企业本体架构师，当前只负责“实体候选与属性候选”的发现，不负责最终关系生成。
 
 你的任务：
 1. 优先阅读“高层本体/图谱设计文档”，并把它视为本次实体范围的第一约束。
 2. 再结合业务摘要、规则摘要（如有）、表角色识别结果，以及当前批次源表结构补充实体细节。
-3. 只生成设计文档中明确纳入首期范围的实体，除非某个缺失实体是支撑这些核心实体落地所必需的最小补充对象。
-4. 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的表是默认主数据实体；即使设计文档遗漏，也必须生成对应候选。
+3. __ENTITY_SCOPE_INSTRUCTION__
+4. __ENTITY_MASTER_TABLE_INSTRUCTION__
 5. 优先抽取稳定业务实体，不要把纯中间宽表直接当成业务实体。
 6. 为每个候选实体给出必要核心属性，属性数量保持克制。
 7. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
@@ -1388,7 +1407,7 @@ class LLMService:
       ]
     }
   ]
-}"""
+}""".replace("__ENTITY_SCOPE_INSTRUCTION__", entity_scope_instruction).replace("__ENTITY_MASTER_TABLE_INSTRUCTION__", master_table_instruction)
 
         prompt_payload = {
             "domain_name": getattr(domain, "domain_name", ""),
@@ -1410,9 +1429,9 @@ class LLMService:
 - 生成实体名称，实体属性，以及实体之间的关系。
 - candidateLevel 只能使用 HIGH / MEDIUM / LOW。
 - 优先抽取业务语义稳定、能承接后续映射和图谱构建的实体。
-- 如果 rule_summary.has_concrete_rule_data = true，必须优先依据其中给出的缺陷识别范围、规格族、指标名和上下限语义来设计缺陷相关实体，不要退回泛化命名。
-- 严格遵循"ontology_design_document"中定义的范围和优先对象，不要因为源表字段多而扩张设计边界。
-- 每个属性都应尽量提供来源于源数据表的属性级来源线索；如果无法明确来源，不要生成该属性。
+- {domain_rule_instruction}
+- {'文档先行时，以业务文档覆盖为准：保留设计文档中的全部对象，并可补充有明确业务依据的对象；不要凭空扩展无文档依据的技术对象。' if document_only else '严格遵循"ontology_design_document"中定义的范围和优先对象，不要因为源表字段多而扩张设计边界。'}
+- {'当前为文档先行逻辑设计：不得虚构来源表、字段、Join 或 SQL；sourceHints/sourceTable/sourceColumn 可为空，属性应表达业务语义、候选业务标识和口径。' if document_only else '每个属性都应尽量提供来源于源数据表的属性级来源线索；如果无法明确来源，不要生成该属性。'}
 - 如果当前批次只覆盖部分表，也先输出当前能确认的实体候选。
 - 返回严格 JSON。"""
 
@@ -1459,24 +1478,32 @@ class LLMService:
         relation_tables: List[Dict[str, Any]],
         semantic_patterns: Optional[List[Dict[str, Any]]] = None,
         config_id: Optional[str] = None,
+        document_only: bool = False,
+        manufacturing_defect_mode: bool = False,
     ) -> Dict[str, Any]:
         config = self._get_config_by_id(config_id) if config_id else self._get_default_config()
         if config_id and not config:
             raise ValueError("所选大模型配置不存在或未启用")
 
+        relation_scope_instruction = (
+            "文档先行时，完整覆盖文档明确关系，并在当前实体之间补充可由业务事件、流转、层级、状态变化、指标规则和处置闭环直接推断的关系。"
+            if document_only else "只在当前已识别的实体候选之间建立关系候选，并且优先保留设计文档中明确要求的首期核心关系。"
+        )
+        relation_domain_instruction = (
+            "如果业务摘要体现为缺陷/异常分析场景，可重点识别缺陷案例、超限规则、测量观察、测试会话、过程站位、设备工装、物料批次之间的关系。"
+            if manufacturing_defect_mode else "按当前业务语义识别主对象、业务事件、规则指标、资源、状态结果与处置对象之间的关系。"
+        )
+        relation_rule_instruction = (
+            "如果 rule_summary.has_concrete_rule_data = true，关系应明确服务于“规格判定 -> 超规指标 -> 缺陷事件/表型 -> 追溯对象”的链路，不要只输出泛化关系。"
+            if manufacturing_defect_mode else "如提供了规则摘要，关系应表达当前业务语义下的规则适用、指标评价、目标达成或业务处置链路。"
+        )
         system_prompt = """你是一个资深企业本体架构师，当前只负责“关系候选”的发现。
 
 你的任务：
 1. 优先阅读“高层本体/图谱设计文档”，并把它视为本次关系范围的第一约束。
 2. 再结合业务摘要、规则摘要（如有）、表角色识别结果、实体候选，以及当前批次源表结构。
-3. 只在当前已识别的实体候选之间建立关系候选，并且优先保留设计文档中明确要求的首期核心关系。
-4. 如果业务摘要体现为缺陷/异常分析场景，可重点识别：
-   - 缺陷案例与超限规则
-   - 缺陷案例与测量观察
-   - 测量观察与测试会话
-   - 测试会话与过程站位/设备/工装
-   - 缺陷案例与物料/批次/供应商
-   否则按通用业务语义识别主对象、过程对象、规则对象、资源对象和结果对象之间的关系。
+3. __RELATION_SCOPE_INSTRUCTION__
+4. __RELATION_DOMAIN_INSTRUCTION__
 5. 关系设计要保持简洁，只输出本次分析目标真正需要的关系。
 6. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
 
@@ -1497,7 +1524,7 @@ class LLMService:
       "edgeSql": "若已经能明确关系边来源SQL，填写返回 EDGE_ID/SOURCE_ID/TARGET_ID 的 Oracle SQL"
     }
   ]
-}"""
+}""".replace("__RELATION_SCOPE_INSTRUCTION__", relation_scope_instruction).replace("__RELATION_DOMAIN_INSTRUCTION__", relation_domain_instruction)
 
         prompt_payload = {
             "domain_name": getattr(domain, "domain_name", ""),
@@ -1520,13 +1547,13 @@ class LLMService:
 - 只生成 relation_candidates，不生成新的 entities。
 - relationType 只能使用 ONE_TO_ONE / ONE_TO_MANY / MANY_TO_MANY / INHERITANCE / ASSOCIATION。
 - candidateLevel 只能使用 HIGH / MEDIUM / LOW。
-- 如果 rule_summary.has_concrete_rule_data = true，关系应明确服务于“规格判定 -> 超规指标 -> 缺陷事件/表型 -> 追溯对象”的链路，不要只输出泛化关系。
+- {relation_rule_instruction}
 - 关系必须引用 entity_candidates 中已经存在的实体名。
 - relationName 必须使用中文、简短且直接表达源节点到目标节点的业务谓词：优先使用 2～6 个字，不要重复源实体或目标实体名称；完整业务语义写入 relationDesc。
-- 优先输出“判定”“产生”“参与”“执行”“归属”“包含”等简洁关系名；例如源节点为“规格规则”、目标节点为“超差事件”时使用“判定”，不要写“规格规则判定超差事件”。
+- 优先输出“判定”“产生”“参与”“执行”“归属”“包含”等简洁关系名；例如源节点为“营销活动”、目标节点为“客户”时使用“参与”，不要写“营销活动参与客户”。
 - 不要输出 hasXxx、belongsTo、occursOn、snake_case、camelCase 这类英文关系名。
-- 关系设计必须服务于后续 Oracle Graph 边表/edge_sql 落地，尽量补充 `sourceTable / targetTable / joinCondition / edgeSql` 草案；如果一时无法完整写出 `edgeSql`，也至少给出证据表和候选来源表线索。
-- 严格遵循 ontology_design_document 中定义的首期关系范围，关系数量保持克制，不要为了覆盖所有潜在线索而构造过于复杂的关系网络。
+- {'当前为文档先行逻辑设计：只输出业务关系、方向、基数与说明；不得虚构证据表、Join 或 edgeSql。' if document_only else '关系设计必须服务于后续 Oracle Graph 边表/edge_sql 落地，尽量补充 `sourceTable / targetTable / joinCondition / edgeSql` 草案；如果一时无法完整写出 `edgeSql`，也至少给出证据表和候选来源表线索。'}
+- {'文档先行时，不以首期 MVP 限制关系数量；应覆盖文档要求的业务关系，但不得凭空生成没有业务依据的关系。' if document_only else '严格遵循 ontology_design_document 中定义的首期关系范围，关系数量保持克制，不要为了覆盖所有潜在线索而构造过于复杂的关系网络。'}
 - 返回严格 JSON。"""
 
         result_text = await self.call_llm(
@@ -1559,27 +1586,45 @@ class LLMService:
         selected_table_schema: Dict[str, Any],
         rule_summary: Dict[str, Any],
         table_roles: List[Dict[str, Any]],
+        business_document: str = "",
         semantic_patterns: Optional[List[Dict[str, Any]]] = None,
         config_id: Optional[str] = None,
+        document_first: bool = False,
+        manufacturing_defect_mode: bool = False,
     ) -> Dict[str, Any]:
         config = self._get_config_by_id(config_id) if config_id else self._get_default_config()
         if config_id and not config:
             raise ValueError("所选大模型配置不存在或未启用")
 
+        design_instructions = {
+            "step1": "先完整阅读业务文档，识别文档要求覆盖的业务范围、对象、事件、规则、指标、状态、案例及其关系。" if document_first else "先阅读业务摘要，识别本次最小可行域（MVP）/ 首次切实可行范围。",
+            "step2": "再结合已选业务语义，推断文档虽未逐项列举但具有直接业务依据的对象和关系。" if document_first else "再结合规则摘要（如有）、表角色识别和源表结构，决定本次首期到底应该构建哪些实体、哪些关系。",
+            "step3": "本次输出是完整逻辑本体设计边界，不按 MVP 人为收缩；仅将确实缺乏业务依据或明显超出文档范围的项目放入 deferred。" if document_first else "本次输出的是高层设计文档，不是最终落库对象清单；重点是定义“做什么”和“先不做什么”。",
+            "step5": "设计应覆盖文档的完整业务语义，避免遗漏明确对象；不得因为尚无源表而删减逻辑对象。" if document_first else "设计必须切实可行，范围克制，避免因为源表很多或字段很多而扩张。",
+            "scope_field_hint": "文档完整覆盖范围的一句话说明" if document_first else "一句话描述本次最小可行域",
+            "master_table_instruction": "文档先行不依赖源表；不得因缺少表结构而缩减业务对象。" if document_first else "表名含 WAREHOUSE、STORE、RETAIL 且具有主键的已选业务主数据表，必须纳入 included_entities；不得静默省略。",
+            "rule_instruction": "如果 rule_summary.has_concrete_rule_data = true，应把这些规则数据视为缺陷识别依据，明确首期缺陷识别范围与相关对象，不要仅停留在通用对象层。" if manufacturing_defect_mode else "如提供规则摘要，应按照当前业务语义把规则理解为业务口径、评价目标、状态约束或处置依据。",
+        }
         system_prompt = """你是一个资深企业本体架构师，当前只负责“高层本体/图谱设计文档”的制定。
 
 你的任务：
-1. 先阅读业务摘要，识别本次最小可行域（MVP）/ 首次切实可行范围。
-2. 再结合规则摘要（如有）、表角色识别和源表结构，决定本次首期到底应该构建哪些实体、哪些关系。
-3. 本次输出的是高层设计文档，不是最终落库对象清单；重点是定义“做什么”和“先不做什么”。
-4. 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的已选业务主数据表，必须纳入 included_entities；不得静默省略。
-5. 设计必须切实可行，范围克制，避免因为源表很多或字段很多而扩张。
+1. __DESIGN_STEP1__
+2. __DESIGN_STEP2__
+3. __DESIGN_STEP3__
+4. __DESIGN_MASTER_TABLE_INSTRUCTION__
+5. __DESIGN_STEP5__
 6. 输出必须是严格 JSON，不要输出 Markdown，不要解释过程。
 
 输出格式：
 {
-  "mvp_scope": "一句话描述本次最小可行域",
+  "mvp_scope": "__DESIGN_SCOPE_FIELD_HINT__",
   "scope_reasoning": "为什么这样收敛",
+  "business_scope": {"goals": ["目标"], "boundaries": ["边界"], "out_of_scope": ["不在范围内容"]},
+  "core_object_definitions": [{"entityName": "英文名", "entityDisplayName": "中文名", "definition": "业务定义", "candidateBusinessKeys": ["候选业务标识"], "requiredAttributeSuggestions": ["必填逻辑属性"]}],
+  "logical_relationships": [{"sourceEntityName": "源对象", "targetEntityName": "目标对象", "relationName": "关系名", "direction": "源->目标", "cardinality": "ONE_TO_MANY", "businessMeaning": "业务含义", "basis": "文档依据或推断依据"}],
+  "lifecycle_event_metric_rule_terms": {"lifecycles": [], "events": [], "metrics": [], "rules": []},
+  "confirmation_items": {"confirmed": [], "pending": [], "assumptions": [], "missing_information": []},
+  "required_data_table_types": [{"tableType": "主数据/事件/规则/关系表", "purpose": "后续需要收集的原因", "example": "可选示例"}],
   "included_entities": [
     {
       "entityName": "英文实体名",
@@ -1605,10 +1650,15 @@ class LLMService:
     "后续实现建议"
   ]
 }"""
+        for placeholder, instruction in design_instructions.items():
+            system_prompt = system_prompt.replace(f"__DESIGN_{placeholder.upper()}__", instruction)
 
         prompt_payload = {
             "domain_name": getattr(domain, "domain_name", ""),
             "domain_desc": getattr(domain, "domain_desc", ""),
+            # 高层设计必须直接依据需求文档，不能只依赖规则化摘要；摘要会
+            # 丢失营销对象清单、关系说明和业务边界等关键信息。
+            "business_document_markdown": self._truncate_text((business_document or "").strip(), 16000),
             "business_summary": business_summary or {},
             "rule_summary": rule_summary or {},
             "table_roles": table_roles or [],
@@ -1622,13 +1672,18 @@ class LLMService:
 {json.dumps(prompt_payload, ensure_ascii=False, indent=2)}
 
 要求：
-- 输出本次切实可行的最小范围，不要贪多。
+- {'输出文档语义的完整逻辑范围，不按 MVP 进行压缩。' if document_first else '输出本次切实可行的最小范围，不要贪多。'}
 - 如果业务文档已经明确给出首期对象或关系建议，必须优先遵循。
-- 如果 rule_summary.has_concrete_rule_data = true，应把这些规则数据视为缺陷识别依据，明确首期缺陷识别范围与相关对象，不要仅停留在通用对象层。
+- __DESIGN_RULE_INSTRUCTION__
 - included_relations 中的 relationName 必须使用中文、简短的关系谓词（优先 2～6 个字），不要重复两端实体名称；完整说明写入 reason。不要使用 hasXxx / belongsTo / occursOn / camelCase / snake_case 之类英文关系名。
-- 如果某些对象理论上有价值但首期不必要，应放入 excluded_or_deferred。
-- 表名含 WAREHOUSE、STORE、RETAIL 且具有主键的已选业务表属于默认主数据实体，必须列入 included_entities。
+- {'只有与文档主题无关、缺乏业务依据的对象才放入 excluded_or_deferred；不要因为暂时没有表、字段或 DDL 而延后业务对象。' if document_first else '如果某些对象理论上有价值但首期不必要，应放入 excluded_or_deferred。'}
+- __DESIGN_MASTER_TABLE_INSTRUCTION__
 - 返回严格 JSON。"""
+        user_prompt = user_prompt.replace(
+            "__DESIGN_RULE_INSTRUCTION__", design_instructions["rule_instruction"]
+        ).replace(
+            "__DESIGN_MASTER_TABLE_INSTRUCTION__", design_instructions["master_table_instruction"]
+        )
 
         result_text = await self.call_llm(
             system_prompt,
@@ -1636,16 +1691,15 @@ class LLMService:
             config,
             timeout_override=max((config.timeout if config else 60), 180)
         )
-        normalized = self._normalize_ontology_design_document_result(self._extract_json_object(result_text))
+        raw_payload = self._extract_json_object(result_text)
+        normalized = self._normalize_ontology_design_document_result(raw_payload)
         if not normalized:
-            normalized = {
-                "mvp_scope": "围绕当前业务摘要中的核心对象和关键过程构建首期本体。",
-                "scope_reasoning": "未获得稳定设计文档输出，回退为最小化默认范围。",
-                "included_entities": [],
-                "included_relations": [],
-                "excluded_or_deferred": [],
-                "implementation_notes": [],
-            }
+            normalized = self._build_ontology_design_document_fallback(
+                business_document=business_document,
+                domain_name=getattr(domain, "domain_name", "") or "当前业务分析域",
+            )
+            provider_error = str((raw_payload or {}).get("error") or "").strip()
+            normalized["generation_error"] = provider_error or "模型未返回符合高层本体设计格式的 JSON 内容。"
             generation_mode = "fallback"
         else:
             generation_mode = "llm"
@@ -1654,6 +1708,7 @@ class LLMService:
             **normalized,
             "generation_mode": generation_mode,
             "model": self._config_brief(config),
+            "llm_raw_output": result_text,
         }
 
     async def generate_semantic_deployment_design(
@@ -2855,6 +2910,18 @@ class LLMService:
         if not payload or not isinstance(payload, dict):
             return None
 
+        design_keys = {
+            "mvp_scope", "scope_reasoning", "business_scope", "core_object_definitions",
+            "logical_relationships", "lifecycle_event_metric_rule_terms", "confirmation_items",
+            "required_data_table_types", "included_entities", "included_relations",
+            "excluded_or_deferred", "implementation_notes",
+        }
+        # Do not treat a provider error/mock response such as {"mappings": []}
+        # as a valid design document. The old behaviour persisted an all-empty
+        # document and made the confirmation page look as though nothing happened.
+        if not any(key in payload for key in design_keys):
+            return None
+
         included_entities = []
         for item in payload.get("included_entities") or []:
             if not isinstance(item, dict):
@@ -2900,6 +2967,36 @@ class LLMService:
             if str(item).strip()
         ]
 
+        business_scope = payload.get("business_scope") if isinstance(payload.get("business_scope"), dict) else {}
+        if not any(business_scope.get(key) for key in ("goals", "boundaries", "out_of_scope")):
+            business_scope = {
+                "goals": [str(payload.get("mvp_scope") or "根据需求文档完成业务本体逻辑设计")],
+                "boundaries": [str(payload.get("scope_reasoning") or "以当前需求文档和所选业务语义为边界")],
+                "out_of_scope": [],
+            }
+        core_object_definitions = [item for item in (payload.get("core_object_definitions") or []) if isinstance(item, dict)]
+        if not core_object_definitions:
+            core_object_definitions = [
+                {
+                    "entityName": item.get("entityName"),
+                    "entityDisplayName": item.get("entityDisplayName") or item.get("entityName"),
+                    "definition": item.get("reason") or "文档明确或推断的核心业务对象",
+                    "candidateBusinessKeys": [],
+                    "requiredAttributeSuggestions": [],
+                }
+                for item in included_entities
+            ]
+        logical_relationships = [item for item in (payload.get("logical_relationships") or []) if isinstance(item, dict)]
+        if not logical_relationships:
+            logical_relationships = [
+                {
+                    "relationName": item.get("relationName"),
+                    "businessMeaning": item.get("reason") or "文档建议的业务关系",
+                    "basis": item.get("reason") or "需求文档",
+                }
+                for item in included_relations
+            ]
+
         return {
             "mvp_scope": (payload.get("mvp_scope") or "").strip(),
             "scope_reasoning": (payload.get("scope_reasoning") or "").strip(),
@@ -2907,6 +3004,51 @@ class LLMService:
             "included_relations": included_relations,
             "excluded_or_deferred": excluded_or_deferred,
             "implementation_notes": implementation_notes,
+            "business_scope": business_scope,
+            "core_object_definitions": core_object_definitions,
+            "logical_relationships": logical_relationships,
+            "lifecycle_event_metric_rule_terms": payload.get("lifecycle_event_metric_rule_terms") if isinstance(payload.get("lifecycle_event_metric_rule_terms"), dict) else {},
+            "confirmation_items": payload.get("confirmation_items") if isinstance(payload.get("confirmation_items"), dict) else {},
+            "required_data_table_types": [item for item in (payload.get("required_data_table_types") or []) if isinstance(item, dict)],
+        }
+
+    def _build_ontology_design_document_fallback(self, business_document: str, domain_name: str) -> Dict[str, Any]:
+        """Return a reviewable, non-empty design shell if an LLM response is unusable.
+
+        This deliberately does not invent entities or relationships. It preserves the
+        document outline and clearly identifies what still needs confirmation, so a
+        transient model/provider failure cannot silently become an empty design page.
+        """
+        raw_lines = [line.strip() for line in (business_document or "").splitlines() if line.strip()]
+        outline = [re.sub(r"^(#{1,6}\s*|[-*+]\s*)", "", line).strip() for line in raw_lines[:12]]
+        outline = [line for line in outline if line]
+        scope = f"依据《{domain_name}》需求文档进行业务本体逻辑设计"
+        return {
+            "mvp_scope": scope,
+            "scope_reasoning": "本次未获得可解析的大模型设计结果，已保留需求文档范围供人工确认；请检查模型配置或重新生成。",
+            "business_scope": {
+                "goals": ["根据需求文档识别核心业务对象、事件、指标、规则与关系"],
+                "boundaries": outline[:6] or ["以已上传需求文档为准"],
+                "out_of_scope": ["尚未提供数据表、字段、关系表或规则数据的物理映射与 SQL 实现"],
+            },
+            "core_object_definitions": [],
+            "logical_relationships": [],
+            "lifecycle_event_metric_rule_terms": {"lifecycles": [], "events": [], "metrics": [], "rules": []},
+            "confirmation_items": {
+                "confirmed": ["已读取并保留上传的需求文档"],
+                "pending": ["请重新生成高层本体设计文档，或检查大模型配置与返回格式"],
+                "assumptions": [],
+                "missing_information": ["需要大模型成功返回对象、关系、事件、指标和规则的结构化设计"],
+            },
+            "required_data_table_types": [
+                {"tableType": "主数据", "purpose": "承载稳定业务主体及其业务标识", "example": "产品、客户、组织、门店等"},
+                {"tableType": "业务事件/单据", "purpose": "承载业务过程、状态和时间序列", "example": "订单、活动、出入库、扫码等"},
+                {"tableType": "关系表/规则表", "purpose": "在数据补全阶段提供明确关联与业务口径", "example": "对象关联、指标规则、状态规则等"},
+            ],
+            "included_entities": [],
+            "included_relations": [],
+            "excluded_or_deferred": [],
+            "implementation_notes": ["当前为模型返回异常后的设计壳，不应直接据此生成本体对象。"],
         }
 
     def _resolve_ontology_entity_name(

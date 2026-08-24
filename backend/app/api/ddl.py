@@ -99,7 +99,7 @@ def _run_ddl_execution_task(
     skip_existing: bool,
 ) -> None:
     """Run a DDL task outside the request worker and persist its final result."""
-    from app.services.ddl_service import DDLService
+    from app.services.ddl_service import DDLService, DDLPreflightValidationError
 
     task_db = SessionLocal()
     started_at = time.time()
@@ -417,7 +417,7 @@ async def generate_ddl(
 ):
     ensure_domain_access(db, current_user, domain_id)
     """调用LLM生成DDL"""
-    from app.services.ddl_service import DDLService
+    from app.services.ddl_service import DDLService, DDLPreflightValidationError
 
     # Get domain data
     domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
@@ -444,6 +444,14 @@ async def generate_ddl(
     ddl_service = DDLService(db)
     try:
         ddl_result = await ddl_service.generate_ddl(domain, entities, relations)
+    except DDLPreflightValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "DDL 生成前校验未通过，请按下列定位逐项修复。",
+                "issues": exc.issues,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not (ddl_result.get("ddl_statements") or []):

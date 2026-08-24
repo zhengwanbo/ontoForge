@@ -46,6 +46,30 @@ class OntologyGuidePromptCompactionTest(unittest.TestCase):
             },
         )
 
+    def test_integrated_generation_marks_all_entities_and_relations_mapping_ready(self) -> None:
+        result = {
+            "selected_tables": ["MD_PRODUCT", "TRD_ORDER"],
+            "entities": [{
+                "entityName": "Product",
+                "properties": [{"propertyName": "product_id"}],
+            }],
+            "relations": [{
+                "relationName": "订购",
+                "sourceEntityName": "Order",
+                "targetEntityName": "Product",
+            }],
+            "source_role_bindings": [],
+            "semantic_patterns": [],
+        }
+
+        self.guide_service._annotate_integrated_generation_support(result)
+
+        self.assertEqual("DATA_SUPPORTED", result["entities"][0]["data_support_status"])
+        self.assertEqual("DATA_SUPPORTED", result["entities"][0]["properties"][0]["data_support_status"])
+        self.assertEqual("DATA_SUPPORTED", result["relations"][0]["data_support_status"])
+        self.assertEqual(1, result["data_support"]["data_supported_entity_count"])
+        self.assertEqual(1, result["data_support"]["data_supported_relation_count"])
+
     def test_llm_selected_schema_omits_empty_table_and_column_metadata(self) -> None:
         schema = self.guide_service._build_selected_table_schema(
             [{
@@ -127,6 +151,51 @@ class OntologyGuidePromptCompactionTest(unittest.TestCase):
 
         self.assertEqual(name, "产生")
         self.assertLessEqual(len(name), 12)
+
+    def test_design_document_normalizer_rejects_unrelated_mock_payload(self) -> None:
+        self.assertIsNone(
+            self.llm_service._normalize_ontology_design_document_result({"mappings": []})
+        )
+
+    def test_design_document_fallback_is_reviewable(self) -> None:
+        fallback = self.llm_service._build_ontology_design_document_fallback(
+            "# 营销需求\n\n## 活动管理\n\n需要分析促销活动效果。",
+            "营销分析域",
+        )
+
+        self.assertTrue(fallback["business_scope"]["goals"])
+        self.assertTrue(fallback["business_scope"]["boundaries"])
+        self.assertTrue(fallback["confirmation_items"]["pending"])
+        self.assertEqual(3, len(fallback["required_data_table_types"]))
+
+    def test_data_enrichment_support_keeps_logical_entities_and_marks_evidence(self) -> None:
+        entities = [
+            {
+                "entityName": "Product",
+                "sourceHints": ["MD_PRODUCT"],
+                "properties": [{"propertyName": "product_id", "sourceTable": "MD_PRODUCT", "sourceColumn": "PRODUCT_ID"}],
+            },
+            {"entityName": "Campaign", "sourceHints": [], "properties": [{"propertyName": "campaign_name"}]},
+        ]
+        relations = [{
+            "sourceEntityName": "Product",
+            "targetEntityName": "Campaign",
+            "relationName": "参与",
+            "evidenceTables": ["TRD_PROMOTION"],
+            "sourceTable": "MD_PRODUCT",
+            "targetTable": "TRD_PROMOTION",
+            "joinCondition": "src.PRODUCT_ID = dst.PRODUCT_ID",
+        }]
+
+        support = self.guide_service._annotate_data_enrichment_support(
+            entities, relations, ["MD_PRODUCT", "TRD_PROMOTION"]
+        )
+
+        self.assertEqual("DATA_SUPPORTED", entities[0]["data_support_status"])
+        self.assertEqual("LOGICAL_ONLY", entities[1]["data_support_status"])
+        self.assertEqual("LOGICAL_ONLY", relations[0]["data_support_status"])
+        self.assertEqual(1, support["data_supported_entity_count"])
+        self.assertEqual(1, support["logical_only_entity_count"])
 
     def test_preserves_selected_warehouse_and_store_master_candidates(self) -> None:
         schema = {

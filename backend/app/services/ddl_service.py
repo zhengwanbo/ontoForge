@@ -8,6 +8,14 @@ from app.services.llm_service import LLMService
 from app.services.source_data_service import SourceDataService
 
 
+class DDLPreflightValidationError(ValueError):
+    """DDL generation is blocked by fixable ontology or mapping issues."""
+
+    def __init__(self, issues: List[Dict[str, Any]]):
+        self.issues = issues
+        super().__init__(f"DDL 生成前校验发现 {len(issues)} 个需要修复的配置问题")
+
+
 class DDLService:
     def __init__(self, db: Session):
         self.db = db
@@ -19,16 +27,9 @@ class DDLService:
         relations: List[SysOntologyRelation]
     ) -> Dict:
         """生成DDL"""
-        unnamed_relations = [
-            relation.relation_name or relation.relation_id
-            for relation in relations
-            if not (relation.relation_table_name or "").strip().upper().startswith("ONTO_EDGE_")
-        ]
-        if unnamed_relations:
-            raise ValueError(
-                "请先在数据映射管理中为每条关系填写唯一的英文边表名（如 BELONGS_TO）；"
-                f"尚未完成：{', '.join(unnamed_relations)}"
-            )
+        issues = self.validate_ddl_readiness(entities, relations)
+        if issues:
+            raise DDLPreflightValidationError(issues)
         blueprint_package = self._load_latest_blueprint(domain.domain_id)
         template_statements = self._generate_template_ddl(domain, entities, relations)
         relation_warnings = self._collect_relation_mapping_warnings(relations, entities)
@@ -78,6 +79,134 @@ class DDLService:
                 for entity in entities
             },
         }
+
+    def validate_ddl_readiness(
+        self,
+        entities: List[SysOntologyEntity],
+        relations: List[SysOntologyRelation],
+    ) -> List[Dict[str, Any]]:
+        """Collect all fixable DDL blockers with a navigation target for the UI."""
+        issues: List[Dict[str, Any]] = []
+        entity_by_id = {entity.entity_id: entity for entity in entities}
+
+        def entity_label(entity: SysOntologyEntity) -> str:
+            return entity.entity_display_name or entity.entity_name or entity.entity_id
+
+        def entity_issue(entity: SysOntologyEntity, code: str, message: str, action: str) -> None:
+            issues.append({
+                "code": code,
+                "scope": "ENTITY",
+                "entity_id": entity.entity_id,
+                "entity_name": entity.entity_name,
+                "entity_display_name": entity_label(entity),
+                "title": f"实体「{entity_label(entity)}」配置不完整",
+                "message": message,
+                "action_label": action,
+                "navigate_to": {"path": "/mapping/manage", "query": {"entity_id": entity.entity_id}},
+            })
+
+        for entity in entities:
+            primary_key = self._get_entity_primary_key(entity)
+            if not primary_key:
+                entity_issue(
+                    entity,
+                    "ENTITY_PRIMARY_KEY_MISSING",
+                    "未配置唯一主键属性。Oracle Property Graph 节点必须有稳定且唯一的业务主键。",
+                    "去本体关系构建设置 PK",
+                )
+            try:
+                self._build_entity_source_query(entity)
+            except ValueError as exc:
+                entity_issue(
+                    entity,
+                    "ENTITY_SOURCE_MAPPING_INVALID",
+                    str(exc),
+                    "去数据映射修复实体",
+                )
+
+        for relation in relations:
+            relation_name = relation.relation_name or relation.relation_id
+            source_entity = entity_by_id.get(relation.source_entity_id)
+            target_entity = entity_by_id.get(relation.target_entity_id)
+            navigation_entity = source_entity or target_entity
+
+            def relation_issue(code: str, message: str, action: str) -> None:
+                issues.append({
+                    "code": code,
+                    "scope": "RELATION",
+                    "relation_id": relation.relation_id,
+                    "relation_name": relation_name,
+                    "source_entity_id": relation.source_entity_id,
+                    "target_entity_id": relation.target_entity_id,
+                    "title": f"关系「{relation_name}」配置不完整",
+                    "message": message,
+                    "action_label": action,
+                    "navigate_to": {
+                        "path": "/mapping/manage",
+                        "query": {
+                            "entity_id": navigation_entity.entity_id if navigation_entity else "",
+                            "relation_id": relation.relation_id,
+                        },
+                    },
+                })
+
+            if not (relation.relation_table_name or "").strip().upper().startswith("ONTO_EDGE_"):
+                relation_issue(
+                    "RELATION_EDGE_NAME_MISSING",
+                    "未配置唯一英文边表名。请填写如 BELONGS_TO，系统将生成 ONTO_EDGE_BELONGS_TO。",
+                    "去数据映射配置边表名",
+                )
+            if not source_entity or not target_entity:
+                relation_issue(
+                    "RELATION_ENDPOINT_MISSING",
+                    "源实体或目标实体不存在，无法确定边表两端节点。",
+                    "去本体关系构建修复关系",
+                )
+                continue
+            source_key = self._get_entity_primary_key(source_entity)
+            target_key = self._get_entity_primary_key(target_entity)
+            if not source_key or not target_key:
+                missing = "、".join(
+                    label for label, key in ((entity_label(source_entity), source_key), (entity_label(target_entity), target_key)) if not key
+                )
+                relation_issue(
+                    "RELATION_ENDPOINT_PRIMARY_KEY_MISSING",
+                    f"关系两端节点必须各自配置唯一主键；缺少主键：{missing}。",
+                    "去本体关系构建设置 PK",
+                )
+                continue
+
+            mapping = relation.relation_mapping
+            mapping_mode = (getattr(mapping, "mapping_mode", None) or "DIRECT").upper()
+            if mapping_mode == "RELATION_TABLE":
+                missing_fields = [
+                    label for label, value in (
+                        ("关系证据表", getattr(mapping, "relation_table", "")),
+                        ("关系表→源节点字段", getattr(mapping, "relation_source_column", "")),
+                        ("关系表→目标节点字段", getattr(mapping, "relation_target_column", "")),
+                    ) if not (value or "").strip()
+                ]
+                if missing_fields:
+                    relation_issue(
+                        "RELATION_TABLE_MAPPING_INCOMPLETE",
+                        f"关系表模式缺少：{'、'.join(missing_fields)}。",
+                        "去数据映射补齐关系表",
+                    )
+            else:
+                raw_join = (getattr(mapping, "join_condition", None) or "").strip()
+                if not raw_join:
+                    relation_issue(
+                        "RELATION_JOIN_MISSING",
+                        "未配置已验证的业务 Join 条件；不能直接用两端节点主键作为 Join。",
+                        "去数据映射识别 Join",
+                    )
+                elif not self._build_relation_join_condition(relation, source_entity, target_entity, source_key, target_key):
+                    relation_issue(
+                        "RELATION_JOIN_INVALID",
+                        f"Join「{raw_join}」未能映射到两端节点已投影字段，请检查节点属性映射、src/dst 表和关联列。",
+                        "去数据映射修复 Join",
+                    )
+        return issues
 
     def _filter_to_required_object_views(
         self,

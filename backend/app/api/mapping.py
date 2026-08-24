@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from app.core.database import get_db, SessionLocal
 from app.core.auth import ensure_domain_access, get_current_user
 from app.core.logging import get_logger
@@ -23,6 +23,34 @@ from app.models.models import (
 
 router = APIRouter(prefix="/mapping", tags=["数据映射"])
 logger = get_logger(__name__)
+
+
+@router.post("/domains/{domain_id}/ddl-readiness-check", response_model=ApiResponse)
+async def check_mapping_ddl_readiness(
+    domain_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Run the same preflight checks used by DDL generation from mapping management."""
+    ensure_domain_access(db, current_user, domain_id)
+    entities = db.query(SysOntologyEntity).options(
+        selectinload(SysOntologyEntity.properties).selectinload(SysOntologyProperty.mapping),
+        selectinload(SysOntologyEntity.entity_mapping),
+    ).filter(SysOntologyEntity.domain_id == domain_id).all()
+    relations = db.query(SysOntologyRelation).options(
+        selectinload(SysOntologyRelation.relation_mapping),
+    ).filter(SysOntologyRelation.domain_id == domain_id).all()
+    from app.services.ddl_service import DDLService
+
+    issues = DDLService(db).validate_ddl_readiness(entities, relations)
+    return ApiResponse(
+        message="映射关系检查完成" if not issues else f"发现 {len(issues)} 个待修复问题",
+        data={
+            "ready": not issues,
+            "issue_count": len(issues),
+            "issues": issues,
+        },
+    )
 
 
 def _ensure_entity_access(db: Session, current_user: dict, entity: Optional[SysOntologyEntity]) -> None:
@@ -105,6 +133,26 @@ def _load_latest_blueprint_payload(db: Session, domain_id: str) -> Optional[dict
     return _serialize_blueprint_payload(latest)
 
 
+def _load_latest_data_enrichment_blueprint_payload(db: Session, domain_id: str) -> Optional[dict]:
+    """Return the newest mapping-ready blueprint, not merely the newest blueprint.
+
+    A later logical-design or integrated-generation run must not make the mapping
+    job forget which ontology objects have actual source-data evidence.
+    """
+    _ensure_blueprint_storage(db)
+    records = (
+        db.query(SysOntologyBlueprint)
+        .filter(SysOntologyBlueprint.domain_id == domain_id)
+        .order_by(SysOntologyBlueprint.version_no.desc(), SysOntologyBlueprint.created_at.desc())
+        .all()
+    )
+    for record in records:
+        payload = _serialize_blueprint_payload(record)
+        if payload and payload.get("generation_mode") in {"data_enrichment", "integrated"}:
+            return payload
+    return None
+
+
 def _load_blueprint_payload_by_id(db: Session, blueprint_id: Optional[str]) -> Optional[dict]:
     if not blueprint_id:
         return None
@@ -165,6 +213,20 @@ def _find_blueprint_entity_recommendation(blueprint_payload: Optional[dict], ent
     return None
 
 
+def _is_entity_auto_mapping_eligible(blueprint_payload: Optional[dict], entity: SysOntologyEntity) -> bool:
+    """Data-enrichment blueprints only auto-map evidence-backed entities.
+
+    Logical-only entities remain available for manual mapping after additional source
+    data is supplied, but must not be sent to the all-domain LLM mapping job.
+    """
+    generation_mode = (blueprint_payload or {}).get("generation_mode")
+    if not blueprint_payload or generation_mode not in {"data_enrichment", "integrated"}:
+        return True
+    recommendation = _find_blueprint_entity_recommendation(blueprint_payload, entity)
+    status = (recommendation or {}).get("data_support_status")
+    return bool(recommendation and (status == "DATA_SUPPORTED" or (generation_mode == "integrated" and not status)))
+
+
 def _build_blueprint_mapping_context(
     blueprint_payload: Optional[dict],
     entity: SysOntologyEntity,
@@ -210,6 +272,8 @@ def _build_blueprint_mapping_context(
         "preferred_tables": preferred_tables,
         "preferred_roles": preferred_roles,
         "role_by_table": role_by_table,
+        "data_support_status": (entity_recommendation or {}).get("data_support_status") or "LOGICAL_ONLY",
+        "data_support_reason": (entity_recommendation or {}).get("data_support_reason") or "",
     }
 
 
@@ -244,8 +308,26 @@ def _find_blueprint_relation_recommendation(
                 "target_table": item.get("targetTable") or "",
                 "join_condition": item.get("joinCondition") or "",
                 "edge_sql": item.get("edgeSql") or "",
+                "data_support_status": item.get("data_support_status") or "",
+                "data_support_reason": item.get("data_support_reason") or "",
             }
     return None
+
+
+def _is_relation_auto_mapping_eligible(blueprint_payload: Optional[dict], relation: SysOntologyRelation) -> bool:
+    generation_mode = (blueprint_payload or {}).get("generation_mode")
+    if not blueprint_payload or generation_mode not in {"data_enrichment", "integrated"}:
+        return True
+    recommendation = _find_blueprint_relation_recommendation(blueprint_payload, relation)
+    # DATA_CANDIDATE means both endpoint entities and the relationship evidence
+    # table exist, while the actual Join is still unknown.  This is exactly the
+    # relation type that the mapping stage needs to analyse; filtering it out
+    # makes relation mapping repeatedly return zero results.
+    status = (recommendation or {}).get("data_support_status")
+    return bool(recommendation and (
+        status in {"DATA_SUPPORTED", "DATA_CANDIDATE"}
+        or (generation_mode == "integrated" and not status)
+    ))
 
 
 def _get_entity_primary_property_name(entity: Optional[SysOntologyEntity]) -> str:
@@ -1141,18 +1223,22 @@ def _build_bulk_mapping_response_payload(
     applied_node_total: int = 0,
 ) -> dict:
     relations = relation_results or []
+    skipped_count = sum(1 for item in results if item["status"] == "SKIPPED_NO_DATA_SUPPORT")
+    mapped_results = [item for item in results if item["status"] != "SKIPPED_NO_DATA_SUPPORT"]
     summary = {
-        "entity_count": len(results),
-        "processed_count": len(results),
-        "ready_count": sum(1 for item in results if item["status"] in {"READY", "APPLIED"}),
-        "empty_count": sum(1 for item in results if item["status"] == "EMPTY"),
-        "failed_count": sum(1 for item in results if item["status"] == "FAILED"),
+        "entity_count": len(mapped_results),
+        "logical_entity_count": len(results),
+        "processed_count": len(mapped_results),
+        "ready_count": sum(1 for item in mapped_results if item["status"] in {"READY", "APPLIED"}),
+        "empty_count": sum(1 for item in mapped_results if item["status"] == "EMPTY"),
+        "skipped_no_data_support_count": skipped_count,
+        "failed_count": sum(1 for item in mapped_results if item["status"] == "FAILED"),
         "applied_total": applied_total,
         "relation_count": len(relations),
         "relation_ready_count": sum(1 for item in relations if item.get("status") in {"READY", "APPLIED"}),
         "relation_missing_count": sum(1 for item in relations if item.get("status") == "EMPTY"),
         "applied_relation_count": applied_relation_total,
-        "node_sql_ready_count": sum(1 for item in results if (item.get("node_mapping") or {}).get("node_sql")),
+        "node_sql_ready_count": sum(1 for item in mapped_results if (item.get("node_mapping") or {}).get("node_sql")),
         "applied_node_count": applied_node_total,
         "running": False,
         "current_entity_name": "",
@@ -1187,18 +1273,21 @@ def _build_bulk_mapping_progress_payload(
     graph_mapping_design: Optional[Dict[str, Any]] = None,
 ) -> dict:
     relations = relation_results or []
+    mapped_results = [item for item in results if item["status"] != "SKIPPED_NO_DATA_SUPPORT"]
     summary = {
         "entity_count": total_entities,
-        "processed_count": len(results),
-        "ready_count": sum(1 for item in results if item["status"] in {"READY", "APPLIED"}),
-        "empty_count": sum(1 for item in results if item["status"] == "EMPTY"),
-        "failed_count": sum(1 for item in results if item["status"] == "FAILED"),
+        "logical_entity_count": len(results),
+        "processed_count": len(mapped_results),
+        "ready_count": sum(1 for item in mapped_results if item["status"] in {"READY", "APPLIED"}),
+        "empty_count": sum(1 for item in mapped_results if item["status"] == "EMPTY"),
+        "skipped_no_data_support_count": sum(1 for item in results if item["status"] == "SKIPPED_NO_DATA_SUPPORT"),
+        "failed_count": sum(1 for item in mapped_results if item["status"] == "FAILED"),
         "applied_total": applied_total,
         "relation_count": len(relations),
         "relation_ready_count": sum(1 for item in relations if item.get("status") in {"READY", "APPLIED"}),
         "relation_missing_count": sum(1 for item in relations if item.get("status") == "EMPTY"),
-        "node_sql_ready_count": sum(1 for item in results if (item.get("node_mapping") or {}).get("node_sql")),
-        "running": len(results) < total_entities,
+        "node_sql_ready_count": sum(1 for item in mapped_results if (item.get("node_mapping") or {}).get("node_sql")),
+        "running": len(mapped_results) < total_entities,
         "current_entity_name": current_entity_name,
         "blueprint_version": (blueprint_payload or {}).get("blueprint_version"),
     }
@@ -1234,22 +1323,49 @@ async def _run_bulk_auto_mapping_job_async(
         if not domain:
             raise ValueError("业务分析域不存在")
 
-        entities = db.query(SysOntologyEntity).filter(
+        all_entities = db.query(SysOntologyEntity).filter(
             SysOntologyEntity.domain_id == domain_id
         ).order_by(SysOntologyEntity.created_at).all()
-        if not entities:
+        if not all_entities:
             raise ValueError("当前分析域下没有可映射的本体对象")
 
         source_service = SourceDataService(db)
         llm_service = LLMService(db)
-        results = []
         applied_total = 0
         applied_node_total = 0
-        total_entities = len(entities)
         holistic_source_tables: Dict[str, Dict[str, Any]] = {}
         blueprint_payload = _load_blueprint_payload_by_id(db, request_payload.get("blueprint_id"))
+        if not blueprint_payload or blueprint_payload.get("generation_mode") not in {"data_enrichment", "integrated"}:
+            blueprint_payload = _load_latest_data_enrichment_blueprint_payload(db, domain.domain_id)
         if not blueprint_payload:
-            blueprint_payload = _load_latest_blueprint_payload(db, domain.domain_id)
+            raise ValueError("未找到可映射设计结果；请先完成“一体化生成（文档+业务数据表）”或“分步骤生成 → 数据补全设计”，再执行数据映射。")
+
+        entities = [
+            entity for entity in all_entities
+            if _is_entity_auto_mapping_eligible(blueprint_payload, entity)
+        ]
+        skipped_entities = [
+            entity for entity in all_entities
+            if not _is_entity_auto_mapping_eligible(blueprint_payload, entity)
+        ]
+        results = [
+            {
+                "entity_id": entity.entity_id,
+                "entity_name": entity.entity_name,
+                "entity_display_name": entity.entity_display_name,
+                "entity_desc": entity.entity_desc,
+                "status": "SKIPPED_NO_DATA_SUPPORT",
+                "error_message": "当前数据补全蓝图未提供实体或属性来源；保留为逻辑本体，不执行自动数据映射。",
+                "mappings": [],
+                "candidate_tables": [],
+                "mapping_count": 0,
+                "oracle_vertex": {},
+            }
+            for entity in skipped_entities
+        ]
+        if not entities:
+            raise ValueError("当前数据补全蓝图中没有具备数据来源依据的实体，无法执行自动数据映射")
+        total_entities = len(entities)
 
         for entity in entities:
             blueprint_context = _build_blueprint_mapping_context(blueprint_payload, entity)
@@ -1426,9 +1542,13 @@ async def _run_bulk_auto_mapping_job_async(
             )
             db.commit()
 
-        relations = db.query(SysOntologyRelation).filter(
+        all_relations = db.query(SysOntologyRelation).filter(
             SysOntologyRelation.domain_id == domain_id
         ).order_by(SysOntologyRelation.created_at).all()
+        relations = [
+            relation for relation in all_relations
+            if _is_relation_auto_mapping_eligible(blueprint_payload, relation)
+        ]
         ontology_entity_context = [
             {
                 "entity_id": entity.entity_id,
@@ -1462,6 +1582,51 @@ async def _run_bulk_auto_mapping_job_async(
             }
             for relation in relations
         ]
+        # 关系证据表（特别是瓶码-盒码这类独立关系表）通常不会被任何单个
+        # 节点的属性映射选中。将它们显式补入整体图映射上下文，才能让模型识别
+        # 关系表模式及实际 Join，而不是因为看不到该表而返回 0 条关系建议。
+        evidence_table_names = {
+            table_name
+            for relation in relations
+            for table_name in ((_find_blueprint_relation_recommendation(blueprint_payload, relation) or {}).get("evidence_tables") or [])
+            if str(table_name).strip()
+        }
+        missing_evidence_names = {
+            str(table_name).strip().upper()
+            for table_name in evidence_table_names
+            if str(table_name).strip().upper() not in holistic_source_tables
+        }
+        if missing_evidence_names:
+            try:
+                evidence_catalog = source_service.get_remote_table_catalog_for_mapping(
+                    source_id=request_payload.get("source_id"),
+                    domain_id=domain_id,
+                    schema=request_payload.get("schema"),
+                    entity_keywords=list(missing_evidence_names),
+                )
+                catalog_by_name = {
+                    str(item.get("table_name") or "").strip().upper(): item
+                    for item in (evidence_catalog.get("tables") or [])
+                }
+                evidence_metadata = source_service.get_remote_tables_metadata_by_names(
+                    source_id=request_payload.get("source_id"),
+                    schema=evidence_catalog.get("schema") or request_payload.get("schema"),
+                    tables=[catalog_by_name[name] for name in missing_evidence_names if name in catalog_by_name],
+                    sample_limit=request_payload.get("sample_limit", 3),
+                    entity_keywords=list(missing_evidence_names),
+                    source_name=evidence_catalog.get("source_name"),
+                )
+                for source_table in evidence_metadata.get("tables") or []:
+                    table_key = str(source_table.get("table_name") or "").strip().upper()
+                    if table_key:
+                        holistic_source_tables[table_key] = source_table
+            except Exception as exc:
+                logger.warning(
+                    "Unable to load relation evidence tables for mapping: domain_id=%s tables=%s error=%s",
+                    domain_id,
+                    sorted(missing_evidence_names),
+                    str(exc),
+                )
         graph_mapping_design: Dict[str, Any] = {}
         graph_design_progress = _build_bulk_mapping_progress_payload(
             domain=domain,
@@ -1681,6 +1846,9 @@ async def get_latest_blueprint(
         "entities": payload.get("entities") or [],
         "relations": payload.get("relations") or [],
         "generation_mode": payload.get("generation_mode"),
+        "generation_phase": payload.get("generation_phase"),
+        "source_design_blueprint_id": payload.get("source_design_blueprint_id"),
+        "source_design_blueprint_version": payload.get("source_design_blueprint_version"),
         "model": payload.get("model"),
         "ontology_generation_context": payload.get("ontology_generation_context") or {},
         "llm_context_summary": payload.get("llm_context_summary") or {},
@@ -1691,7 +1859,50 @@ async def get_latest_blueprint(
         "view_plan": payload.get("view_plan") or {},
         "mapping_design": payload.get("mapping_design") or {},
         "deployment_design": payload.get("deployment_design") or {},
+        "data_support": payload.get("data_support") or {},
     })
+
+
+@router.get("/domains/{domain_id}/blueprint/data-support", response_model=ApiResponse)
+async def get_latest_data_support_blueprint(
+    domain_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the newest data-support classification for graph coloring and mapping."""
+    ensure_domain_access(db, current_user, domain_id)
+    records = (
+        db.query(SysOntologyBlueprint)
+        .filter(SysOntologyBlueprint.domain_id == domain_id)
+        .order_by(SysOntologyBlueprint.version_no.desc(), SysOntologyBlueprint.created_at.desc())
+        .all()
+    )
+    for record in records:
+        payload = _serialize_blueprint_payload(record)
+        if not payload or payload.get("generation_mode") not in {"data_enrichment", "integrated"}:
+            continue
+        entities = []
+        for item in payload.get("entities") or []:
+            entity_name = str(item.get("entityName") or "").strip()
+            status = str(item.get("data_support_status") or "").strip()
+            if entity_name and status:
+                entities.append({
+                    "entity_name": entity_name,
+                    "data_support_status": status,
+                    "data_support_reason": str(item.get("data_support_reason") or ""),
+                })
+        if entities:
+            # Keep the full design context available to the mapping-operation
+            # page (selected tables, candidates and semantics), while exposing
+            # the compact normalised entity list used by graph coloring.
+            return ApiResponse(data={
+                **payload,
+                "blueprint_id": record.blueprint_id,
+                "blueprint_version": record.version_no,
+                "data_support": payload.get("data_support") or {},
+                "entities": entities,
+            })
+    return ApiResponse(data=None)
 
 @router.get("/entities/{entity_id}/entity-mapping", response_model=ApiResponse)
 async def get_entity_mapping(
@@ -2340,21 +2551,42 @@ async def bulk_auto_mapping(
         len(entities),
         [item.entity_name for item in entities[:20]],
     )
-    latest_blueprint_payload = _load_latest_blueprint_payload(db, domain_id)
+    latest_blueprint_payload = _load_latest_data_enrichment_blueprint_payload(db, domain_id)
+    if not latest_blueprint_payload:
+        raise HTTPException(
+            status_code=400,
+            detail="当前分析域尚无可映射设计结果，无法判断哪些本体对象有数据支撑。请先完成“一体化生成（文档+业务数据表）”或“分步骤生成 → 数据补全设计”。",
+        )
+    eligible_entities = [
+        entity for entity in entities
+        if _is_entity_auto_mapping_eligible(latest_blueprint_payload, entity)
+    ]
+    eligible_relations = [
+        relation for relation in db.query(SysOntologyRelation).filter(
+            SysOntologyRelation.domain_id == domain_id
+        ).all()
+        if _is_relation_auto_mapping_eligible(latest_blueprint_payload, relation)
+    ]
     request_payload = req.model_dump()
     request_payload["blueprint_id"] = latest_blueprint_payload.get("blueprint_id") if latest_blueprint_payload else None
     request_payload["blueprint_version"] = latest_blueprint_payload.get("blueprint_version") if latest_blueprint_payload else None
     request_payload["blueprint_status"] = latest_blueprint_payload.get("blueprint_status") if latest_blueprint_payload else None
     initial_summary = {
-        "entity_count": len(entities),
+        "entity_count": len(eligible_entities),
+        "logical_entity_count": len(entities),
+        "skipped_no_data_support_count": len(entities) - len(eligible_entities),
         "processed_count": 0,
         "ready_count": 0,
         "empty_count": 0,
         "failed_count": 0,
         "applied_total": 0,
-        "relation_count": db.query(SysOntologyRelation).filter(
+        "relation_count": len(eligible_relations),
+        "logical_relation_count": db.query(SysOntologyRelation).filter(
             SysOntologyRelation.domain_id == domain_id
         ).count(),
+        "skipped_relation_no_data_support_count": db.query(SysOntologyRelation).filter(
+            SysOntologyRelation.domain_id == domain_id
+        ).count() - len(eligible_relations),
         "relation_ready_count": 0,
         "relation_missing_count": 0,
         "applied_relation_count": 0,

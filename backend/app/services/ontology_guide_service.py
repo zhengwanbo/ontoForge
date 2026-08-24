@@ -24,6 +24,7 @@ from app.models.models import (
 from app.services.llm_service import LLMService
 from app.services.source_data_service import SourceDataService
 from app.services.domain_ontology_generators import build_canonical_model, build_view_plan
+from app.services.business_type_service import ensure_default_business_types
 
 logger = get_logger(__name__)
 
@@ -78,6 +79,7 @@ class OntologyGuideService:
 
     def _load_domain_semantic_patterns(self, domain: SysDomain) -> None:
         """Load user-maintained semantic patterns for the active business type."""
+        ensure_default_business_types(self.db)
         selected_code = (self._selected_semantic_type_code or domain.domain_type or "BUSINESS").strip().upper()
         business_type = self.db.query(SysBusinessType).filter(
             SysBusinessType.type_code == selected_code,
@@ -111,6 +113,26 @@ class OntologyGuideService:
             "semantic_desc": business_type.semantic_desc or "",
         }
 
+    def _supports_structured_defect_generation(self, semantic_type_code: Optional[str]) -> bool:
+        """Structured pipeline eligibility comes from the managed semantic patterns."""
+        ensure_default_business_types(self.db)
+        code = (semantic_type_code or "").strip().upper()
+        business_type = self.db.query(SysBusinessType).filter(
+            SysBusinessType.type_code == code,
+            SysBusinessType.status == "ACTIVE",
+        ).first()
+        if not business_type:
+            return False
+        try:
+            patterns = json.loads(business_type.semantic_patterns_json or "[]")
+        except (TypeError, ValueError):
+            patterns = []
+        pattern_codes = {
+            str(item.get("pattern_code") or item.get("code") or "").strip().lower()
+            for item in patterns if isinstance(item, dict)
+        }
+        return {"measurement-threshold-violation", "case-rootcause-action"}.issubset(pattern_codes)
+
     def parse_uploaded_document(self, file_name: str, content: bytes) -> Dict[str, Any]:
         if not content:
             raise ValueError("上传文件为空")
@@ -120,22 +142,27 @@ class OntologyGuideService:
         suffix = Path(file_name or "").suffix.lower()
         if suffix in {".txt", ".md", ".csv"}:
             extracted_text = self._decode_text_bytes(content)
+            markdown = self._text_to_markdown(extracted_text, preserve_markdown=suffix == ".md")
         elif suffix == ".docx":
-            extracted_text = self._extract_docx_text(content)
+            markdown = self._extract_docx_markdown(content)
         elif suffix == ".pdf":
             extracted_text = self._extract_pdf_text(content)
+            markdown = self._text_to_markdown(extracted_text)
         else:
             raise ValueError("暂不支持该文件类型，请上传 txt、md、docx 或 pdf 文档")
 
-        normalized_text = self._normalize_document_text(extracted_text)
-        if not normalized_text:
+        normalized_markdown = self._normalize_markdown(markdown)
+        if not normalized_markdown:
             raise ValueError("未能从文档中提取到有效文本")
 
         return {
             "file_name": file_name,
             "file_type": suffix.lstrip("."),
-            "text": normalized_text,
-            "char_count": len(normalized_text),
+            # text 保留用于兼容既有调用方；Guide 新调用方应优先使用 markdown。
+            "text": normalized_markdown,
+            "markdown": normalized_markdown,
+            "content_format": "markdown",
+            "char_count": len(normalized_markdown),
         }
 
     def parse_uploaded_ddl(self, file_name: str, content: bytes) -> Dict[str, Any]:
@@ -201,6 +228,10 @@ class OntologyGuideService:
         schema: str | None = None,
         table_source_mode: str = "database",
         generation_strategy: Optional[str] = None,
+        generation_mode: str = "integrated",
+        base_blueprint_id: Optional[str] = None,
+        document_generation_phase: str = "ontology",
+        design_blueprint_id: Optional[str] = None,
         business_scenario: Optional[str] = None,
         semantic_type_code: Optional[str] = None,
         rule_table_name: Optional[str] = None,
@@ -217,14 +248,39 @@ class OntologyGuideService:
         overwrite_existing: bool = False,
         created_by: str = "unknown",
     ) -> Dict[str, Any]:
+        normalized_generation_mode = (generation_mode or "integrated").strip().lower()
+        if normalized_generation_mode == "document_first":
+            return await self._generate_document_first(
+                domain_id=domain_id,
+                business_document=business_document,
+                semantic_type_code=semantic_type_code,
+                enabled_patterns=enabled_patterns or [],
+                model_config_id=model_config_id,
+                created_by=created_by,
+                document_generation_phase=document_generation_phase,
+                design_blueprint_id=design_blueprint_id,
+            )
+        if normalized_generation_mode not in {"integrated", "data_enrichment"}:
+            raise ValueError("不支持的本体生成阶段")
         normalized_generation_strategy = self._normalize_generation_strategy(generation_strategy)
+        # 数据补全必须围绕已确认的逻辑基线做语义补全；不能再进入只适用于
+        # 结构化制造场景的一次性流水线，否则会丢失基线约束。
+        if normalized_generation_mode == "data_enrichment":
+            normalized_generation_strategy = "llm_first"
+        normalized_business_scenario = self._normalize_business_scenario(business_scenario)
+        if normalized_generation_strategy == "structured_domain_pipeline":
+            if not self._supports_structured_defect_generation(semantic_type_code):
+                raise ValueError("结构化领域生成请从“业务语义管理”中选择已配置“质量规则与缺陷判定”和“根因分析与改善闭环”的业务语义")
+            normalized_business_scenario = "DEFECT_ROOTCAUSE"
         self._selected_semantic_type_code = (
             (semantic_type_code or "").strip().upper()
             if normalized_generation_strategy == "llm_first" and (semantic_type_code or "").strip()
+            else (semantic_type_code or "").strip().upper()
+            if normalized_generation_strategy == "structured_domain_pipeline" and (semantic_type_code or "").strip()
             else None
         )
         guide_context = self._build_guide_strategy_context(
-            business_scenario=business_scenario,
+            business_scenario=normalized_business_scenario,
             focus_metric_families=focus_metric_families,
             focus_stations=focus_stations,
             history_case_sources=history_case_sources,
@@ -237,7 +293,7 @@ class OntologyGuideService:
             guide_context["semantic_type_code"] = self._selected_semantic_type_code
 
         if normalized_generation_strategy == "structured_domain_pipeline":
-            return await self._generate_with_structured_domain_pipeline(
+            result = await self._generate_with_structured_domain_pipeline(
                 domain_id=domain_id,
                 relation_tables=relation_tables,
                 business_document=business_document,
@@ -256,8 +312,30 @@ class OntologyGuideService:
                 overwrite_existing=overwrite_existing,
                 created_by=created_by,
             )
+            if normalized_generation_mode == "integrated":
+                result["generation_mode"] = "integrated"
+                self._annotate_integrated_generation_support(result)
+                persisted = self._save_blueprint_package(
+                    domain_id=domain_id,
+                    source_id=result.get("source_id"),
+                    schema=result.get("schema"),
+                    payload=result,
+                    created_by=created_by,
+                    status="GENERATED",
+                )
+                result["blueprint_id"] = persisted["blueprint_id"]
+                result["blueprint_version"] = persisted["version_no"]
+            return result
 
-        return await self._generate_with_llm_first(
+        if normalized_generation_mode == "data_enrichment":
+            if not base_blueprint_id:
+                raise ValueError("数据补全阶段必须选择已确认的逻辑本体基线")
+            base_blueprint = self._load_blueprint_payload(base_blueprint_id, domain_id)
+            if not base_blueprint:
+                raise ValueError("所选逻辑本体基线不存在或不属于当前分析域")
+            business_document = f"{business_document}\n\n已确认的逻辑本体基线（必须优先保留并补全映射）：\n{json.dumps({'entities': base_blueprint.get('entities') or [], 'relations': base_blueprint.get('relations') or []}, ensure_ascii=False)}"
+
+        result = await self._generate_with_llm_first(
             domain_id=domain_id,
             relation_tables=relation_tables,
             business_document=business_document,
@@ -273,10 +351,180 @@ class OntologyGuideService:
             enabled_patterns=enabled_patterns,
             model_config_id=model_config_id,
             sample_limit=sample_limit,
-            auto_apply=auto_apply,
+            # 数据补全和一体化生成都要先标注数据支撑度再持久化。前者需要
+            # 合并逻辑基线；后者已同时选择业务文档和数据表，生成对象默认进入
+            # 自动映射范围。
+            auto_apply=auto_apply if normalized_generation_mode != "data_enrichment" else False,
             overwrite_existing=overwrite_existing,
             created_by=created_by,
+            persist_blueprint=normalized_generation_mode not in {"data_enrichment", "integrated"},
         )
+        result["generation_mode"] = normalized_generation_mode
+        if normalized_generation_mode == "data_enrichment":
+            # LLM 的职责是补全物理映射，不能静默删掉已由人工确认的逻辑对象。
+            # 先保留本轮识别出的物理字段映射，再用基线补回本轮没有识别到的
+            # 逻辑对象；这样同名属性不会被基线中的空来源覆盖。
+            merged_baseline = self._merge_blueprint_results([result, base_blueprint])
+            result["entities"] = merged_baseline.get("entities") or result.get("entities") or []
+            result["relations"] = merged_baseline.get("relations") or result.get("relations") or []
+            result["entity_candidates"] = result["entities"]
+            result["relation_candidates"] = result["relations"]
+            data_support = self._annotate_data_enrichment_support(
+                entities=result["entities"],
+                relations=result["relations"],
+                selected_tables=result.get("selected_tables") or relation_tables,
+            )
+            result["data_support"] = data_support
+            # 自动数据映射只接收已有物理来源依据的对象与边；逻辑候选仍保留
+            # 在本体设计中供后续补数或人工映射，不会被自动映射任务扫描。
+            supported_entities = [
+                item for item in result["entities"]
+                if item.get("data_support_status") == "DATA_SUPPORTED"
+            ]
+            supported_relations = [
+                item for item in result["relations"]
+                if item.get("data_support_status") == "DATA_SUPPORTED"
+            ]
+            result["mapping_design"] = self._build_mapping_design(
+                entities=supported_entities,
+                relations=supported_relations,
+                source_role_bindings=result.get("source_role_bindings") or result.get("table_roles") or [],
+                semantic_patterns=result.get("semantic_patterns") or [],
+            )
+            result["base_blueprint_id"] = base_blueprint_id
+            result["base_blueprint_version"] = base_blueprint.get("blueprint_version")
+            result["baseline_merge_note"] = "已保留已确认逻辑本体；仅标记有实际表和字段依据的对象、属性、边进入自动数据映射范围。"
+        elif normalized_generation_mode == "integrated":
+            self._annotate_integrated_generation_support(result)
+
+        if normalized_generation_mode in {"data_enrichment", "integrated"}:
+            persisted = self._save_blueprint_package(
+                domain_id=domain_id,
+                source_id=result.get("source_id"),
+                schema=result.get("schema"),
+                payload=result,
+                created_by=created_by,
+                status="GENERATED",
+            )
+            result["blueprint_id"] = persisted["blueprint_id"]
+            result["blueprint_version"] = persisted["version_no"]
+        return result
+
+    async def _generate_document_first(
+        self,
+        domain_id: str,
+        business_document: str,
+        semantic_type_code: Optional[str],
+        enabled_patterns: List[str],
+        model_config_id: Optional[str],
+        created_by: str,
+        document_generation_phase: str = "ontology",
+        design_blueprint_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not (business_document or "").strip():
+            raise ValueError("请输入业务说明文档")
+        domain = self.db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
+        if not domain:
+            raise ValueError("业务分析域不存在")
+        self._selected_semantic_type_code = (semantic_type_code or "").strip().upper() or None
+        self._load_domain_semantic_patterns(domain)
+        parsed = self._parse_business_document_structured(business_document)
+        empty_schema = {"table_count": 0, "tables": []}
+        rule_summary = self._build_rule_summary(empty_schema, parsed, [])
+        semantic_patterns = self._build_semantic_patterns([], enabled_patterns)
+        business_summary = self._build_business_summary(domain, parsed, rule_summary, [])
+        phase = (document_generation_phase or "ontology").strip().lower()
+        if phase not in {"design", "ontology"}:
+            raise ValueError("文档先行生成阶段仅支持 design 或 ontology")
+        if phase == "ontology":
+            if not design_blueprint_id:
+                raise ValueError("请先确认高层本体设计文档，再生成本体对象")
+            design_blueprint = self._load_blueprint_payload(design_blueprint_id, domain_id)
+            if not design_blueprint or design_blueprint.get("generation_phase") != "design":
+                raise ValueError("所选高层本体设计文档不存在或不属于当前分析域")
+            design_document = design_blueprint.get("ontology_design_document") or {}
+            if not design_document:
+                raise ValueError("高层本体设计文档内容为空，请重新生成")
+        else:
+            design_document = await self.llm_service.generate_ontology_design_document(
+                domain=domain, business_summary=business_summary, selected_table_schema=empty_schema,
+                rule_summary=rule_summary, table_roles=[], semantic_patterns=semantic_patterns,
+                business_document=business_document, config_id=model_config_id, document_first=True,
+            )
+            result = {
+                "domain_id": domain_id, "domain_name": domain.domain_name, "domain_desc": domain.domain_desc,
+                "generation_mode": "document_first", "generation_phase": "design", "generation_strategy": "llm_first",
+                "lifecycle_stage": "LOGICAL_DESIGN_DRAFT", "generation_scope": "DOCUMENT_FULL", "table_source_mode": "none",
+                "business_document": business_document, "business_document_parsed": parsed,
+                "business_summary": business_summary, "rule_summary": rule_summary,
+                "ontology_design_document": design_document, "semantic_patterns": semantic_patterns,
+                "selected_tables": [], "selected_table_schema": empty_schema, "table_roles": [],
+                "entities": [], "relations": [], "entity_candidates": [], "relation_candidates": [],
+                "mapping_design": {"status": "NOT_STARTED", "message": "请先确认高层本体设计文档；确认后才生成逻辑实体、属性和关系。"},
+                "deployment_design": {"status": "NOT_READY", "message": "等待逻辑本体确认和后续数据映射。"},
+            }
+            persisted = self._save_blueprint_package(
+                domain_id=domain_id, source_id=None, schema=None, payload=result,
+                created_by=created_by, status="LOGICAL_DESIGN_DRAFT",
+            )
+            result["blueprint_id"] = persisted["blueprint_id"]
+            result["blueprint_version"] = persisted["version_no"]
+            return result
+        entity_result = await self.llm_service.generate_entity_candidates(
+            domain=domain, business_summary=business_summary, ontology_design_document=design_document,
+            selected_table_schema=empty_schema, rule_summary=rule_summary, table_roles=[],
+            semantic_patterns=semantic_patterns, config_id=model_config_id, document_only=True,
+        )
+        # 文档先行的目标是完整表达文档业务语义，不能再用 MVP 设计清单
+        # 二次裁剪实体；后续可由人工确认删除不需要的候选。
+        entities = entity_result.get("entity_candidates") or []
+        relation_result = await self.llm_service.generate_relation_candidates(
+            domain=domain, business_summary=business_summary, ontology_design_document=design_document,
+            rule_summary=rule_summary, table_roles=[], entity_candidates=entities, relation_tables=[],
+            semantic_patterns=semantic_patterns, config_id=model_config_id, document_only=True,
+        )
+        relations = relation_result.get("relation_candidates") or []
+        blueprint = self._build_ontology_design(entities, relations)
+        result = {
+            "domain_id": domain_id, "domain_name": domain.domain_name, "domain_desc": domain.domain_desc,
+            "generation_mode": "document_first", "generation_phase": "ontology", "generation_strategy": "llm_first",
+            "source_design_blueprint_id": design_blueprint_id,
+            "source_design_blueprint_version": design_blueprint.get("blueprint_version"),
+            "lifecycle_stage": "LOGICAL_DRAFT", "generation_scope": "DOCUMENT_FULL", "table_source_mode": "none",
+            "business_document": business_document, "business_document_parsed": parsed,
+            "business_summary": business_summary, "rule_summary": rule_summary,
+            "ontology_design_document": design_document, "semantic_patterns": semantic_patterns,
+            "selected_tables": [], "selected_table_schema": empty_schema, "table_roles": [],
+            "entity_candidates": entities, "relation_candidates": relations,
+            "mapping_design": {"status": "NOT_STARTED", "message": "等待后续提供数据表、DDL 或规则数据后再开展映射。"},
+            "deployment_design": {"status": "NOT_READY", "message": "逻辑本体确认后，需完成数据映射才可生成部署设计。"},
+            **blueprint,
+        }
+        persisted = self._save_blueprint_package(
+            domain_id=domain_id, source_id=None, schema=None, payload=result,
+            created_by=created_by, status="LOGICAL_DRAFT",
+        )
+        result["blueprint_id"] = persisted["blueprint_id"]
+        result["blueprint_version"] = persisted["version_no"]
+        # SYS_ONTOLOGY_BLUEPRINT.STATUS is VARCHAR2(20) in Oracle.
+        # Keep the persisted lifecycle marker within that physical constraint.
+        self.mark_blueprint_status(design_blueprint_id, "LOGICAL_DESIGN_DONE")
+        return result
+
+    def _load_blueprint_payload(self, blueprint_id: str, domain_id: str) -> Optional[Dict[str, Any]]:
+        record = self.db.query(SysOntologyBlueprint).filter(
+            SysOntologyBlueprint.blueprint_id == blueprint_id,
+            SysOntologyBlueprint.domain_id == domain_id,
+        ).first()
+        if not record:
+            return None
+        try:
+            payload = json.loads(record.blueprint_json or "{}")
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {**payload, "blueprint_id": record.blueprint_id, "blueprint_version": record.version_no, "blueprint_status": record.status}
 
     async def _generate_with_structured_domain_pipeline(
         self,
@@ -655,6 +903,7 @@ class OntologyGuideService:
             selected_table_schema=llm_selected_table_schema,
             rule_summary=rule_summary,
             table_roles=table_roles,
+            business_document=business_document,
             semantic_patterns=semantic_patterns,
             config_id=model_config_id,
         )
@@ -964,6 +1213,14 @@ class OntologyGuideService:
             return normalized
         return "structured_domain_pipeline"
 
+    @staticmethod
+    def _normalize_business_scenario(business_scenario: Optional[str]) -> Optional[str]:
+        """Unify historical SFR/defect choices into one configurable semantic."""
+        normalized = str(business_scenario or "").strip().upper()
+        if normalized in {"SFR_ROOTCAUSE", "DEFECT_ANALYSIS", "DEFECT_ROOTCAUSE"}:
+            return "DEFECT_ROOTCAUSE"
+        return normalized or None
+
     def _build_guide_strategy_context(
         self,
         business_scenario: Optional[str],
@@ -1230,12 +1487,12 @@ class OntologyGuideService:
         business_scenario = guide_context.get("business_scenario")
         if not business_scenario:
             if "SFR" in upper_text and any(token in raw_text for token in ["根因", "缺陷"]):
-                business_scenario = "SFR_ROOTCAUSE"
+                business_scenario = "DEFECT_ROOTCAUSE"
             elif "缺陷" in raw_text:
-                business_scenario = "DEFECT_ANALYSIS"
+                business_scenario = "DEFECT_ROOTCAUSE"
 
         return {
-            "scenario_name": "TAMS SFR 根因分析" if business_scenario == "SFR_ROOTCAUSE" else "业务分析场景",
+            "scenario_name": "缺陷根因分析业务语义" if business_scenario == "DEFECT_ROOTCAUSE" else "业务分析场景",
             "business_scenario": business_scenario,
             "product_codes": product_codes,
             "history_knowledge_sources": history_sources,
@@ -1943,7 +2200,13 @@ class OntologyGuideService:
             role = item.get("source_role") or "other"
             role_counts[role] = role_counts.get(role, 0) + 1
         raw_text = business_document_parsed.get("raw_text") or ""
-        is_defect_scenario = "缺陷" in raw_text or "SFR" in raw_text.upper()
+        # 文档出现“缺陷”“SFR”等词并不代表应启用制造缺陷模板；只有
+        # 用户显式选择的缺陷根因分析业务语义才允许构造该专用摘要。
+        selected_semantic_code = (self._business_type_context.get("type_code") or "").upper()
+        is_defect_scenario = (
+            selected_semantic_code == "MANUFACTURING_DEFECT"
+            and ("缺陷" in raw_text or "SFR" in raw_text.upper())
+        )
         default_goal = (
             "围绕缺陷/异常分析场景构建可用于根因分析、影响分析与追溯分析的本体对象、属性和关系。"
             if is_defect_scenario
@@ -1958,16 +2221,15 @@ class OntologyGuideService:
         return {
             "scenario_name": getattr(domain, "domain_name", "") or "业务本体分析",
             "core_goal": default_goal,
-            "defect_definition": default_definition,
+            "business_rule_definition": default_definition,
             "rule_source_mode": rule_summary.get("rule_source_mode") or "none",
-            "defect_scope_summary": rule_summary.get("scope_summary") or {},
+            "rule_scope_summary": rule_summary.get("scope_summary") or {},
             "trace_path": [
-                "业务事件/对象",
-                "关键标识",
-                "测量/规则/过程数据",
-                "上游站位或过程节点",
-                "设备/工装/物料/批次",
-                "原因或影响对象",
+                "业务主体",
+                "业务事件或单据",
+                "规则、指标或权益",
+                "生命周期状态",
+                "交易、服务或处置结果",
             ] if not is_defect_scenario else [
                 "SFR NG项",
                 "VCM_ID / SensorID",
@@ -1977,7 +2239,7 @@ class OntologyGuideService:
                 "Lens / VCM / Lot / 供应商",
                 "根因候选",
             ],
-            "analysis_dimensions": ["规则判定", "测量指标", "过程站位", "设备工装", "物料批次", "供应商"] if is_defect_scenario else ["业务对象", "关键规则", "过程节点", "设备资源", "物料/组织"],
+            "analysis_dimensions": ["规则判定", "测量指标", "过程站位", "设备工装", "物料批次", "供应商"] if is_defect_scenario else ["业务主体", "业务事件", "指标规则", "生命周期状态", "交易或服务结果"],
             "focus_processes": business_document_parsed.get("focus_processes") or [],
             "focus_objects": business_document_parsed.get("focus_objects") or [],
             "rule_understanding": rule_summary.get("summary") or "",
@@ -2742,6 +3004,139 @@ class OntologyGuideService:
             return ""
         return cleaned
 
+    def _annotate_data_enrichment_support(
+        self,
+        entities: List[Dict[str, Any]],
+        relations: List[Dict[str, Any]],
+        selected_tables: List[str],
+    ) -> Dict[str, Any]:
+        """Separate logical ontology design from evidence-backed mapping candidates."""
+        selected_table_set = {
+            str(item).strip().upper()
+            for item in selected_tables or []
+            if str(item).strip()
+        }
+        entity_status_by_name: Dict[str, str] = {}
+        property_supported_count = 0
+        for entity in entities or []:
+            properties = entity.get("properties") or []
+            supported_properties = 0
+            for prop in properties:
+                if not isinstance(prop, dict):
+                    continue
+                source_table = str(prop.get("sourceTable") or prop.get("source_table") or "").strip().upper()
+                source_column = str(prop.get("sourceColumn") or prop.get("source_column") or "").strip().upper()
+                is_supported = bool(source_table in selected_table_set and source_column)
+                prop["data_support_status"] = "DATA_SUPPORTED" if is_supported else "LOGICAL_ONLY"
+                prop["data_support_reason"] = (
+                    f"已匹配来源字段 {source_table}.{source_column}"
+                    if is_supported else "当前选定数据对象中未找到可确认的来源字段"
+                )
+                if is_supported:
+                    supported_properties += 1
+                    property_supported_count += 1
+
+            source_hints = {
+                str(item).strip().upper() for item in (entity.get("sourceHints") or []) if str(item).strip()
+            }
+            has_supported_hint = bool(source_hints & selected_table_set)
+            status = "DATA_SUPPORTED" if supported_properties or has_supported_hint else "LOGICAL_ONLY"
+            entity["data_support_status"] = status
+            entity["data_support_reason"] = (
+                f"已由 {supported_properties} 个属性来源或源表 {'、'.join(sorted(source_hints & selected_table_set)) or '-'} 支撑"
+                if status == "DATA_SUPPORTED" else "仅来自逻辑设计，当前选定数据对象未提供实体或属性来源"
+            )
+            entity_status_by_name[(entity.get("entityName") or "").strip().lower()] = status
+
+        relation_counts = {"DATA_SUPPORTED": 0, "DATA_CANDIDATE": 0, "LOGICAL_ONLY": 0}
+        for relation in relations or []:
+            evidence_tables = {
+                str(item).strip().upper() for item in (relation.get("evidenceTables") or []) if str(item).strip()
+            }
+            source_table = str(relation.get("sourceTable") or "").strip().upper()
+            target_table = str(relation.get("targetTable") or "").strip().upper()
+            has_table_evidence = bool(evidence_tables & selected_table_set) or (
+                source_table in selected_table_set and target_table in selected_table_set
+            )
+            source_status = entity_status_by_name.get((relation.get("sourceEntityName") or "").strip().lower(), "LOGICAL_ONLY")
+            target_status = entity_status_by_name.get((relation.get("targetEntityName") or "").strip().lower(), "LOGICAL_ONLY")
+            has_join = bool((relation.get("joinCondition") or "").strip() or (relation.get("edgeSql") or "").strip())
+            if source_status == "DATA_SUPPORTED" and target_status == "DATA_SUPPORTED" and has_table_evidence and has_join:
+                status = "DATA_SUPPORTED"
+                reason = "两端实体、关系证据表和实际关联条件均已具备"
+            elif source_status == "DATA_SUPPORTED" and target_status == "DATA_SUPPORTED" and has_table_evidence:
+                status = "DATA_CANDIDATE"
+                reason = "两端实体和关系证据表已具备，但仍需确认实际 Join 条件"
+            else:
+                status = "LOGICAL_ONLY"
+                reason = "当前选定数据对象未同时支撑两端实体及关系依据"
+            relation["data_support_status"] = status
+            relation["data_support_reason"] = reason
+            relation_counts[status] += 1
+
+        entity_supported_count = sum(1 for item in entities or [] if item.get("data_support_status") == "DATA_SUPPORTED")
+        return {
+            "logical_entity_count": len(entities or []),
+            "data_supported_entity_count": entity_supported_count,
+            "logical_only_entity_count": len(entities or []) - entity_supported_count,
+            "data_supported_property_count": property_supported_count,
+            "data_supported_relation_count": relation_counts["DATA_SUPPORTED"],
+            "data_candidate_relation_count": relation_counts["DATA_CANDIDATE"],
+            "logical_only_relation_count": relation_counts["LOGICAL_ONLY"],
+            "selected_tables": sorted(selected_table_set),
+        }
+
+    def _annotate_integrated_generation_support(self, result: Dict[str, Any]) -> None:
+        """Mark an integrated document + data-table generation as mapping-ready.
+
+        This mode is not a document-only logical design: the user has explicitly
+        supplied the business document and the source data objects in the same
+        run.  The produced ontology therefore defines the scope for the next
+        data-mapping stage.  Exact source fields and joins are still verified by
+        that stage, but entities and relations must not be excluded beforehand.
+        """
+        selected_tables = sorted({
+            str(item).strip().upper()
+            for item in (result.get("selected_tables") or [])
+            if str(item).strip()
+        })
+        entities = result.get("entities") or []
+        relations = result.get("relations") or []
+        property_count = 0
+        for entity in entities:
+            entity["data_support_status"] = "DATA_SUPPORTED"
+            entity["data_support_reason"] = "一体化生成已同时使用需求文档和选定业务数据表；将在数据映射阶段校验具体字段来源。"
+            for prop in entity.get("properties") or []:
+                if not isinstance(prop, dict):
+                    continue
+                prop["data_support_status"] = "DATA_SUPPORTED"
+                prop["data_support_reason"] = "所属实体来自一体化生成的业务数据范围；待数据映射阶段确认具体来源字段。"
+                property_count += 1
+        for relation in relations:
+            relation["data_support_status"] = "DATA_SUPPORTED"
+            relation["data_support_reason"] = "一体化生成已同时使用需求文档和业务数据表；将在数据映射阶段验证实际 Join 或关系表。"
+
+        result["entity_candidates"] = entities
+        result["relation_candidates"] = relations
+        result["mapping_design"] = self._build_mapping_design(
+            entities=entities,
+            relations=relations,
+            source_role_bindings=result.get("source_role_bindings") or result.get("table_roles") or [],
+            semantic_patterns=result.get("semantic_patterns") or [],
+        )
+        result["data_support"] = {
+            "support_mode": "INTEGRATED_GENERATION",
+            "support_basis": "需求文档 + 已选业务数据表",
+            "logical_entity_count": len(entities),
+            "data_supported_entity_count": len(entities),
+            "logical_only_entity_count": 0,
+            "data_supported_property_count": property_count,
+            "data_supported_relation_count": len(relations),
+            "data_candidate_relation_count": 0,
+            "logical_only_relation_count": 0,
+            "selected_tables": selected_tables,
+        }
+
     def _merge_blueprint_results(self, blueprint_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         merged_entities: List[Dict[str, Any]] = []
         entity_index: Dict[str, Dict[str, Any]] = {}
@@ -3107,6 +3502,8 @@ class OntologyGuideService:
                 "source_roles": source_roles,
                 "recommended_build_mode": build_mode,
                 "mapping_status": "PENDING",
+                "data_support_status": entity.get("data_support_status") or "DATA_SUPPORTED",
+                "data_support_reason": entity.get("data_support_reason") or "",
             })
 
         relation_mappings = [
@@ -3116,6 +3513,8 @@ class OntologyGuideService:
                 "target_entity_name": relation.get("targetEntityName"),
                 "evidence_tables": relation.get("evidenceTables") or [],
                 "mapping_status": "PENDING",
+                "data_support_status": relation.get("data_support_status") or "DATA_SUPPORTED",
+                "data_support_reason": relation.get("data_support_reason") or "",
             }
             for relation in relations
         ]
@@ -3412,6 +3811,9 @@ class OntologyGuideService:
     def mark_blueprint_status(self, blueprint_id: str, status: str) -> None:
         if not blueprint_id:
             return
+        normalized_status = (status or "").strip()
+        if len(normalized_status) > 20:
+            raise ValueError(f"蓝图状态长度不能超过 20 个字符：{normalized_status}")
         self._ensure_blueprint_storage()
         record = (
             self.db.query(SysOntologyBlueprint)
@@ -3420,7 +3822,7 @@ class OntologyGuideService:
         )
         if not record:
             return
-        record.status = status
+        record.status = normalized_status
         record.updated_at = self._utcnow()
         self.db.commit()
 
@@ -3429,6 +3831,7 @@ class OntologyGuideService:
         domain_id: str,
         blueprint: Dict[str, Any],
         overwrite_existing: bool = False,
+        logical_only: bool = False,
         created_by: str = "unknown",
     ) -> Dict[str, Any]:
         entities_payload = blueprint.get("entities") or []
@@ -3492,7 +3895,8 @@ class OntologyGuideService:
                 entity_result["created"] += 1
                 entity_action = "created"
 
-            self._upsert_entity_mapping_seed(entity, entity_data, overwrite_existing=overwrite_existing, created_by=created_by)
+            if not logical_only:
+                self._upsert_entity_mapping_seed(entity, entity_data, overwrite_existing=overwrite_existing, created_by=created_by)
             existing_props = list(entity.properties) if getattr(entity, "properties", None) else []
             property_index = {(prop.property_name or "").lower(): prop for prop in existing_props}
             for prop_data in entity_data.get("properties", [])[:30]:
@@ -3525,7 +3929,8 @@ class OntologyGuideService:
                     property_index[property_name] = prop
                     existing_props.append(prop)
                     property_result["created"] += 1
-                self._upsert_property_mapping_seed(prop, prop_data, overwrite_existing=overwrite_existing, created_by=created_by)
+                if not logical_only:
+                    self._upsert_property_mapping_seed(prop, prop_data, overwrite_existing=overwrite_existing, created_by=created_by)
 
             applied_entities.append({
                 "entity_id": entity.entity_id,
@@ -3604,7 +4009,8 @@ class OntologyGuideService:
                 relation_result["created"] += 1
                 relation_action = "created"
 
-            self._upsert_relation_mapping_seed(relation, relation_data, entity_index, overwrite_existing=overwrite_existing, created_by=created_by)
+            if not logical_only:
+                self._upsert_relation_mapping_seed(relation, relation_data, entity_index, overwrite_existing=overwrite_existing, created_by=created_by)
             applied_relations.append({
                 "relation_name": relation_name,
                 "source_entity_name": source_entity.entity_name,
@@ -3830,7 +4236,91 @@ class OntologyGuideService:
                 continue
         return content.decode("latin-1", errors="ignore")
 
+    def _extract_docx_markdown(self, content: bytes) -> str:
+        """Convert DOCX to lightweight Markdown while retaining document structure.
+
+        The earlier XML-only reader flattened headings, list hierarchy and tables into
+        plain text. Those structures are meaningful inputs to ontology design, so use
+        python-docx here and keep them as Markdown for the Guide and LLM.
+        """
+        try:
+            from docx import Document
+        except ImportError as exc:
+            raise ValueError("当前运行环境未安装 python-docx，暂时无法解析 DOCX 文档") from exc
+
+        try:
+            document = Document(BytesIO(content))
+        except Exception as exc:
+            raise ValueError(f"无法解析 docx 文档: {str(exc)}") from exc
+
+        parts: List[str] = []
+        for paragraph in document.paragraphs:
+            text = (paragraph.text or "").strip()
+            if not text:
+                continue
+            style_name = (getattr(paragraph.style, "name", "") or "").lower()
+            heading_match = re.search(r"heading\s*([1-6])|标题\s*([1-6])", style_name, re.IGNORECASE)
+            if heading_match:
+                level = next((int(value) for value in heading_match.groups() if value), 1)
+                parts.append(f"{'#' * level} {text}")
+            elif "list bullet" in style_name or "项目符号" in style_name:
+                parts.append(f"- {text}")
+            elif "list number" in style_name or "编号" in style_name:
+                parts.append(f"1. {text}")
+            else:
+                parts.append(text)
+
+        for table in document.tables:
+            rows = [
+                [self._escape_markdown_table_cell(cell.text) for cell in row.cells]
+                for row in table.rows
+            ]
+            rows = [row for row in rows if any(cell.strip() for cell in row)]
+            if not rows:
+                continue
+            column_count = max(len(row) for row in rows)
+            normalized_rows = [row + [""] * (column_count - len(row)) for row in rows]
+            parts.append("| " + " | ".join(normalized_rows[0]) + " |")
+            parts.append("| " + " | ".join(["---"] * column_count) + " |")
+            parts.extend("| " + " | ".join(row) + " |" for row in normalized_rows[1:])
+
+        return "\n\n".join(parts)
+
     def _extract_docx_text(self, content: bytes) -> str:
+        """Compatibility wrapper for callers that only need a text representation."""
+        return self._extract_docx_markdown(content)
+
+    @staticmethod
+    def _escape_markdown_table_cell(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").replace("|", "\\|")).strip()
+
+    def _text_to_markdown(self, text: str, preserve_markdown: bool = False) -> str:
+        normalized = self._normalize_document_text(text)
+        if not normalized:
+            return ""
+        if preserve_markdown:
+            return normalized
+
+        markdown_lines: List[str] = []
+        for line in normalized.splitlines():
+            if re.match(r"^(第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+、|\d+(?:\.\d+)*[、.]?)\s*", line):
+                markdown_lines.append(f"## {line}")
+            elif re.match(r"^[•·▪◦]\s*", line):
+                markdown_lines.append("- " + re.sub(r"^[•·▪◦]\s*", "", line))
+            else:
+                markdown_lines.append(line)
+        return "\n\n".join(markdown_lines)
+
+    @staticmethod
+    def _normalize_markdown(text: str) -> str:
+        lines = [line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines).strip()
+
+    def _extract_docx_text_legacy(self, content: bytes) -> str:
         namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         parts: List[str] = []
         try:

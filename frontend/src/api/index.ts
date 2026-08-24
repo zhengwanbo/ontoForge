@@ -34,7 +34,12 @@ api.interceptors.response.use(
       localStorage.removeItem('token')
       window.location.href = '/login'
     } else {
-      ElMessage.error(error.response?.data?.detail || error.message || '网络错误')
+      const detail = error.response?.data?.detail
+      ElMessage.error(
+        typeof detail === 'string'
+          ? detail
+          : (detail?.message || error.message || '网络错误')
+      )
     }
     return Promise.reject(error)
   }
@@ -143,6 +148,7 @@ export const graphApi = {
   generateOntologyGuide: (domainId: string, data: any) => api.post(`/domains/${domainId}/guide/generate`, data, {
     timeout: 900000
   }),
+  listOntologyGuideBlueprints: (domainId: string) => api.get(`/domains/${domainId}/guide/blueprints`),
   applyOntologyGuide: (domainId: string, data: any) => api.post(`/domains/${domainId}/guide/apply`, data, {
     timeout: 300000
   }),
@@ -186,6 +192,8 @@ export const mappingApi = {
   getLatestBlueprint: (domainId: string) => api.get(`/mapping/domains/${domainId}/blueprint/latest`, {
     timeout: 300000
   }),
+  getLatestDataSupportBlueprint: (domainId: string) => api.get(`/mapping/domains/${domainId}/blueprint/data-support`),
+  checkDdlReadiness: (domainId: string) => api.post(`/mapping/domains/${domainId}/ddl-readiness-check`),
   getEntityMapping: (entityId: string) => api.get(`/mapping/entities/${entityId}/entity-mapping`),
   updateEntityMapping: (entityId: string, data: any) => api.put(`/mapping/entities/${entityId}/entity-mapping`, data),
   getPropertyMappings: (entityId: string) => api.get(`/mapping/entities/${entityId}/mappings`),
