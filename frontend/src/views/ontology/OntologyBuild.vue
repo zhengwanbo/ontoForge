@@ -506,6 +506,7 @@
             <el-option label="DATE" value="DATE" />
             <el-option label="TIMESTAMP" value="TIMESTAMP" />
             <el-option label="CLOB" value="CLOB" />
+            <el-option label="JSON" value="JSON" />
           </el-select>
         </el-form-item>
         <el-form-item label="是否主键"><el-switch v-model="propertyForm.is_primary_key" active-value="Y" inactive-value="N" /></el-form-item>

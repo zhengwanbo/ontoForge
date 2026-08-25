@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -8,10 +9,38 @@ from app.schemas.schemas import (
     ApiResponse,
     DataObjectCommentGenerateRequest, DataObjectCommentSaveRequest, GraphQueryRequest
 )
-from app.models.models import SysDataSource
+from app.models.models import SysDataSource, SysDomain, SysOntologyBlueprint, SysGraphQueryRecommendation
+from app.services.llm_service import LLMService
 from app.services.source_data_service import SourceDataService
 
 router = APIRouter(prefix="/source", tags=["源数据浏览管理"])
+
+
+def _ensure_graph_recommendation_table(db: Session) -> None:
+    """Support existing Oracle installations without a separate migration step."""
+    SysGraphQueryRecommendation.__table__.create(bind=db.bind, checkfirst=True)
+
+
+def _get_graph_query_recommendation(
+    db: Session, domain_id: str, source_id: str, schema_name: str, graph_name: str,
+) -> SysGraphQueryRecommendation | None:
+    _ensure_graph_recommendation_table(db)
+    return db.query(SysGraphQueryRecommendation).filter(
+        SysGraphQueryRecommendation.domain_id == domain_id,
+        SysGraphQueryRecommendation.source_id == source_id,
+        SysGraphQueryRecommendation.schema_name == schema_name.upper(),
+        SysGraphQueryRecommendation.graph_name == graph_name.upper(),
+    ).order_by(SysGraphQueryRecommendation.updated_at.desc()).first()
+
+
+def _load_cached_recommendations(record: SysGraphQueryRecommendation | None) -> list[dict]:
+    if not record:
+        return []
+    try:
+        items = json.loads(record.recommendations_json or "[]")
+        return items if isinstance(items, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _graph_identifier(value: str) -> str:
@@ -23,38 +52,44 @@ def _graph_identifier(value: str) -> str:
 
 
 def _build_graph_query_recommendations(topology: dict) -> list[dict[str, str]]:
-    """Build six marketing-oriented, executable GRAPH_TABLE query samples."""
+    """Build topology-aware read-only fallbacks when the LLM is unavailable.
+
+    These are intentionally generic. Business-specific names and SQL are produced
+    by LLMService from the current domain and the live graph metadata.
+    """
     graph_name = _graph_identifier(topology.get("graph_name") or "")
     vertex = lambda name: f"JSON_SERIALIZE(VERTEX_ID({name}) RETURNING VARCHAR2(4000))"
-    edge = "JSON_SERIALIZE(EDGE_ID(rel) RETURNING VARCHAR2(4000))"
-    labels = {str(node.get("displayName") or node.get("name") or "").upper() for node in (topology.get("nodes") or [])}
+    nodes = topology.get("nodes") or []
+    edges = topology.get("edges") or []
+
+    def safe_label(item: dict) -> str:
+        label = str(item.get("displayName") or item.get("name") or "").upper()
+        return label if re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", label) else ""
+
+    labels = [safe_label(item) for item in nodes]
+    labels = [item for item in labels if item]
+    first_label = labels[0] if labels else ""
+    second_label = labels[1] if len(labels) > 1 else first_label
+    first_name = str((nodes[0] if nodes else {}).get("displayName") or first_label or "实体")
+    second_name = str((nodes[1] if len(nodes) > 1 else {}).get("displayName") or second_label or "关联实体")
+    edge_name = str((edges[0] if edges else {}).get("name") or "关联")
 
     def graph_query(match: str, columns: str) -> str:
         return f"SELECT *\nFROM GRAPH_TABLE(\n  {graph_name}\n  MATCH {match}\n  COLUMNS (\n{columns}\n  )\n)"
 
-    fallback = (
-        f"SELECT *\nFROM GRAPH_TABLE(\n  {graph_name}\n  MATCH (src)-[rel]->(dst)\n  COLUMNS (\n"
-        f"    {vertex('src')} AS SOURCE_ID, {vertex('src')} AS SOURCE_LABEL,\n"
-        f"    {vertex('dst')} AS TARGET_ID, {vertex('dst')} AS TARGET_LABEL,\n    {edge} AS RELATION_NAME\n  )\n)"
-    )
-
-    def scenario(item_id: str, title: str, description: str, required: set[str], match: str, columns: str) -> dict[str, str]:
-        ready = required.issubset(labels)
-        return {
-            "id": item_id,
-            "title": title,
-            "description": description if ready else f"当前属性图缺少 {', '.join(sorted(required - labels))} 对象，已降级为全图关联探索。",
-            "graph_name": graph_name,
-            "sql": graph_query(match, columns) if ready else fallback,
-        }
+    direct_columns = f"    {vertex('src')} AS SOURCE_ID, {vertex('src')} AS SOURCE_LABEL,\n    {vertex('dst')} AS TARGET_ID, {vertex('dst')} AS TARGET_LABEL,\n    '{edge_name}' AS RELATION_NAME"
+    two_hop_columns = f"    {vertex('src')} AS SOURCE_ID, {vertex('src')} AS SOURCE_LABEL,\n    {vertex('dst')} AS TARGET_ID, {vertex('dst')} AS TARGET_LABEL,\n    '两跳关联' AS RELATION_NAME, {vertex('mid')} AS MIDDLE_ID"
+    source_pattern = f"(src IS {first_label})-[rel]->(dst)" if first_label else "(src)-[rel]->(dst)"
+    target_pattern = f"(src)-[rel]->(dst IS {second_label})" if second_label else "(src)-[rel]->(dst)"
+    pair_pattern = f"(src IS {first_label})-[rel]->(dst IS {second_label})" if first_label and second_label else "(src)-[rel]->(dst)"
 
     return [
-        scenario("promotion-effect-trace", "场景1：促销活动全链路效果追溯", "从促销活动追溯扫码触达、兑换订单和终端去向。", {"PROMOTIONACTIVITY", "CONSUMERSCAN", "EXCHANGEORDER", "RETAILSTORE"}, "(activity IS PROMOTIONACTIVITY)<-[rel]-(scan IS CONSUMERSCAN)-[]->(exchange_order IS EXCHANGEORDER)-[]->(store IS RETAILSTORE)", f"    {vertex('activity')} AS SOURCE_ID, activity.ACTIVITY_NAME AS SOURCE_LABEL,\n    {vertex('store')} AS TARGET_ID, store.STORE_NAME AS TARGET_LABEL,\n    '促销触达终端' AS RELATION_NAME, activity.ACTIVITY_CODE, activity.BUDGET_AMOUNT, scan.SCAN_TIME, exchange_order.ORDER_NO, exchange_order.PAY_AMOUNT"),
-        scenario("channel-risk-root-cause", "场景2：窜货根因分析", "定位高风险窜货记录关联的经销商、商品与区域。", {"CHANNELRISK", "DISTRIBUTOR", "PRODUCTSKU", "REGION"}, "(risk IS CHANNELRISK)-[rel]->(distributor IS DISTRIBUTOR), (risk IS CHANNELRISK)-[]->(sku IS PRODUCTSKU), (risk IS CHANNELRISK)-[]->(region IS REGION)", f"    {vertex('risk')} AS SOURCE_ID, risk.CHANNEL_RISK_ID AS SOURCE_LABEL,\n    {vertex('distributor')} AS TARGET_ID, distributor.DISTRIBUTOR_NAME AS TARGET_LABEL,\n    '窜货风险关联经销商' AS RELATION_NAME, risk.RISK_LEVEL, risk.RISK_SCORE, risk.CROSS_SCAN_COUNT, sku.SKU_NAME, region.REGION_NAME"),
-        scenario("low-sales-store", "场景3：低动销终端诊断", "按近 90 天零售订单定位终端、经销商与 SKU 的低动销线索。", {"RETAILORDER", "RETAILSTORE", "RETAILORDERITEM", "PRODUCTSKU"}, "(order_item IS RETAILORDERITEM)<-[rel]-(retail_order IS RETAILORDER)-[]->(store IS RETAILSTORE), (retail_order IS RETAILORDER)-[]->(order_item IS RETAILORDERITEM)-[]->(sku IS PRODUCTSKU)", f"    {vertex('retail_order')} AS SOURCE_ID, retail_order.ORDER_NO AS SOURCE_LABEL,\n    {vertex('store')} AS TARGET_ID, store.STORE_NAME AS TARGET_LABEL,\n    '终端零售订单' AS RELATION_NAME, retail_order.ORDER_DATE, retail_order.TOTAL_AMOUNT, order_item.QTY, sku.SKU_NAME"),
-        scenario("distributor-profile", "场景4：经销商全链路画像", "查看经销商覆盖终端、采购订单与库存的关联画像。", {"DISTRIBUTOR", "RETAILSTORE", "PURCHASEORDER", "DISTRIBUTORINVENTORY"}, "(store IS RETAILSTORE)-[rel]->(distributor IS DISTRIBUTOR)<-[]-(purchase_order IS PURCHASEORDER), (inventory IS DISTRIBUTORINVENTORY)-[]->(distributor IS DISTRIBUTOR)", f"    {vertex('store')} AS SOURCE_ID, store.STORE_NAME AS SOURCE_LABEL,\n    {vertex('distributor')} AS TARGET_ID, distributor.DISTRIBUTOR_NAME AS TARGET_LABEL,\n    '经销商覆盖终端' AS RELATION_NAME, distributor.DISTRIBUTOR_CODE, distributor.LEVEL_TYPE, purchase_order.ORDER_NO, purchase_order.TOTAL_AMOUNT, inventory.AVAILABLE_QTY"),
-        scenario("one-code-scan-insight", "场景5：一物一码扫码热度与消费者洞察", "查看消费者扫码、五码对象、商品和活动之间的关联，支持按时间与区域进一步筛选。", {"CONSUMERSCAN", "CODE", "PRODUCTSKU", "PROMOTIONACTIVITY"}, "(scan IS CONSUMERSCAN)-[rel]->(code IS CODE)-[]->(sku IS PRODUCTSKU), (scan IS CONSUMERSCAN)-[]->(activity IS PROMOTIONACTIVITY)", f"    {vertex('scan')} AS SOURCE_ID, scan.CONSUMER_SCAN_ID AS SOURCE_LABEL,\n    {vertex('code')} AS TARGET_ID, code.CODE_VALUE AS TARGET_LABEL,\n    '消费者扫码五码' AS RELATION_NAME, scan.SCAN_TIME, scan.PROVINCE, scan.CITY, scan.PRIZE_FLAG, scan.VERIFY_STATUS, sku.SKU_NAME, activity.ACTIVITY_NAME"),
-        scenario("promotion-roi-root-cause", "场景6：费用 ROI 根因分析", "关联活动预算、规则奖励、扫码和兑换订单，分析费用投入与转化结果。", {"PROMOTIONACTIVITY", "PROMOTIONRULE", "CONSUMERSCAN", "EXCHANGEORDER"}, "(activity IS PROMOTIONACTIVITY)-[rel]->(rule IS PROMOTIONRULE), (scan IS CONSUMERSCAN)-[]->(activity IS PROMOTIONACTIVITY), (scan IS CONSUMERSCAN)-[]->(exchange_order IS EXCHANGEORDER)", f"    {vertex('activity')} AS SOURCE_ID, activity.ACTIVITY_NAME AS SOURCE_LABEL,\n    {vertex('exchange_order')} AS TARGET_ID, exchange_order.ORDER_NO AS TARGET_LABEL,\n    '活动投入兑换转化' AS RELATION_NAME, activity.BUDGET_AMOUNT, rule.REWARD_AMOUNT, scan.SCAN_TIME, scan.PRIZE_FLAG, exchange_order.PAY_AMOUNT, exchange_order.ORDER_STATUS"),
+        {"id": "graph-overview", "title": "全图直接关联概览", "description": "浏览当前属性图中全部直接关联，确认可查询的实体连接情况。", "graph_name": graph_name, "sql": graph_query("(src)-[rel]->(dst)", direct_columns)},
+        {"id": "two-hop-path", "title": "两跳业务链路发现", "description": "发现经由中间实体形成的两跳业务关联，用于梳理可追溯链路。", "graph_name": graph_name, "sql": graph_query("(src)-[rel1]->(mid)-[rel2]->(dst)", two_hop_columns)},
+        {"id": "source-object-explore", "title": f"{first_name}关联对象探索", "description": f"从 {first_name} 出发查看其下游关联对象和 {edge_name} 关系。", "graph_name": graph_name, "sql": graph_query(source_pattern, direct_columns)},
+        {"id": "target-object-explore", "title": f"{second_name}上游关联探索", "description": f"定位与 {second_name} 直接相连的上游对象，辅助核查数据关系。", "graph_name": graph_name, "sql": graph_query(target_pattern, direct_columns)},
+        {"id": "object-pair-check", "title": f"{first_name}与{second_name}关系核查", "description": "核查两个代表性实体之间是否存在可用的直接图关系。", "graph_name": graph_name, "sql": graph_query(pair_pattern, direct_columns)},
+        {"id": "relation-sample", "title": "关系实例抽样核查", "description": "抽取属性图中的关系实例，作为后续按业务条件编写查询的起点。", "graph_name": graph_name, "sql": graph_query("(src)-[rel]->(dst)", direct_columns)},
     ]
 
 
@@ -91,10 +126,151 @@ async def get_graph_query_recommendations(
         raise HTTPException(status_code=502, detail=f"读取 Oracle Property Graph 元数据失败: {str(exc)}")
     if not topology.get("graph_name"):
         raise HTTPException(status_code=400, detail="当前业务分析域的目标数据库中没有可用的 Oracle 属性图")
+    cached = _get_graph_query_recommendation(
+        db, domain_id, source_id, topology.get("schema") or schema or "", topology["graph_name"],
+    )
+    recommendations = _load_cached_recommendations(cached)
+    cached_errors: list[str] = []
+    if recommendations:
+        graph_service = SourceDataService(db)
+        for item in recommendations:
+            try:
+                graph_service.validate_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=str(item.get("sql") or ""),
+                    schema=topology.get("schema") or schema or source.schema_name,
+                )
+            except Exception as exc:
+                cached_errors.append(str(exc))
+                break
+        if cached_errors:
+            recommendations = []
     return ApiResponse(data={
         "graph_name": topology["graph_name"],
         "graphs": topology.get("graphs") or [],
-        "recommendations": _build_graph_query_recommendations(topology),
+        "recommendations": recommendations,
+        "generation_mode": "cached" if recommendations else "idle",
+        "generation_message": "已显示此前生成并保存的 6 条业务场景与 Graph SQL；已通过 Oracle 语法预检。" if recommendations else ("此前保存的 Graph SQL 未通过当前 Oracle 语法预检，请点击“生成业务场景与 SQL”修复。" if cached_errors else "尚未生成业务场景。请点击“生成业务场景与 SQL”，系统将按当前业务分析域和属性图生成 6 条查询。"),
+        "generated_at": cached.updated_at.isoformat() if cached and recommendations else None,
+    })
+
+
+@router.post("/graph-query/recommendations/generate", response_model=ApiResponse)
+async def generate_graph_query_recommendations(
+    domain_id: str = Query(...),
+    source_id: str = Query(...),
+    schema: Optional[str] = Query(default=None),
+    graph_name: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Explicitly regenerate and persist six LLM business graph query scenarios."""
+    ensure_domain_access(db, current_user, domain_id)
+    source = db.query(SysDataSource).filter(
+        SysDataSource.source_id == source_id,
+        SysDataSource.is_active == "Y",
+    ).first()
+    if not source:
+        raise HTTPException(status_code=400, detail="数据源不存在或未启用")
+    if (source.db_type or "").lower() != "oracle":
+        raise HTTPException(status_code=400, detail="图数据查询仅支持 Oracle 数据源")
+    if source.business_domain_id and source.business_domain_id != domain_id:
+        raise HTTPException(status_code=400, detail="数据源不属于当前业务分析域")
+    try:
+        topology = SourceDataService(db).get_remote_property_graph_topology(
+            source_id=source_id,
+            graph_name=graph_name,
+            schema=schema or source.schema_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取 Oracle Property Graph 元数据失败: {str(exc)}")
+    if not topology.get("graph_name"):
+        raise HTTPException(status_code=400, detail="当前业务分析域的目标数据库中没有可用的 Oracle 属性图")
+
+    domain = db.query(SysDomain).filter(SysDomain.domain_id == domain_id).first()
+    blueprint = db.query(SysOntologyBlueprint).filter(
+        SysOntologyBlueprint.domain_id == domain_id,
+    ).order_by(SysOntologyBlueprint.updated_at.desc()).first()
+    try:
+        generated = await LLMService(db).generate_property_graph_query_recommendations(
+            domain=domain,
+            graph_topology=topology,
+            blueprint=blueprint,
+        )
+    except Exception as exc:
+        # 查询页面仍应可用；模型或上下文异常不能阻断用户查看实时图结构。
+        generated = {"recommendations": [], "generation_mode": "fallback", "generation_error": str(exc)}
+    recommendations = generated.get("recommendations") or []
+    graph_service = SourceDataService(db)
+
+    def validation_errors(items: list[dict]) -> list[str]:
+        errors: list[str] = []
+        for item in items:
+            try:
+                graph_service.validate_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=str(item.get("sql") or ""),
+                    schema=topology.get("schema") or schema or source.schema_name,
+                )
+            except Exception as exc:
+                errors.append(f"{item.get('title') or item.get('id')}: {str(exc)}")
+        return errors
+
+    errors = validation_errors(recommendations) if recommendations else []
+    if errors:
+        try:
+            generated = await LLMService(db).generate_property_graph_query_recommendations(
+                domain=domain,
+                graph_topology=topology,
+                blueprint=blueprint,
+                validation_feedback=errors,
+            )
+            recommendations = generated.get("recommendations") or []
+            errors = validation_errors(recommendations) if recommendations else errors
+        except Exception as exc:
+            recommendations = []
+            errors = [str(exc)]
+    if not recommendations or errors:
+        # 不以保底查询覆盖已有业务场景；用户可以继续使用最近一次有效结果。
+        cached = _get_graph_query_recommendation(
+            db, domain_id, source_id, topology.get("schema") or schema or "", topology["graph_name"],
+        )
+        cached_items = _load_cached_recommendations(cached)
+        if cached_items:
+            return ApiResponse(data={
+                "graph_name": topology["graph_name"], "graphs": topology.get("graphs") or [],
+                "recommendations": cached_items, "generation_mode": "cached",
+                "generation_message": "本次模型未生成有效的 6 条查询，已保留并显示此前保存的业务场景。",
+                "generated_at": cached.updated_at.isoformat(),
+            })
+        return ApiResponse(data={
+            "graph_name": topology["graph_name"], "graphs": topology.get("graphs") or [],
+            "recommendations": _build_graph_query_recommendations(topology), "generation_mode": "fallback",
+            "generation_message": "模型未生成通过 Oracle 语法预检的 6 条查询，当前展示基于实时属性图结构的保底探索查询；可稍后再次点击生成。",
+        })
+
+    schema_name = str(topology.get("schema") or schema or "").upper()
+    record = _get_graph_query_recommendation(db, domain_id, source_id, schema_name, topology["graph_name"])
+    if not record:
+        record = SysGraphQueryRecommendation(
+            domain_id=domain_id, source_id=source_id, schema_name=schema_name,
+            graph_name=topology["graph_name"].upper(), generated_by=current_user.get("user_id"),
+        )
+        db.add(record)
+    record.recommendations_json = json.dumps(recommendations, ensure_ascii=False)
+    record.generation_mode = "llm"
+    record.generated_by = current_user.get("user_id")
+    db.commit()
+    db.refresh(record)
+    return ApiResponse(data={
+        "graph_name": topology["graph_name"],
+        "graphs": topology.get("graphs") or [],
+        "recommendations": recommendations,
+        "generation_mode": "llm",
+        "generation_message": "已基于当前业务分析域、属性图 DDL、顶点/边及其全部属性生成；6 条 SQL 均已通过 Oracle 语法预检并保存。",
+        "generated_at": record.updated_at.isoformat(),
     })
 
 

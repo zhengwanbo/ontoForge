@@ -680,7 +680,7 @@ class SourceDataService:
                 cursor,
                 source,
                 """
-                SELECT e.ELEMENT_NAME, c.COLUMN_NAME,
+                SELECT e.ELEMENT_NAME, e.ELEMENT_KIND, c.COLUMN_NAME,
                        c.DATA_TYPE || CASE
                            WHEN c.DATA_TYPE IN ('VARCHAR2','VARCHAR','CHAR','NCHAR','NVARCHAR2','RAW') THEN '(' || c.DATA_LENGTH || ')'
                            WHEN c.DATA_TYPE = 'NUMBER' AND c.DATA_PRECISION IS NOT NULL AND c.DATA_SCALE IS NOT NULL THEN '(' || c.DATA_PRECISION || ',' || c.DATA_SCALE || ')'
@@ -694,7 +694,6 @@ class SourceDataService:
                 LEFT JOIN ALL_COL_COMMENTS cc
                   ON cc.OWNER = c.OWNER AND cc.TABLE_NAME = c.TABLE_NAME AND cc.COLUMN_NAME = c.COLUMN_NAME
                 WHERE e.OWNER = :owner AND e.GRAPH_NAME = :graph_name
-                  AND e.ELEMENT_KIND = 'VERTEX'
                 ORDER BY e.ELEMENT_NAME, c.COLUMN_ID
                 """,
                 binds,
@@ -714,6 +713,21 @@ class SourceDataService:
             )
             edge_rows = self._fetchall_logged(cursor, source, f"property_graph_edges:{owner}:{selected_graph}")
 
+            # 将数据库真实 DDL 一并带回。部分旧版本数据库可能不支持
+            # PROPERTY_GRAPH 元数据类型，此时仍保留完整元素/属性元数据供调用方使用。
+            graph_ddl = ""
+            try:
+                self._execute_remote_sql(
+                    cursor,
+                    source,
+                    "SELECT DBMS_METADATA.GET_DDL('PROPERTY_GRAPH', :graph_name, :owner) FROM DUAL",
+                    binds,
+                )
+                ddl_row = self._fetchone_logged(cursor, source, f"property_graph_ddl:{owner}:{selected_graph}")
+                graph_ddl = str(ddl_row[0] or "") if ddl_row else ""
+            except Exception as ddl_exc:
+                logger.info("Property Graph DDL metadata is unavailable for %s.%s: %s", owner, selected_graph, ddl_exc)
+
             return self._assemble_property_graph_topology(
                 source=source,
                 owner=owner,
@@ -724,6 +738,7 @@ class SourceDataService:
                 key_rows=key_rows,
                 column_rows=column_rows,
                 edge_rows=edge_rows,
+                graph_ddl=graph_ddl,
             )
 
         return self._run_with_remote_retry(source, f"get_remote_property_graph_topology:{source_id}", action)
@@ -739,6 +754,7 @@ class SourceDataService:
         key_rows: List[Any],
         column_rows: List[Any],
         edge_rows: List[Any],
+        graph_ddl: str = "",
     ) -> Dict[str, Any]:
         labels_by_element: Dict[str, List[str]] = {}
         for element_name, label_name in label_rows:
@@ -747,7 +763,7 @@ class SourceDataService:
         for element_name, column_name in key_rows:
             keys_by_element.setdefault(element_name, set()).add(column_name)
         columns_by_element: Dict[str, List[Dict[str, Any]]] = {}
-        for element_name, column_name, data_type, nullable, order_num, comments in column_rows:
+        for element_name, element_kind, column_name, data_type, nullable, order_num, comments in column_rows:
             columns_by_element.setdefault(element_name, []).append({
                 "property_name": column_name,
                 "property_display_name": comments,
@@ -809,6 +825,7 @@ class SourceDataService:
                         "relationTableName": edge_tab,
                         "relationObjectType": "EDGE",
                         "mappingData": {"graph_name": graph_name, "edge_element": edge_tab},
+                        "properties": columns_by_element.get(edge_tab, []),
                     })
         return {
             "source_id": source.source_id,
@@ -816,6 +833,7 @@ class SourceDataService:
             "schema": owner,
             "graphs": [{"owner": owner, "graph_name": name} for name in graph_names],
             "graph_name": graph_name,
+            "graph_ddl": graph_ddl,
             "nodes": nodes,
             "edges": edges,
         }
@@ -1139,6 +1157,35 @@ class SourceDataService:
             }
 
         return self._run_with_remote_retry(source, f"execute_remote_graph_query:{source_id}", action)
+
+    def validate_remote_graph_query(
+        self,
+        source_id: str,
+        graph_sql: str,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Ask Oracle to parse a Graph SQL statement without retrieving data.
+
+        A string-level check cannot catch invalid graph path syntax (ORA-40997),
+        invalid labels, or unavailable properties.  Wrapping the statement with
+        ``WHERE 1 = 0`` makes Oracle compile GRAPH_TABLE while returning no rows.
+        """
+        source = self._get_data_source(source_id)
+        normalized_sql = (graph_sql or "").strip().rstrip(";")
+        upper_sql = normalized_sql.upper()
+        if not normalized_sql or not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")) or "GRAPH_TABLE" not in upper_sql:
+            raise ValueError("待校验 SQL 必须是包含 GRAPH_TABLE 的只读 SELECT / WITH 查询")
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "graph_query_validate_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            self._execute_remote_sql(cursor, source, f"SELECT * FROM (\n{normalized_sql}\n) WHERE 1 = 0")
+            return None
+
+        self._run_with_remote_retry(source, f"validate_remote_graph_query:{source_id}", action)
 
     def get_remote_property_graph_instances(
         self,

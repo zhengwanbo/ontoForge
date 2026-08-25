@@ -1711,6 +1711,129 @@ class LLMService:
             "llm_raw_output": result_text,
         }
 
+    async def generate_property_graph_query_recommendations(
+        self,
+        domain: Any,
+        graph_topology: Dict[str, Any],
+        blueprint: Optional[Any] = None,
+        validation_feedback: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate domain-specific, executable Oracle Property Graph query ideas.
+
+        The model is deliberately given only the live graph contract (DDL, labels,
+        edge endpoints and all exposed properties).  This prevents it from carrying
+        fixed scenarios from another business domain into the current graph.
+        """
+        config = self._get_default_config()
+        graph_name = str(graph_topology.get("graph_name") or "").upper()
+        if not config:
+            return {"recommendations": [], "generation_mode": "fallback", "generation_error": "没有可用的大模型配置"}
+
+        vertex_labels = {
+            str(item.get("id") or ""): str(item.get("displayName") or item.get("name") or "")
+            for item in graph_topology.get("nodes") or []
+        }
+
+        def compact_element(item: Dict[str, Any], is_edge: bool = False) -> Dict[str, Any]:
+            properties = item.get("properties") or []
+            return {
+                "label": item.get("displayName") or item.get("name"),
+                "element_name": item.get("name"),
+                "business_name": item.get("displayName") or item.get("name"),
+                "description": item.get("desc") or "",
+                "table": item.get("relationTableName") if is_edge else item.get("tableName"),
+                "source": vertex_labels.get(str(item.get("source") or ""), item.get("source")) if is_edge else None,
+                "target": vertex_labels.get(str(item.get("target") or ""), item.get("target")) if is_edge else None,
+                "properties": [
+                    {"name": prop.get("property_name"), "business_name": prop.get("property_display_name"), "type": prop.get("data_type"), "key": prop.get("is_primary_key")}
+                    for prop in properties
+                ],
+            }
+
+        payload = {
+            "business_domain": {"name": getattr(domain, "domain_name", ""), "description": getattr(domain, "domain_desc", "")},
+            "ontology_design_summary": self._truncate_text(str(getattr(blueprint, "summary_json", "") or ""), 5000),
+            "property_graph": {
+                "name": graph_name,
+                "ddl": self._truncate_text(str(graph_topology.get("graph_ddl") or ""), 12000),
+                "vertices": [compact_element(item) for item in graph_topology.get("nodes") or []],
+                "edges": [compact_element(item, True) for item in graph_topology.get("edges") or []],
+            },
+        }
+        system_prompt = """你是 Oracle Database 26ai 属性图查询专家。只为当前业务分析域生成查询场景，绝不能使用其他业务域的固定模板。
+你只能使用输入中真实存在的属性图名称、顶点标签、边标签和属性；不得虚构任何对象或字段。
+输出严格 JSON，不要 Markdown，不要解释。"""
+        user_prompt = f"""请根据以下业务分析域要求及 Oracle 属性图实际 DDL/元数据，生成恰好 6 个彼此不同、对业务人员有价值的图查询场景。
+
+输入：
+{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}
+
+返回格式：
+{{"recommendations":[{{"id":"英文短标识","title":"中文业务场景标题","description":"说明要解决的业务问题","sql":"可直接执行的 Oracle Graph SQL"}}]}}
+
+SQL 强制要求：
+1. 只能是 SELECT 或 WITH 开头，必须使用 GRAPH_TABLE({graph_name} ...)；不得 DDL/DML/PLSQL。
+2. 每条 SQL 使用真实标签和真实属性。若需要展示图关系，结果列优先别名为 SOURCE_ID、SOURCE_LABEL、TARGET_ID、TARGET_LABEL、RELATION_NAME。
+3. 用 JSON_SERIALIZE(VERTEX_ID(v) RETURNING VARCHAR2(4000)) 取顶点 ID，避免假设底层主键字段；边名可使用真实边属性，缺失时使用固定中文文本。
+4. 没有充分数据依据时，应做“关联探索/链路核查/对象画像”等可执行探索，不要凭空写阈值、时间范围或业务结论。
+5. 六条场景要覆盖不同的对象或关系组合，避免六条仅替换标题。
+6. SQL 必须按 Oracle GRAPH_TABLE 标准语法多行缩进格式输出；路径只能使用 `(v IS 顶点标签)-[e IS 边标签]->(w IS 顶点标签)`、`(v)-[e]->(w)` 等基本形式。不要使用不存在的标签、逗号拼接路径、路径量词或任何未在元数据中出现的模式。"""
+        if validation_feedback:
+            user_prompt += "\n\n上一轮 SQL 已由 Oracle 实际解析，以下错误必须全部修复；请重新输出完整 6 条 JSON，不得保留错误语句：\n" + "\n".join(
+                f"- {self._truncate_text(str(item), 800)}" for item in validation_feedback[:12]
+            )
+        raw_output = await self.call_llm(
+            system_prompt,
+            user_prompt,
+            config=config,
+            timeout_override=max(int(config.timeout or 60), 180),
+        )
+        parsed = self._extract_json_object(raw_output)
+        items = (parsed or {}).get("recommendations") if isinstance(parsed, dict) else None
+        normalized: List[Dict[str, str]] = []
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                sql = str(item.get("sql") or "").strip().rstrip(";")
+                if not self._is_safe_property_graph_query(sql, graph_name):
+                    continue
+                title = str(item.get("title") or "").strip()
+                description = str(item.get("description") or "").strip()
+                if not title or not description:
+                    continue
+                normalized.append({
+                    "id": re.sub(r"[^a-z0-9_-]+", "-", str(item.get("id") or f"scenario-{index + 1}").lower()).strip("-") or f"scenario-{index + 1}",
+                    "title": title,
+                    "description": description,
+                    "graph_name": graph_name,
+                    "sql": sql,
+                })
+                if len(normalized) == 6:
+                    break
+        if len(normalized) != 6:
+            return {
+                "recommendations": [],
+                "generation_mode": "fallback",
+                "generation_error": str((parsed or {}).get("error") or "模型未返回 6 条可执行的 Graph SQL"),
+                "llm_raw_output": raw_output,
+            }
+        return {
+            "recommendations": normalized,
+            "generation_mode": "llm",
+            "model": self._config_brief(config),
+            "llm_raw_output": raw_output,
+        }
+
+    @staticmethod
+    def _is_safe_property_graph_query(sql: str, graph_name: str) -> bool:
+        normalized = " ".join((sql or "").upper().split())
+        if not normalized.startswith(("SELECT ", "WITH ")) or "GRAPH_TABLE" not in normalized:
+            return False
+        if graph_name and not re.search(rf"GRAPH_TABLE\s*\(\s*{re.escape(graph_name.upper())}\b", normalized):
+            return False
+        return not any(re.search(rf"\b{token}\b", normalized) for token in ("INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "ALTER", "CREATE", "EXECUTE", "BEGIN", "DECLARE"))
+
     async def generate_semantic_deployment_design(
         self,
         domain: Any,

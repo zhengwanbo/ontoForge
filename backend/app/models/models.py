@@ -341,6 +341,22 @@ class SysOntologyBlueprint(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class SysGraphQueryRecommendation(Base):
+    """Persisted LLM graph-query scenarios, scoped to one live Property Graph."""
+    __tablename__ = "sys_graph_query_recommendation"
+
+    recommendation_id = Column(String(50), primary_key=True, default=lambda: generate_id("gqr"))
+    domain_id = Column(String(50), nullable=False, index=True)
+    source_id = Column(String(50), nullable=False, index=True)
+    schema_name = Column(String(100), nullable=False)
+    graph_name = Column(String(128), nullable=False)
+    recommendations_json = Column(Text, nullable=False)
+    generation_mode = Column(String(20), default="llm")
+    generated_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SysUser(Base):
     __tablename__ = "sys_user"
 

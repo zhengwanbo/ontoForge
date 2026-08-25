@@ -79,6 +79,8 @@ export const sourceApi = {
   ) => api.post(`/source/datasources/${sourceId}/tables/${encodeURIComponent(tableName)}/annotation/save`, data),
   getGraphQueryRecommendations: (domainId: string, sourceId: string, params?: { schema?: string; graph_name?: string }) =>
     api.get('/source/graph-query/recommendations', { params: { domain_id: domainId, source_id: sourceId, ...params } }),
+  generateGraphQueryRecommendations: (domainId: string, sourceId: string, params?: { schema?: string; graph_name?: string }) =>
+    api.post('/source/graph-query/recommendations/generate', null, { params: { domain_id: domainId, source_id: sourceId, ...params }, timeout: 200000 }),
   executeGraphQuery: (data: { domain_id: string; source_id: string; schema?: string; graph_sql: string; row_limit: number }) =>
     api.post('/source/graph-query', data, { timeout: 120000 }),
 }
