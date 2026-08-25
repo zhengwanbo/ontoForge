@@ -17,6 +17,7 @@ from app.api.process import router as process_router
 from app.api.datasource import router as datasource_router
 from app.api.business_rules import router as business_rules_router
 from app.api.agent import router as agent_router
+from app.api.dashboard import router as dashboard_router
 from app.schemas.schemas import ApiResponse
 
 logger = get_logger(__name__)
@@ -177,6 +178,7 @@ app.include_router(process_router, prefix=settings.API_PREFIX)
 app.include_router(datasource_router, prefix=settings.API_PREFIX)
 app.include_router(business_rules_router, prefix=settings.API_PREFIX)
 app.include_router(agent_router, prefix=settings.API_PREFIX)
+app.include_router(dashboard_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/", response_model=ApiResponse)

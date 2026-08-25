@@ -103,6 +103,10 @@ export const domainApi = {
   delete: (id: string) => api.delete(`/domains/${id}`)
 }
 
+export const dashboardApi = {
+  getOverview: (domainId: string) => api.get(`/dashboard/domains/${domainId}/overview`),
+}
+
 // ====== Business Type Semantic API ======
 export const businessTypeApi = {
   list: () => api.get('/business-types'),

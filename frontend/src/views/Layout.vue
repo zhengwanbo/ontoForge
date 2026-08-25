@@ -20,9 +20,13 @@
         text-color="#ccc"
         active-text-color="#fff"
       >
+        <el-menu-item index="/home">
+          <el-icon><HomeFilled /></el-icon>
+          <span>首页</span>
+        </el-menu-item>
         <el-sub-menu index="/source">
           <template #title>
-            <el-icon><Database /></el-icon>
+            <el-icon><DataBoard /></el-icon>
             <span>源数据管理</span>
           </template>
           <el-menu-item index="/source/browse">

@@ -11,9 +11,15 @@ const routes = [
     path: '/',
     name: 'Layout',
     component: () => import('../views/Layout.vue'),
-    redirect: '/business/domains',
+    redirect: '/home',
     meta: { requiresAuth: true },
     children: [
+      {
+        path: 'home',
+        name: 'HomeDashboard',
+        component: () => import('../views/HomeDashboard.vue'),
+        meta: { title: '首页', icon: 'HomeFilled' }
+      },
       {
         path: 'source',
         redirect: '/source/browse'
