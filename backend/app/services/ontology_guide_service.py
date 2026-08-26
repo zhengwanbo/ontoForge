@@ -2931,6 +2931,7 @@ class OntologyGuideService:
                     target_entity_name=target_entity_name,
                     entity_display_map=entity_display_map,
                 ),
+                "relationPredicate": relation.get("relationPredicate") or relation.get("relation_predicate") or "",
                 "relationType": relation.get("relationType") or "ASSOCIATION",
                 "relationDesc": relation.get("relationDesc") or "",
                 "evidenceTables": relation.get("evidenceTables") or [],
@@ -4042,13 +4043,11 @@ class OntologyGuideService:
         if explicit:
             return explicit if explicit.startswith("ONTO_") else f"ONTO_EDGE_{explicit}"
 
-        if relation_type == "MANY_TO_MANY":
-            return f"ONTO_REL_{source_entity_name.upper()}_{target_entity_name.upper()}"
-
         predicate = self._build_relation_predicate_token(
             str(relation_data.get("relationName") or "").strip(),
             source_entity_name=source_entity_name,
             target_entity_name=target_entity_name,
+            llm_predicate=str(relation_data.get("relationPredicate") or relation_data.get("relation_predicate") or "").strip(),
         )
         return f"ONTO_EDGE_{source_entity_name.upper()}_{predicate}_{target_entity_name.upper()}"
 
@@ -4057,6 +4056,7 @@ class OntologyGuideService:
         relation_name: str,
         source_entity_name: str,
         target_entity_name: str,
+        llm_predicate: str = "",
     ) -> str:
         mapping = {
             "属于": "BELONGS_TO",
@@ -4079,10 +4079,16 @@ class OntologyGuideService:
         if relation_name in mapping:
             return mapping[relation_name]
 
-        ascii_name = re.sub(r"[^A-Z0-9]+", "_", str(relation_name or "").upper()).strip("_")
-        if ascii_name:
-            return ascii_name[:48]
-        return f"REL_{source_entity_name.upper()}_{target_entity_name.upper()}"[:48]
+        # The LLM produces a predicate only (for example USES), never a full
+        # source/target expression.  This avoids names such as
+        # EQUIPMENT_REL_EQUIPMENT_WORKSHOP_WORKSHOP.
+        predicate = re.sub(r"[^A-Z0-9]+", "_", llm_predicate.upper()).strip("_")
+        if predicate and not predicate.startswith("ONTO_"):
+            return predicate[:48]
+
+        # A valid graph edge still needs a portable name when no configured
+        # vocabulary or model suggestion is available.
+        return "RELATED_TO"
 
     def _upsert_entity_mapping_seed(
         self,

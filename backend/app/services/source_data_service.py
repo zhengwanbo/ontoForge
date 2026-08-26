@@ -1187,6 +1187,203 @@ class SourceDataService:
 
         self._run_with_remote_retry(source, f"validate_remote_graph_query:{source_id}", action)
 
+    def probe_remote_graph_query(
+        self,
+        source_id: str,
+        graph_sql: str,
+        schema: Optional[str] = None,
+    ) -> bool:
+        """Return whether an already validated Graph SQL has at least one row."""
+        source = self._get_data_source(source_id)
+        normalized_sql = (graph_sql or "").strip().rstrip(";")
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "graph_query_probe_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            self._execute_remote_sql(cursor, source, f"SELECT 1 FROM (\n{normalized_sql}\n) WHERE ROWNUM = 1")
+            return bool(self._fetchone_logged(cursor, source, "graph_query_probe"))
+
+        return bool(self._run_with_remote_retry(source, f"probe_remote_graph_query:{source_id}", action))
+
+    @staticmethod
+    def _safe_graph_object_name(value: str) -> str:
+        parts = [part.strip().upper() for part in str(value or "").split(".") if part.strip()]
+        if not parts or not all(re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", part) for part in parts):
+            raise ValueError(f"属性图元数据中的对象名称不合法: {value}")
+        return ".".join(parts)
+
+    def get_remote_property_graph_query_contract(
+        self,
+        source_id: str,
+        topology: Dict[str, Any],
+        schema: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build the LLM-safe graph contract and profile live vertex/edge rows.
+
+        The contract deliberately retains the edge *element* and its exact source
+        and destination labels.  A shared GRAPH_LABEL alone is insufficient for
+        generating a safe business traversal.
+        """
+        source = self._get_data_source(source_id)
+        nodes = topology.get("nodes") or []
+        node_by_id = {str(item.get("id") or ""): item for item in nodes}
+        vertex_rows = []
+        for node in nodes:
+            label = str(node.get("displayName") or node.get("name") or "").upper()
+            if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", label):
+                continue
+            vertex_rows.append({
+                "label": label,
+                "element_name": node.get("name"),
+                "table_name": self._safe_graph_object_name(node.get("tableName") or ""),
+                "key_properties": [prop.get("property_name") for prop in node.get("properties") or [] if prop.get("is_primary_key") == "Y"],
+                "properties": [
+                    {"name": str(prop.get("property_name") or "").upper(), "business_name": prop.get("property_display_name") or "", "data_type": prop.get("data_type") or ""}
+                    for prop in node.get("properties") or [] if prop.get("property_name")
+                ],
+                "row_count": 0,
+            })
+        edge_rows = []
+        for edge in topology.get("edges") or []:
+            source_node, target_node = node_by_id.get(str(edge.get("source") or "")), node_by_id.get(str(edge.get("target") or ""))
+            if not source_node or not target_node:
+                continue
+            source_label = str(source_node.get("displayName") or source_node.get("name") or "").upper()
+            target_label = str(target_node.get("displayName") or target_node.get("name") or "").upper()
+            edge_label = str(edge.get("name") or "").upper()
+            if not all(re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", value) for value in (source_label, target_label, edge_label)):
+                continue
+            edge_rows.append({
+                "edge_element": str(edge.get("relationTableName") or "").upper(),
+                "edge_label": edge_label,
+                "business_name": edge.get("name") or edge.get("relationTableName") or "关系",
+                "description": edge.get("desc") or "",
+                "source_label": source_label,
+                "target_label": target_label,
+                "table_name": self._safe_graph_object_name(edge.get("relationTableName") or ""),
+                "properties": [
+                    {"name": str(prop.get("property_name") or "").upper(), "business_name": prop.get("property_display_name") or "", "data_type": prop.get("data_type") or ""}
+                    for prop in edge.get("properties") or [] if prop.get("property_name")
+                ],
+                "row_count": 0,
+            })
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "graph_contract_connected_user")[0]
+            owner = (schema or topology.get("schema") or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            for vertex in vertex_rows:
+                self._execute_remote_sql(cursor, source, f"SELECT COUNT(*) FROM {vertex['table_name']}")
+                vertex["row_count"] = int((self._fetchone_logged(cursor, source, f"graph_contract_vertex:{vertex['label']}") or [0])[0] or 0)
+            for edge in edge_rows:
+                self._execute_remote_sql(cursor, source, f"SELECT COUNT(*) FROM {edge['table_name']}")
+                edge["row_count"] = int((self._fetchone_logged(cursor, source, f"graph_contract_edge:{edge['edge_element']}") or [0])[0] or 0)
+            return owner
+
+        owner = self._run_with_remote_retry(source, f"get_property_graph_query_contract:{source_id}", action)
+        return {
+            "graph_name": str(topology.get("graph_name") or "").upper(),
+            "schema": owner,
+            "vertices": vertex_rows,
+            "edges": edge_rows,
+            "graph_ddl": topology.get("graph_ddl") or "",
+        }
+
+    @staticmethod
+    def compile_property_graph_query_plan(contract: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a structured LLM plan against the graph contract and compile SQL."""
+        graph_name = str(contract.get("graph_name") or "").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", graph_name):
+            raise ValueError("属性图名称不合法")
+        vertices = {str(item.get("label") or "").upper(): item for item in contract.get("vertices") or []}
+        edges = {str(item.get("edge_element") or "").upper(): item for item in contract.get("edges") or []}
+        patterns = plan.get("patterns") or []
+        if not isinstance(patterns, list) or not 1 <= len(patterns) <= 5:
+            raise ValueError("查询计划必须包含 1 至 5 条关系路径")
+        variable_labels: Dict[str, str] = {}
+        rendered_patterns = []
+        for index, pattern in enumerate(patterns, 1):
+            if not isinstance(pattern, dict):
+                raise ValueError("查询路径格式不正确")
+            source_var, target_var = str(pattern.get("source_var") or ""), str(pattern.get("target_var") or "")
+            source_label, target_label = str(pattern.get("source_label") or "").upper(), str(pattern.get("target_label") or "").upper()
+            edge_element = str(pattern.get("edge_element") or "").upper()
+            if not all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,30}", value) for value in (source_var, target_var)):
+                raise ValueError("路径变量名称不合法")
+            edge = edges.get(edge_element)
+            if not edge or edge.get("source_label") != source_label or edge.get("target_label") != target_label:
+                raise ValueError(f"图中不存在关系路径 {source_label} -[{edge_element}]-> {target_label}")
+            same_pair_edges = [
+                item for item in edges.values()
+                if item.get("source_label") == source_label
+                and item.get("target_label") == target_label
+                and item.get("edge_label") == edge.get("edge_label")
+            ]
+            if len(same_pair_edges) > 1:
+                raise ValueError(
+                    f"关系路径 {source_label} → {target_label} 存在多个同名边标签，无法精确选择 {edge_element}；"
+                    "请重新部署属性图以使用唯一边标签。"
+                )
+            if int(edge.get("row_count") or 0) <= 0:
+                raise ValueError(f"关系 {edge_element} 当前没有实例数据")
+            for variable, label in ((source_var, source_label), (target_var, target_label)):
+                if label not in vertices:
+                    raise ValueError(f"图中不存在顶点标签 {label}")
+                if variable_labels.get(variable) and variable_labels[variable] != label:
+                    raise ValueError(f"变量 {variable} 被绑定到了不同的顶点标签")
+                variable_labels[variable] = label
+            edge_label = str(edge.get("edge_label") or "").upper()
+            edge_var = f"e{index}"
+            rendered_patterns.append(f"({source_var} IS {source_label})-[{edge_var} IS {edge_label}]->({target_var} IS {target_label})")
+        anchor_var, target_var = str(plan.get("anchor_var") or ""), str(plan.get("target_var") or "")
+        if anchor_var not in variable_labels or target_var not in variable_labels:
+            raise ValueError("查询计划的起点或终点不在关系路径中")
+        title = str(plan.get("title") or "").strip()
+        description = str(plan.get("description") or "").strip()
+        if not title or not description:
+            raise ValueError("查询计划缺少业务场景标题或说明")
+        sql_literal = title.replace("'", "''")
+        columns = [
+            f"JSON_SERIALIZE(VERTEX_ID({anchor_var}) RETURNING VARCHAR2(4000)) AS SOURCE_ID",
+            f"'{variable_labels[anchor_var]}' AS SOURCE_LABEL",
+            f"JSON_SERIALIZE(VERTEX_ID({target_var}) RETURNING VARCHAR2(4000)) AS TARGET_ID",
+            f"'{variable_labels[target_var]}' AS TARGET_LABEL",
+            f"'{sql_literal}' AS RELATION_NAME",
+        ]
+        used_aliases = {"SOURCE_ID", "SOURCE_LABEL", "TARGET_ID", "TARGET_LABEL", "RELATION_NAME"}
+        for prop in (plan.get("properties") or [])[:15]:
+            if not isinstance(prop, dict):
+                continue
+            variable, property_name = str(prop.get("var") or ""), str(prop.get("property") or "").upper()
+            if variable not in variable_labels:
+                raise ValueError(f"属性变量 {variable} 未出现在关系路径中")
+            allowed = {str(item.get("name") or "").upper() for item in vertices[variable_labels[variable]].get("properties") or []}
+            if property_name not in allowed:
+                raise ValueError(f"顶点 {variable_labels[variable]} 不存在属性 {property_name}")
+            alias = re.sub(r"[^A-Z0-9_]+", "_", str(prop.get("alias") or f"{variable}_{property_name}").upper()).strip("_")[:30]
+            if not alias or alias in used_aliases:
+                continue
+            used_aliases.add(alias)
+            columns.append(f"{variable}.{property_name} AS {alias}")
+        sql = "SELECT *\nFROM GRAPH_TABLE (\n  {graph}\n  MATCH\n    {patterns}\n  COLUMNS (\n    {columns}\n  )\n)".format(
+            graph=graph_name,
+            patterns=",\n    ".join(rendered_patterns),
+            columns=",\n    ".join(columns),
+        )
+        return {
+            "id": re.sub(r"[^a-z0-9_-]+", "-", str(plan.get("id") or title).lower()).strip("-") or "graph-scenario",
+            "title": title,
+            "description": description,
+            "graph_name": graph_name,
+            "sql": sql,
+            "query_plan": plan,
+        }
+
     def get_remote_property_graph_instances(
         self,
         source_id: str,

@@ -123,6 +123,14 @@ class DDLService:
                     str(exc),
                     "去数据映射修复实体",
                 )
+            projection_gaps = self._get_multi_source_node_projection_gaps(entity)
+            if projection_gaps:
+                entity_issue(
+                    entity,
+                    "ENTITY_NODE_SQL_PROPERTY_INCOMPLETE",
+                    "多来源节点 SQL 未输出全部已确认属性：" + "、".join(projection_gaps),
+                    "去数据映射补齐节点 Join 与属性投影",
+                )
 
         for relation in relations:
             relation_name = relation.relation_name or relation.relation_id
@@ -705,12 +713,17 @@ COMMENT ON TABLE {view_name} IS '{purpose}';"""
             if not self._relation_join_is_deployable(relation, source_entity, target_entity):
                 continue
             edge_table_name = self._resolve_relation_storage_name(relation)
+            # 不能让所有边共用 GRAPH_LABEL。唯一边标签使图查询能够精确
+            # 表达“发生于工序”和“使用设备”等不同关系，而非仅凭端点猜测。
+            edge_label = self._sanitize_graph_label(
+                re.sub(r"^ONTO_EDGE_", "", edge_table_name, flags=re.IGNORECASE)
+            )
             edge_specs.append(
                 f"  {edge_table_name}\n"
                 f"    KEY (EDGE_ID)\n"
                 f"    SOURCE KEY (SOURCE_ID) REFERENCES {source_entity.table_name or f'ONTO_NODE_{source_entity.entity_name.upper()}'} ({source_pk})\n"
                 f"    DESTINATION KEY (TARGET_ID) REFERENCES {target_entity.table_name or f'ONTO_NODE_{target_entity.entity_name.upper()}'} ({target_pk})\n"
-                f"    LABEL {self._sanitize_graph_label(relation.relation_name or relation.relation_type)}\n"
+                f"    LABEL {edge_label}\n"
                 f"    PROPERTIES ARE ALL COLUMNS"
             )
 
@@ -1175,6 +1188,62 @@ SELECT
             if re.search(rf"\b{identifier}\b", explicit_sql):
                 columns.add(identifier)
         return columns
+
+    def _get_multi_source_node_projection_gaps(self, entity: SysOntologyEntity) -> List[str]:
+        """Detect stale multi-table node SQL before it silently drops attributes."""
+        entity_mapping = getattr(entity, "entity_mapping", None)
+        explicit_sql = (getattr(entity_mapping, "view_sql", None) or "").strip()
+        if not explicit_sql:
+            return []
+        mapped_properties = [
+            prop for prop in (entity.properties or [])
+            if getattr(prop, "mapping", None)
+            and (
+                ((prop.mapping.mapping_type or "").upper() == "DIRECT" and (prop.mapping.source_table or "").strip() and (prop.mapping.source_column or "").strip())
+                or ((prop.mapping.mapping_type or "").upper() == "COMPUTED" and (prop.mapping.source_table or "").strip() and (prop.mapping.formula_expr or "").strip())
+            )
+        ]
+        source_tables = {
+            (prop.mapping.source_table or "").strip().upper()
+            for prop in mapped_properties
+            if (prop.mapping.source_table or "").strip()
+        }
+        if len(source_tables) < 2:
+            return []
+        projected = self._extract_final_select_aliases(explicit_sql)
+        return sorted({(prop.property_name or "").strip().upper() for prop in mapped_properties if (prop.property_name or "").strip()} - projected)
+
+    @staticmethod
+    def _extract_final_select_aliases(sql: str) -> set[str]:
+        statement = (sql or "").strip().rstrip(";")
+        depth = 0
+        final_select = -1
+        for match in re.finditer(r"(?i)\bSELECT\b|[()]", statement):
+            token = match.group(0).upper()
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth = max(depth - 1, 0)
+            elif depth == 0:
+                final_select = match.start()
+        if final_select < 0:
+            return set()
+        final_from = None
+        depth = 0
+        for match in re.finditer(r"(?i)\bFROM\b|[()]", statement[final_select + 6:]):
+            token = match.group(0).upper()
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth = max(depth - 1, 0)
+            elif token == "FROM" and depth == 0:
+                final_from = final_select + 6 + match.start()
+                break
+        projection = statement[final_select:final_from] if final_from else statement[final_select:]
+        return {
+            alias.upper()
+            for alias in re.findall(r"(?i)\bAS\s+([A-Z][A-Z0-9_$#]*)\b", projection)
+        }
 
     def _build_entity_source_query(self, entity: SysOntologyEntity) -> str:
         entity_mapping = getattr(entity, "entity_mapping", None)

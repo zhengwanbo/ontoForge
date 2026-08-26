@@ -1677,6 +1677,11 @@ async def _run_bulk_auto_mapping_job_async(
             for item in (graph_mapping_design.get("entity_mappings") or [])
             if item.get("entity_id")
         }
+        node_issues_by_entity = {
+            item.get("entity_id"): item
+            for item in (graph_mapping_design.get("entity_mapping_issues") or [])
+            if item.get("entity_id")
+        }
         results = [
             _merge_holistic_node_design(
                 item,
@@ -1684,6 +1689,11 @@ async def _run_bulk_auto_mapping_job_async(
             )
             for item in results
         ]
+        for entity_result in results:
+            issue = node_issues_by_entity.get(entity_result.get("entity_id"))
+            if issue:
+                entity_result["node_mapping_issue"] = issue
+                entity_result["error_message"] = issue.get("message") or "多来源节点 SQL 校验未通过。"
         if request_payload.get("auto_apply"):
             entity_by_id = {entity.entity_id: entity for entity in entities}
             for entity_result in results:

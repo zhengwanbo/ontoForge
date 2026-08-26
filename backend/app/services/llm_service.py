@@ -466,16 +466,17 @@ class LLMService:
 参考成熟的 Oracle 属性图构建脚本模式：
 1. 每个本体对象对应一个稳定命名的节点表；节点表由源表通过 SELECT、JOIN、UNION ALL、DISTINCT 或 GROUP BY 构建。
 2. 节点 SELECT 必须输出稳定且唯一的本体 KEY，并输出该本体对象的全部属性列；派生对象允许用拼接键、聚合或事件展开构建。
-3. 每个本体关系对应一张边表；边 SELECT 必须输出稳定唯一的 EDGE_ID、SOURCE_ID、TARGET_ID，且两端值必须分别等于源节点和目标节点的 KEY。
-4. 边必须根据本体对象之间的关系语义设计。JOIN 条件必须使用源、目标表中实际存在且能够匹配数据的业务关联列；严禁把不同含义的两端主键直接写成 JOIN。
-5. 对于直接等值关联，优先选择两端同名的 `*_ID` 字段，并且该字段在源或目标本体对象中至少一端是主键（典型模式：子表外键 PRODUCT_ID = 产品表主键 PRODUCT_ID）。
-6. `SOURCE_ID`、`TARGET_ID` 是图边端点，分别输出源、目标节点的主键；它们不是 JOIN 推断依据。必须先用业务关联列完成 JOIN，再投影两端节点主键。
-7. 若不存在可证明的关联列，不要虚构边 SQL；返回空 joinCondition/edgeSql，并在 designReason 中说明“待人工确认”。
-8. 节点 SQL 和边 SQL 都只返回 SELECT / WITH 查询体，不要包含 CREATE、ALTER、DROP、COMMENT 或结尾分号。
-9. 默认使用 TABLE 构建方式，以便下一步 CTAS 后增加 PRIMARY KEY；仅在明确需要实时视图时使用 VIEW。
-10. Oracle 对象名和输出列别名使用大写英文下划线；SQL 必须可执行。
-11. 不得虚构输入中不存在的源表或源字段。
-12. 返回严格 JSON，不要输出 Markdown。"""
+3. 当同一节点属性来自多张源表时，必须先设计多表节点视图：指定锚点表和锚点业务键；逐张补充表说明与锚点的实际 Join 键、基数，以及一对多记录的收敛规则（LATEST_BY / EARLIEST_BY / MAX / MIN / SUM / LISTAGG / EXISTS）。补充表必须先按锚点键收敛为一行，再 JOIN 到锚点；严禁直接裸 JOIN 多个事件明细表造成节点重复、属性错配。
+4. 多表节点中，所有已确认属性都必须在最终最外层 SELECT 中以本体 property_name 作为 `AS` 别名输出；仅在 CTE 中出现不算输出。
+5. 每个本体关系对应一张边表；边 SELECT 必须输出稳定唯一的 EDGE_ID、SOURCE_ID、TARGET_ID，且两端值必须分别等于源节点和目标节点的 KEY。
+6. 边必须根据本体对象之间的关系语义设计。JOIN 条件必须使用源、目标表中实际存在且能够匹配数据的业务关联列；严禁把不同含义的两端主键直接写成 JOIN。
+7. 对于直接等值关联，优先选择两端同名的 `*_ID` 字段，并且该字段在源或目标本体对象中至少一端是主键（典型模式：子表外键 PRODUCT_ID = 产品表主键 PRODUCT_ID）。
+8. `SOURCE_ID`、`TARGET_ID` 是图边端点，分别输出源、目标节点的主键；它们不是 JOIN 推断依据。必须先用业务关联列完成 JOIN，再投影两端节点主键。
+9. 若不存在可证明的关联列，不要虚构边 SQL；返回空 joinCondition/edgeSql，并在 designReason 中说明“待人工确认”。
+10. 节点 SQL 和边 SQL 都只返回 SELECT / WITH 查询体，不要包含 CREATE、ALTER、DROP、COMMENT 或结尾分号。
+11. Oracle 对象名和输出列别名使用大写英文下划线；SQL 必须可执行。
+12. 不得虚构输入中不存在的源表或源字段。
+13. 返回严格 JSON，不要输出 Markdown。"""
         extra_instruction = (mapping_instruction or "").strip()
         user_prompt = f"""请根据完整本体、对象关系、源表结构和初步属性候选，一次性设计节点表与边表的源数据映射。
 
@@ -494,6 +495,7 @@ class LLMService:
       "keyPropertyName": "本体主键属性名",
       "keyOutputColumn": "节点SQL输出的主键列名",
       "nodeSql": "SELECT ...",
+      "multiSourceJoinPlan": {"anchorSourceTable": "主来源表", "anchorKeyColumn": "锚点业务键", "joins": [{"sourceTable": "补充来源表", "sourceJoinColumn": "补充表关联键", "anchorJoinColumn": "锚点表关联键", "cardinality": "ONE_TO_MANY", "rowSelection": "LATEST_BY", "orderByColumns": ["事件时间 DESC", "业务ID DESC"]}]},
       "designReason": "节点构建说明"
     }}
   ],
@@ -513,6 +515,7 @@ class LLMService:
 }}
 
 必须覆盖输入中的每一个本体对象和每一条本体关系。节点表名、边表名、节点 KEY 和关系方向必须前后一致；keyOutputColumn 必须就是 nodeSql 中 keyPropertyName 对应的输出列别名。
+如果某节点 property_mapping_candidates 中涉及两张或更多 source_table，必须填写 multiSourceJoinPlan，并在 nodeSql 中落实该计划。最终 SELECT 的 `AS` 别名必须逐一覆盖该节点的全部 property_name；无法证明表间关联时不要用 NULL 静默补齐，应不输出该节点并在 designReason 中说明待人工确认。
 关系输出必须在 designReason 中明确写出“关联列”和“两端节点主键投影”。不得使用 `src.<源PK> = dst.<目标PK>` 作为不同实体之间的 Join。
 当输入 `verified_direct_relation_candidates` 包含当前 relationId 的候选时，必须优先且原样使用该候选的 joinCondition；这是已由系统根据属性映射验证的 FK→PK 关系，不得遗漏或替换。
 {f"额外业务映射指令：{extra_instruction}" if extra_instruction else ""}"""
@@ -557,6 +560,8 @@ class LLMService:
         # The relationship validator needs the actual source columns selected
         # during property mapping, not just conceptual property names.
         mapped_columns_by_entity: Dict[str, Dict[str, str]] = {}
+        mapped_property_names_by_entity: Dict[str, set[str]] = {}
+        mapped_source_tables_by_entity: Dict[str, set[str]] = {}
         for mapping_result in entity_mapping_results or []:
             entity_id = str(mapping_result.get("entity_id") or "").strip()
             if not entity_id:
@@ -565,10 +570,16 @@ class LLMService:
             for mapping in mapping_result.get("mappings") or []:
                 property_name = str(mapping.get("matchedPropertyName") or mapping.get("propertyName") or "").strip().upper()
                 source_column = str(mapping.get("sourceColumn") or mapping.get("source_column") or "").strip().upper()
+                source_table = str(mapping.get("sourceTable") or mapping.get("source_table") or "").strip().upper()
+                formula = str(mapping.get("formula") or mapping.get("formula_expr") or "").strip()
                 if property_name and source_column:
                     column_map[source_column] = property_name
+                if property_name and source_table and (source_column or formula):
+                    mapped_property_names_by_entity.setdefault(entity_id, set()).add(property_name)
+                    mapped_source_tables_by_entity.setdefault(entity_id, set()).add(source_table)
             mapped_columns_by_entity[entity_id] = column_map
         normalized_entities: List[Dict[str, Any]] = []
+        entity_mapping_issues: List[Dict[str, Any]] = []
         seen_entity_ids = set()
         for item in payload.get("entityMappings") or payload.get("entity_mappings") or []:
             if not isinstance(item, dict):
@@ -588,6 +599,38 @@ class LLMService:
             key_property_name = str(item.get("keyPropertyName") or item.get("key_property_name") or "").strip()
             if not key_property_name:
                 continue
+            expected_properties = mapped_property_names_by_entity.get(entity_id, set())
+            projected_properties = self._extract_final_select_aliases(node_sql)
+            missing_properties = sorted(expected_properties - projected_properties)
+            source_tables = sorted(
+                set(self._normalize_source_table_names(item.get("sourceTables") or item.get("source_tables") or []))
+                | mapped_source_tables_by_entity.get(entity_id, set())
+            )
+            multi_source_plan = item.get("multiSourceJoinPlan") or item.get("multi_source_join_plan") or {}
+            if missing_properties:
+                entity_mapping_issues.append({
+                    "entity_id": entity_id,
+                    "entity_name": entity.get("entity_name") or "",
+                    "code": "NODE_SQL_PROPERTY_PROJECTION_INCOMPLETE",
+                    "message": "节点 SQL 最终 SELECT 未投影全部已确认属性：" + "、".join(missing_properties),
+                    "missing_properties": missing_properties,
+                })
+                continue
+            has_multi_source_plan = isinstance(multi_source_plan, dict) and bool(
+                str(multi_source_plan.get("anchorSourceTable") or multi_source_plan.get("anchor_source_table") or "").strip()
+                and str(multi_source_plan.get("anchorKeyColumn") or multi_source_plan.get("anchor_key_column") or "").strip()
+                and isinstance(multi_source_plan.get("joins"), list)
+                and multi_source_plan.get("joins")
+            )
+            if len(source_tables) > 1 and not has_multi_source_plan:
+                entity_mapping_issues.append({
+                    "entity_id": entity_id,
+                    "entity_name": entity.get("entity_name") or "",
+                    "code": "MULTI_SOURCE_JOIN_PLAN_MISSING",
+                    "message": "多来源节点缺少锚点、Join 键与收敛规则，不能保存节点 SQL。",
+                    "missing_properties": [],
+                })
+                continue
             normalized_entities.append({
                 "entity_id": entity_id,
                 "entity_name": entity.get("entity_name") or "",
@@ -596,13 +639,14 @@ class LLMService:
                     fallback=f"ONTO_NODE_{entity.get('entity_name') or entity_id}",
                 ),
                 "build_type": "VIEW" if str(item.get("buildType") or item.get("build_type") or "").upper() == "VIEW" else "TABLE",
-                "source_tables": self._normalize_source_table_names(item.get("sourceTables") or item.get("source_tables") or []),
+                "source_tables": source_tables,
                 "key_property_name": key_property_name,
                 "key_output_column": self._normalize_oracle_object_name(
                     item.get("keyOutputColumn") or item.get("key_output_column"),
                     fallback=str(item.get("keyPropertyName") or item.get("key_property_name") or "ID"),
                 ),
                 "node_sql": node_sql,
+                "multi_source_join_plan": multi_source_plan if isinstance(multi_source_plan, dict) else {},
                 "design_reason": str(item.get("designReason") or item.get("design_reason") or "").strip(),
             })
 
@@ -721,6 +765,39 @@ class LLMService:
         return {
             "entity_mappings": normalized_entities,
             "relation_mappings": normalized_relations,
+            "entity_mapping_issues": entity_mapping_issues,
+        }
+
+    def _extract_final_select_aliases(self, sql: str) -> set[str]:
+        """Return output aliases from the final top-level SELECT of a node query."""
+        statement = (sql or "").strip().rstrip(";")
+        depth = 0
+        final_select = -1
+        for match in re.finditer(r"(?i)\bSELECT\b|[()]", statement):
+            token = match.group(0).upper()
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth = max(depth - 1, 0)
+            elif depth == 0:
+                final_select = match.start()
+        if final_select < 0:
+            return set()
+        final_from = None
+        depth = 0
+        for match in re.finditer(r"(?i)\bFROM\b|[()]", statement[final_select + 6:]):
+            token = match.group(0).upper()
+            if token == "(":
+                depth += 1
+            elif token == ")":
+                depth = max(depth - 1, 0)
+            elif token == "FROM" and depth == 0:
+                final_from = final_select + 6 + match.start()
+                break
+        projection = statement[final_select:final_from] if final_from else statement[final_select:]
+        return {
+            alias.upper()
+            for alias in re.findall(r"(?i)\bAS\s+([A-Z][A-Z0-9_$#]*)\b", projection)
         }
 
     def _normalize_relation_join_condition(
@@ -1514,6 +1591,7 @@ class LLMService:
       "sourceEntityName": "源实体英文名",
       "targetEntityName": "目标实体英文名",
       "relationName": "关系名称，必须使用中文",
+      "relationPredicate": "英文关系谓词，例如 BELONGS_TO / USES / OCCURS_AT；仅表达关系动作，不得包含源或目标实体名",
       "relationType": "ASSOCIATION",
       "relationDesc": "关系说明",
       "candidateLevel": "HIGH",
@@ -1552,6 +1630,7 @@ class LLMService:
 - relationName 必须使用中文、简短且直接表达源节点到目标节点的业务谓词：优先使用 2～6 个字，不要重复源实体或目标实体名称；完整业务语义写入 relationDesc。
 - 优先输出“判定”“产生”“参与”“执行”“归属”“包含”等简洁关系名；例如源节点为“营销活动”、目标节点为“客户”时使用“参与”，不要写“营销活动参与客户”。
 - 不要输出 hasXxx、belongsTo、occursOn、snake_case、camelCase 这类英文关系名。
+- relationPredicate 必须为大写英文下划线形式的动词或动词短语，例如 BELONGS_TO、PARTICIPATES_IN、OCCURS_AT；只能表达关系语义，严禁包含 sourceEntityName 或 targetEntityName，也不要添加 ONTO_EDGE_ 前缀。
 - {'当前为文档先行逻辑设计：只输出业务关系、方向、基数与说明；不得虚构证据表、Join 或 edgeSql。' if document_only else '关系设计必须服务于后续 Oracle Graph 边表/edge_sql 落地，尽量补充 `sourceTable / targetTable / joinCondition / edgeSql` 草案；如果一时无法完整写出 `edgeSql`，也至少给出证据表和候选来源表线索。'}
 - {'文档先行时，不以首期 MVP 限制关系数量；应覆盖文档要求的业务关系，但不得凭空生成没有业务依据的关系。' if document_only else '严格遵循 ontology_design_document 中定义的首期关系范围，关系数量保持克制，不要为了覆盖所有潜在线索而构造过于复杂的关系网络。'}
 - 返回严格 JSON。"""
@@ -1718,50 +1797,25 @@ class LLMService:
         blueprint: Optional[Any] = None,
         validation_feedback: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Generate domain-specific, executable Oracle Property Graph query ideas.
-
-        The model is deliberately given only the live graph contract (DDL, labels,
-        edge endpoints and all exposed properties).  This prevents it from carrying
-        fixed scenarios from another business domain into the current graph.
-        """
+        """Generate structured plans that are later compiled against graph metadata."""
         config = self._get_default_config()
         graph_name = str(graph_topology.get("graph_name") or "").upper()
         if not config:
-            return {"recommendations": [], "generation_mode": "fallback", "generation_error": "没有可用的大模型配置"}
-
-        vertex_labels = {
-            str(item.get("id") or ""): str(item.get("displayName") or item.get("name") or "")
-            for item in graph_topology.get("nodes") or []
-        }
-
-        def compact_element(item: Dict[str, Any], is_edge: bool = False) -> Dict[str, Any]:
-            properties = item.get("properties") or []
-            return {
-                "label": item.get("displayName") or item.get("name"),
-                "element_name": item.get("name"),
-                "business_name": item.get("displayName") or item.get("name"),
-                "description": item.get("desc") or "",
-                "table": item.get("relationTableName") if is_edge else item.get("tableName"),
-                "source": vertex_labels.get(str(item.get("source") or ""), item.get("source")) if is_edge else None,
-                "target": vertex_labels.get(str(item.get("target") or ""), item.get("target")) if is_edge else None,
-                "properties": [
-                    {"name": prop.get("property_name"), "business_name": prop.get("property_display_name"), "type": prop.get("data_type"), "key": prop.get("is_primary_key")}
-                    for prop in properties
-                ],
-            }
+            return {"plans": [], "generation_mode": "fallback", "generation_error": "没有可用的大模型配置"}
 
         payload = {
             "business_domain": {"name": getattr(domain, "domain_name", ""), "description": getattr(domain, "domain_desc", "")},
             "ontology_design_summary": self._truncate_text(str(getattr(blueprint, "summary_json", "") or ""), 5000),
-            "property_graph": {
+            "property_graph_contract": {
                 "name": graph_name,
                 "ddl": self._truncate_text(str(graph_topology.get("graph_ddl") or ""), 12000),
-                "vertices": [compact_element(item) for item in graph_topology.get("nodes") or []],
-                "edges": [compact_element(item, True) for item in graph_topology.get("edges") or []],
+                "vertices": graph_topology.get("vertices") or [],
+                "edges": graph_topology.get("edges") or [],
             },
         }
-        system_prompt = """你是 Oracle Database 26ai 属性图查询专家。只为当前业务分析域生成查询场景，绝不能使用其他业务域的固定模板。
-你只能使用输入中真实存在的属性图名称、顶点标签、边标签和属性；不得虚构任何对象或字段。
+        system_prompt = """你是 Oracle Database 26ai 属性图业务查询设计专家。只为当前业务分析域生成查询场景，绝不能使用其他业务域的固定模板。
+你只能使用输入图契约中真实存在且 row_count 大于 0 的顶点、边元素和属性；不得虚构任何对象、字段或路径。
+你只输出结构化查询计划，绝不直接输出 SQL；SQL 会由后端依据图契约编译。
 输出严格 JSON，不要 Markdown，不要解释。"""
         user_prompt = f"""请根据以下业务分析域要求及 Oracle 属性图实际 DDL/元数据，生成恰好 6 个彼此不同、对业务人员有价值的图查询场景。
 
@@ -1769,17 +1823,16 @@ class LLMService:
 {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}
 
 返回格式：
-{{"recommendations":[{{"id":"英文短标识","title":"中文业务场景标题","description":"说明要解决的业务问题","sql":"可直接执行的 Oracle Graph SQL"}}]}}
+{{"plans":[{{"id":"英文短标识","title":"中文业务场景标题","description":"说明业务问题","anchor_var":"v1","target_var":"v2","patterns":[{{"source_var":"v1","source_label":"真实顶点标签","edge_element":"真实 edge_element","target_var":"v2","target_label":"真实顶点标签"}}],"properties":[{{"var":"v1","property":"真实属性名","alias":"显示字段别名"}}]}}]}}
 
-SQL 强制要求：
-1. 只能是 SELECT 或 WITH 开头，必须使用 GRAPH_TABLE({graph_name} ...)；不得 DDL/DML/PLSQL。
-2. 每条 SQL 使用真实标签和真实属性。若需要展示图关系，结果列优先别名为 SOURCE_ID、SOURCE_LABEL、TARGET_ID、TARGET_LABEL、RELATION_NAME。
-3. 用 JSON_SERIALIZE(VERTEX_ID(v) RETURNING VARCHAR2(4000)) 取顶点 ID，避免假设底层主键字段；边名可使用真实边属性，缺失时使用固定中文文本。
-4. 没有充分数据依据时，应做“关联探索/链路核查/对象画像”等可执行探索，不要凭空写阈值、时间范围或业务结论。
-5. 六条场景要覆盖不同的对象或关系组合，避免六条仅替换标题。
-6. SQL 必须按 Oracle GRAPH_TABLE 标准语法多行缩进格式输出；路径只能使用 `(v IS 顶点标签)-[e IS 边标签]->(w IS 顶点标签)`、`(v)-[e]->(w)` 等基本形式。不要使用不存在的标签、逗号拼接路径、路径量词或任何未在元数据中出现的模式。"""
+强制规则：
+1. 恰好输出 6 个 plans；每个 plan 只使用图契约中 row_count 大于 0 的 edge_element，且 source_label、target_label 必须与该 edge_element 的两端完全一致。
+2. 一个对象分别关联多个下游对象时，必须使用共享变量的多个 patterns，例如 `(pe→step), (pe→equipment)`；禁止将两个下游对象串接为 `step→equipment`，除非契约明确存在该边。
+3. 每个 plan 最多 5 条 patterns、15 个 properties；properties 必须属于其 var 所绑定的顶点。
+4. 场景应基于实际业务域与可用节点/关系，六条覆盖不同的业务问题；不要假设阈值、时间范围或不存在的数据。
+5. 不得输出 SQL、CTE、SELECT、MATCH 或任何自由文本路径。"""
         if validation_feedback:
-            user_prompt += "\n\n上一轮 SQL 已由 Oracle 实际解析，以下错误必须全部修复；请重新输出完整 6 条 JSON，不得保留错误语句：\n" + "\n".join(
+            user_prompt += "\n\n上一轮查询计划未通过图契约或 Oracle 数据校验，以下错误必须全部修复；请重新输出完整 6 条 JSON，不得保留错误计划：\n" + "\n".join(
                 f"- {self._truncate_text(str(item), 800)}" for item in validation_feedback[:12]
             )
         raw_output = await self.call_llm(
@@ -1789,37 +1842,36 @@ SQL 强制要求：
             timeout_override=max(int(config.timeout or 60), 180),
         )
         parsed = self._extract_json_object(raw_output)
-        items = (parsed or {}).get("recommendations") if isinstance(parsed, dict) else None
-        normalized: List[Dict[str, str]] = []
+        items = (parsed or {}).get("plans") if isinstance(parsed, dict) else None
+        normalized: List[Dict[str, Any]] = []
         if isinstance(items, list):
             for index, item in enumerate(items):
                 if not isinstance(item, dict):
                     continue
-                sql = str(item.get("sql") or "").strip().rstrip(";")
-                if not self._is_safe_property_graph_query(sql, graph_name):
-                    continue
                 title = str(item.get("title") or "").strip()
                 description = str(item.get("description") or "").strip()
-                if not title or not description:
+                if not title or not description or not isinstance(item.get("patterns"), list):
                     continue
                 normalized.append({
                     "id": re.sub(r"[^a-z0-9_-]+", "-", str(item.get("id") or f"scenario-{index + 1}").lower()).strip("-") or f"scenario-{index + 1}",
                     "title": title,
                     "description": description,
-                    "graph_name": graph_name,
-                    "sql": sql,
+                    "anchor_var": str(item.get("anchor_var") or ""),
+                    "target_var": str(item.get("target_var") or ""),
+                    "patterns": item.get("patterns") or [],
+                    "properties": item.get("properties") or [],
                 })
                 if len(normalized) == 6:
                     break
         if len(normalized) != 6:
             return {
-                "recommendations": [],
+                "plans": [],
                 "generation_mode": "fallback",
-                "generation_error": str((parsed or {}).get("error") or "模型未返回 6 条可执行的 Graph SQL"),
+                "generation_error": str((parsed or {}).get("error") or "模型未返回 6 条有效的图查询计划"),
                 "llm_raw_output": raw_output,
             }
         return {
-            "recommendations": normalized,
+            "plans": normalized,
             "generation_mode": "llm",
             "model": self._config_brief(config),
             "llm_raw_output": raw_output,
@@ -2905,6 +2957,7 @@ SQL 强制要求：
                 "sourceEntityName": source_name,
                 "targetEntityName": target_name,
                 "relationName": relation_name,
+                "relationPredicate": self._normalize_relation_predicate(item.get("relationPredicate") or item.get("relation_predicate")),
                 "relationType": relation_type,
                 "relationDesc": (item.get("relationDesc") or item.get("relation_desc") or "").strip(),
                 "evidenceTables": evidence_tables,
@@ -2977,6 +3030,13 @@ SQL 强制要求：
         if not normalized:
             return ""
         return normalized if normalized in selected_tables else ""
+
+    def _normalize_relation_predicate(self, value: Any) -> str:
+        """Keep only a portable English graph predicate supplied by the LLM."""
+        normalized = re.sub(r"[^A-Z0-9]+", "_", str(value or "").strip().upper()).strip("_")
+        if not normalized or normalized.startswith("ONTO_"):
+            return ""
+        return normalized[:48]
 
     def _normalize_relation_candidates_result(
         self,

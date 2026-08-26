@@ -131,7 +131,9 @@ async def get_graph_query_recommendations(
     )
     recommendations = _load_cached_recommendations(cached)
     cached_errors: list[str] = []
-    if recommendations:
+    # 新机制保存的计划已经做过结构、语法及命中预检，可直接复用；旧缓存
+    # 没有 query_plan 时才做一次兼容性检查，防止历史自由 SQL 继续误导用户。
+    if recommendations and not all(isinstance(item, dict) and item.get("query_plan") for item in recommendations):
         graph_service = SourceDataService(db)
         for item in recommendations:
             try:
@@ -140,6 +142,12 @@ async def get_graph_query_recommendations(
                     graph_sql=str(item.get("sql") or ""),
                     schema=topology.get("schema") or schema or source.schema_name,
                 )
+                if not graph_service.probe_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=str(item.get("sql") or ""),
+                    schema=topology.get("schema") or schema or source.schema_name,
+                ):
+                    raise ValueError("完整业务路径当前没有命中实例数据")
             except Exception as exc:
                 cached_errors.append(str(exc))
                 break
@@ -150,7 +158,7 @@ async def get_graph_query_recommendations(
         "graphs": topology.get("graphs") or [],
         "recommendations": recommendations,
         "generation_mode": "cached" if recommendations else "idle",
-        "generation_message": "已显示此前生成并保存的 6 条业务场景与 Graph SQL；已通过 Oracle 语法预检。" if recommendations else ("此前保存的 Graph SQL 未通过当前 Oracle 语法预检，请点击“生成业务场景与 SQL”修复。" if cached_errors else "尚未生成业务场景。请点击“生成业务场景与 SQL”，系统将按当前业务分析域和属性图生成 6 条查询。"),
+        "generation_message": "已显示此前生成并保存的 6 条业务场景与 Graph SQL；已通过 Oracle 语法和路径命中预检。" if recommendations else ("此前保存的 Graph SQL 未通过当前 Oracle 语法或路径命中预检，请点击“生成业务场景与 SQL”修复。" if cached_errors else "尚未生成业务场景。请点击“生成业务场景与 SQL”，系统将按当前业务分析域和属性图生成 6 条查询。"),
         "generated_at": cached.updated_at.isoformat() if cached and recommendations else None,
     })
 
@@ -193,42 +201,61 @@ async def generate_graph_query_recommendations(
     blueprint = db.query(SysOntologyBlueprint).filter(
         SysOntologyBlueprint.domain_id == domain_id,
     ).order_by(SysOntologyBlueprint.updated_at.desc()).first()
+    graph_service = SourceDataService(db)
+    try:
+        graph_contract = graph_service.get_remote_property_graph_query_contract(
+            source_id=source_id,
+            topology=topology,
+            schema=topology.get("schema") or schema or source.schema_name,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"读取属性图节点、边、属性及数据概况失败: {str(exc)}")
+
+    def compile_and_validate(plans: list[dict]) -> tuple[list[dict], list[str]]:
+        compiled: list[dict] = []
+        errors: list[str] = []
+        for plan in plans:
+            try:
+                recommendation = graph_service.compile_property_graph_query_plan(graph_contract, plan)
+                graph_service.validate_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=recommendation["sql"],
+                    schema=graph_contract.get("schema") or source.schema_name,
+                )
+                if not graph_service.probe_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=recommendation["sql"],
+                    schema=graph_contract.get("schema") or source.schema_name,
+                ):
+                    raise ValueError("该完整业务路径当前没有命中实例数据，请使用已有数据的关系或缩短路径")
+                compiled.append(recommendation)
+            except Exception as exc:
+                errors.append(f"{plan.get('title') or plan.get('id')}: {str(exc)}")
+        if len(compiled) != 6 and not errors:
+            errors.append("模型未返回恰好 6 条可编译的查询计划")
+        return compiled, errors
+
     try:
         generated = await LLMService(db).generate_property_graph_query_recommendations(
             domain=domain,
-            graph_topology=topology,
+            graph_topology=graph_contract,
             blueprint=blueprint,
         )
     except Exception as exc:
         # 查询页面仍应可用；模型或上下文异常不能阻断用户查看实时图结构。
-        generated = {"recommendations": [], "generation_mode": "fallback", "generation_error": str(exc)}
-    recommendations = generated.get("recommendations") or []
-    graph_service = SourceDataService(db)
-
-    def validation_errors(items: list[dict]) -> list[str]:
-        errors: list[str] = []
-        for item in items:
-            try:
-                graph_service.validate_remote_graph_query(
-                    source_id=source_id,
-                    graph_sql=str(item.get("sql") or ""),
-                    schema=topology.get("schema") or schema or source.schema_name,
-                )
-            except Exception as exc:
-                errors.append(f"{item.get('title') or item.get('id')}: {str(exc)}")
-        return errors
-
-    errors = validation_errors(recommendations) if recommendations else []
+        generated = {"plans": [], "generation_mode": "fallback", "generation_error": str(exc)}
+    plans = generated.get("plans") or []
+    recommendations, errors = compile_and_validate(plans) if plans else ([], [generated.get("generation_error") or "模型未生成查询计划"])
     if errors:
         try:
             generated = await LLMService(db).generate_property_graph_query_recommendations(
                 domain=domain,
-                graph_topology=topology,
+                graph_topology=graph_contract,
                 blueprint=blueprint,
                 validation_feedback=errors,
             )
-            recommendations = generated.get("recommendations") or []
-            errors = validation_errors(recommendations) if recommendations else errors
+            plans = generated.get("plans") or []
+            recommendations, errors = compile_and_validate(plans) if plans else ([], [generated.get("generation_error") or "模型未生成修复后的查询计划"])
         except Exception as exc:
             recommendations = []
             errors = [str(exc)]
