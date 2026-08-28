@@ -9,20 +9,22 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.database import get_db, SessionLocal
 from app.core.auth import ensure_domain_access, get_current_user
 from app.core.logging import get_logger
+from app.services.llm_service import LLMService
 from app.schemas.schemas import (
     ApiResponse, PropertyMappingCreate, PropertyMappingUpdate,
     PropertyMappingResponse, EntityMappingUpdate, RelationMappingCreate,
     RelationMappingUpdate, EdgeSqlPreviewRequest, RelationJoinAnalyzeRequest, AutoMappingRequest, MappingConfirmRequest,
-    BulkAutoMappingRequest, BulkMappingApplyRequest
+    BulkAutoMappingRequest, BulkMappingApplyRequest, SemanticViewUpdate
 )
 from app.models.models import (
     SysPropertyMapping, SysEntityMapping, SysRelationMapping,
-    SysOntologyBlueprint, SysOntologyEntity, SysOntologyProperty, SysOntologyRelation, SysDomain, SysMappingTask,
+    SysOntologyBlueprint, SysOntologyEntity, SysOntologyProperty, SysOntologyRelation, SysDomain, SysMappingTask, SysSemanticView,
     generate_id
 )
 
 router = APIRouter(prefix="/mapping", tags=["数据映射"])
 logger = get_logger(__name__)
+SAFE_ORACLE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
 
 
 @router.post("/domains/{domain_id}/ddl-readiness-check", response_model=ApiResponse)
@@ -1913,6 +1915,98 @@ async def get_latest_data_support_blueprint(
                 "entities": entities,
             })
     return ApiResponse(data=None)
+
+def _ensure_semantic_view_storage(db: Session) -> None:
+    SysSemanticView.__table__.create(bind=db.bind, checkfirst=True)
+
+
+@router.get("/entities/{entity_id}/semantic-view", response_model=ApiResponse)
+async def get_entity_semantic_view(entity_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
+    _ensure_semantic_view_storage(db)
+    view = db.query(SysSemanticView).filter(SysSemanticView.entity_id == entity_id, SysSemanticView.status == "CONFIRMED").first()
+    if not view:
+        return ApiResponse(data=None)
+    return ApiResponse(data={
+        "semantic_view_id": view.semantic_view_id, "view_name": view.view_name, "view_sql": view.view_sql,
+        "anchor_table": view.anchor_table, "anchor_key_column": view.anchor_key_column,
+        "source_tables": json.loads(view.source_tables_json or "[]"),
+    })
+
+
+@router.put("/entities/{entity_id}/semantic-view", response_model=ApiResponse)
+async def update_entity_semantic_view(entity_id: str, req: SemanticViewUpdate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    _ensure_entity_access(db, current_user, entity)
+    _ensure_semantic_view_storage(db)
+    view_name, view_sql = req.view_name.strip().upper(), req.view_sql.strip().rstrip(";")
+    if not SAFE_ORACLE_IDENTIFIER_RE.fullmatch(view_name) or not view_sql.upper().startswith(("SELECT", "WITH")):
+        raise HTTPException(status_code=400, detail="请填写合法视图名称，以及以 SELECT 或 WITH 开始的语义整合 SQL")
+    properties = db.query(SysOntologyProperty).filter(SysOntologyProperty.entity_id == entity_id).all()
+    if any(not SAFE_ORACLE_IDENTIFIER_RE.fullmatch(prop.property_name.upper()) for prop in properties):
+        raise HTTPException(status_code=400, detail="本体属性名包含不支持的 Oracle 标识符，请先调整属性名称后再保存语义整合视图")
+    view = db.query(SysSemanticView).filter(SysSemanticView.entity_id == entity_id).first()
+    if not view:
+        view = SysSemanticView(semantic_view_id=generate_id("sview"), domain_id=entity.domain_id, entity_id=entity_id, created_by=current_user.get("username", "unknown"))
+        db.add(view)
+    view.view_name, view.view_sql, view.status = view_name, view_sql, "CONFIRMED"
+    view.anchor_table = (req.anchor_table or "").strip().upper() or None
+    view.anchor_key_column = (req.anchor_key_column or "").strip().upper() or None
+    view.source_tables_json = json.dumps(sorted({str(name).strip().upper() for name in req.source_tables if str(name).strip()}))
+    select_items = []
+    for prop in properties:
+        # 语义整合视图以全部本体属性名作为固定输出列，避免逐属性二次配置。
+        output = prop.property_name.upper()
+        select_items.append(f"    v.{output} AS {prop.property_name}")
+        mapping = prop.mapping or SysPropertyMapping(mapping_id=generate_id("pmap"), property_id=prop.property_id)
+        if not prop.mapping:
+            db.add(mapping)
+        mapping.source_table, mapping.source_column = view_name, output
+        mapping.mapping_type, mapping.formula_expr, mapping.confidence, mapping.mapping_status = "DIRECT", None, "HIGH", "CONFIRMED"
+        prop.source_mark = "MAPPED"
+    entity_mapping = entity.entity_mapping or SysEntityMapping(mapping_id=generate_id("emap"), entity_id=entity_id)
+    if not entity.entity_mapping:
+        db.add(entity_mapping)
+    entity_mapping.build_type, entity_mapping.mapping_status = "VIEW", "CONFIRMED"
+    entity_mapping.view_sql = "SELECT\n" + ",\n".join(select_items) + f"\nFROM {view_name} v"
+    entity.build_type, entity.table_name = "VIEW", f"ONTO_NODE_{entity.entity_name.upper()}_V"
+    db.commit()
+    return ApiResponse(message="语义整合视图和节点映射已保存")
+
+
+@router.post("/entities/{entity_id}/semantic-view/suggest", response_model=ApiResponse)
+async def suggest_entity_semantic_view(entity_id: str, req: AutoMappingRequest, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == entity_id, SysOntologyEntity.domain_id == req.domain_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在或不属于当前业务域")
+    _ensure_entity_access(db, current_user, entity)
+    properties = db.query(SysOntologyProperty).filter(SysOntologyProperty.entity_id == entity_id).all()
+    mappings = db.query(SysPropertyMapping).filter(SysPropertyMapping.property_id.in_([prop.property_id for prop in properties])).all()
+    mapped_by_property = {item.property_id: item for item in mappings}
+    table_names = sorted({(item.source_table or "").upper() for item in mappings if (item.source_table or "").strip()})
+    if len(table_names) < 2:
+        raise HTTPException(status_code=400, detail="当前实体未识别到多个源表，无需生成语义整合视图")
+    from app.services.source_data_service import SourceDataService
+    source_service = SourceDataService(db)
+    catalog = source_service.get_remote_table_catalog_for_mapping(req.source_id, req.domain_id, req.schema, table_names)
+    catalog_by_name = {(item.get("table_name") or "").upper(): item for item in (catalog.get("tables") or [])}
+    source_tables = source_service.get_remote_tables_metadata_by_names(
+        source_id=req.source_id, schema=catalog.get("schema") or req.schema,
+        tables=[catalog_by_name[name] for name in table_names if name in catalog_by_name],
+        sample_limit=req.sample_limit, entity_keywords=table_names, source_name=catalog.get("source_name"),
+    ).get("tables") or []
+    suggestion = await LLMService(db).generate_semantic_view_suggestion(
+        entity, properties,
+        [{"property_id": prop.property_id, "property_name": prop.property_name, "source_table": getattr(mapped_by_property.get(prop.property_id), "source_table", ""), "source_column": getattr(mapped_by_property.get(prop.property_id), "source_column", ""), "mapping_type": getattr(mapped_by_property.get(prop.property_id), "mapping_type", "")} for prop in properties],
+        source_tables, req.model_config_id,
+    )
+    return ApiResponse(data={**suggestion, "source_tables": table_names})
+
 
 @router.get("/entities/{entity_id}/entity-mapping", response_model=ApiResponse)
 async def get_entity_mapping(

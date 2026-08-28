@@ -15,7 +15,7 @@ from app.schemas.schemas import (
 from app.models.models import (
     SysOntologyEntity, SysOntologyProperty, SysOntologyRelation,
     SysDomain, SysEntityMapping, SysPropertyMapping, SysRelationMapping,
-    SysOntologyBlueprint, SysMappingTask, SysDDLLog, SysDDLStatementLog, generate_id
+    SysOntologyBlueprint, SysMappingTask, SysDDLLog, SysDDLStatementLog, SysSemanticView, generate_id
 )
 import json
 import re
@@ -197,6 +197,11 @@ def _delete_entity_dependencies(db: Session, entity_ids: List[str]) -> int:
         db.query(SysPropertyMapping).filter(
             SysPropertyMapping.property_id.in_(property_ids),
         ).delete(synchronize_session=False)
+    # 语义整合视图直接引用实体。必须在删除实体前清理，否则 Oracle 会以
+    # ORA-02292 拒绝删除（保存多表实体映射后首次触发）。
+    db.query(SysSemanticView).filter(
+        SysSemanticView.entity_id.in_(entity_ids),
+    ).delete(synchronize_session=False)
     db.query(SysEntityMapping).filter(
         SysEntityMapping.entity_id.in_(entity_ids),
     ).delete(synchronize_session=False)

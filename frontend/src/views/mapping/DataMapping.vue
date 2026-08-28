@@ -159,6 +159,17 @@
         <el-empty v-else description="当前业务域暂无可预览的映射结果" />
       </el-card>
 
+      <el-card v-if="currentEntitySourceTables.length > 1 || semanticView.semantic_view_id" class="property-mapping-card">
+        <template #header><div class="card-header"><div><span>语义整合视图（多表实体）</span><div class="entity-implementation-hint">将多表 Join、去重和收敛规则集中维护；保存后节点视图将自动从此视图投影属性。</div></div><div><el-button type="primary" plain size="small" :loading="semanticSuggestionLoading" @click="suggestSemanticView">尝试处理</el-button><el-button type="primary" size="small" :loading="semanticViewSaving" @click="saveSemanticView">保存语义整合视图</el-button></div></div></template>
+        <el-alert type="warning" :closable="false" show-icon title="当前实体使用多个源表，需人工确认锚点、Join 与一对多收敛规则。" />
+        <el-form label-width="110px" style="margin-top: 16px">
+          <el-form-item label="视图名称"><el-input v-model="semanticView.view_name" placeholder="例如 VW_EQUIPMENT_SOURCE" /></el-form-item>
+          <el-form-item label="锚点表 / 键"><el-input v-model="semanticView.anchor_table" placeholder="设备主数据表" style="width:48%;margin-right:4%" /><el-input v-model="semanticView.anchor_key_column" placeholder="EQUIPMENT_ID" style="width:48%" /></el-form-item>
+          <el-form-item label="参与源表"><el-tag v-for="table in currentEntitySourceTables" :key="table" style="margin-right:6px">{{ table }}</el-tag></el-form-item>
+          <el-form-item label="整合 SQL"><el-input v-model="semanticView.view_sql" type="textarea" :rows="10" placeholder="填写 WITH / SELECT SQL；在此处理实际 Join、ROW_NUMBER 去重或聚合。视图须以本体属性名输出全部属性，不要包含 CREATE VIEW。" /></el-form-item>
+        </el-form>
+      </el-card>
+
       <el-card class="property-mapping-card">
         <template #header>
           <div class="card-header">
@@ -212,6 +223,11 @@
                 filterable
                 @change="handleSourceTableChange(row)"
               >
+                <el-option
+                  v-if="isSemanticViewSource(row.source_table)"
+                  :label="`${semanticView.view_name}（语义整合视图）`"
+                  :value="semanticView.view_name"
+                />
                 <el-option
                   v-for="t in sourceTables"
                   :key="t.table_name"
@@ -548,6 +564,7 @@ const sourceTables = ref<RemoteTableOption[]>([])
 const tableColumnsMap = ref<Record<string, RemoteColumnOption[]>>({})
 
 const entityMapping = ref<any>({ build_type: 'TABLE', mapping_status: 'PENDING' })
+const semanticView = ref<any>({ view_name: '', view_sql: '', anchor_table: '', anchor_key_column: '' })
 const mappingTable = ref<MappingRow[]>([])
 const relationMappingTable = ref<RelationMappingRow[]>([])
 const mappingNodes = ref<MappingGraphNode[]>([])
@@ -556,6 +573,8 @@ const mappingEdges = ref<MappingGraphEdge[]>([])
 const schemaLoading = ref(false)
 const sourceTableLoading = ref(false)
 const saveLoading = ref(false)
+const semanticViewSaving = ref(false)
+const semanticSuggestionLoading = ref(false)
 const relationSaveLoading = ref(false)
 const showOnlyManualReview = ref(false)
 const lastSavedSnapshot = ref('')
@@ -732,8 +751,20 @@ const syncSnapshot = () => {
 }
 
 const getSourceColumns = (tableName: string) => {
+  if (isSemanticViewSource(tableName)) {
+    return mappingTable.value.map(row => ({
+      column_name: row.property_name,
+      data_type: row.data_type || 'VARCHAR2',
+      mapping_supported: true
+    }))
+  }
   return (tableColumnsMap.value[tableName] || []).filter(column => column.mapping_supported !== false)
 }
+
+const isSemanticViewSource = (tableName: string) => Boolean(
+  tableName && semanticView.value.view_name
+  && tableName.trim().toUpperCase() === semanticView.value.view_name.trim().toUpperCase()
+)
 
 const findRemoteColumn = (tableName: string, columnName: string) => {
   return getSourceColumns(tableName).find(column => column.column_name === columnName)
@@ -817,6 +848,14 @@ const loadEntityMapping = async () => {
   } catch (e) {}
 }
 
+const loadSemanticView = async () => {
+  if (!currentEntityId.value) return
+  try {
+    const res = await mappingApi.getEntitySemanticView(currentEntityId.value)
+    semanticView.value = res.data || { view_name: '', view_sql: '', anchor_table: '', anchor_key_column: '' }
+  } catch (e) {}
+}
+
 const loadPropertyMappings = async () => {
   if (!currentEntityId.value) return
   try {
@@ -849,7 +888,8 @@ const loadPropertyMappings = async () => {
     })
 
     const preloadTasks = mappingTable.value
-      .filter(row => row.source_table)
+      // 语义整合视图是待 DDL 部署的逻辑对象，不属于当前源数据连接的物理表目录。
+      .filter(row => row.source_table && !isSemanticViewSource(row.source_table))
       .map(async row => {
         await preloadSourceColumns(row.source_table)
         const column = findRemoteColumn(row.source_table, row.source_column)
@@ -1076,6 +1116,7 @@ const switchCurrentEntity = async (entityId: string) => {
 
 const handleEntityChange = async () => {
   await loadEntityMapping()
+  await loadSemanticView()
   await loadPropertyMappings()
   await loadRelationMappings()
 }
@@ -1243,6 +1284,50 @@ const saveManualMappings = async () => {
   } catch (e) {
   } finally {
     saveLoading.value = false
+  }
+}
+
+const saveSemanticView = async () => {
+  if (!currentEntityId.value) return
+  if (!semanticView.value.view_name?.trim() || !semanticView.value.view_sql?.trim()) {
+    ElMessage.warning('请填写语义整合视图名称和 SQL')
+    return
+  }
+  semanticViewSaving.value = true
+  try {
+    await mappingApi.updateEntitySemanticView(currentEntityId.value, {
+      view_name: semanticView.value.view_name,
+      view_sql: semanticView.value.view_sql,
+      anchor_table: semanticView.value.anchor_table || null,
+      anchor_key_column: semanticView.value.anchor_key_column || null,
+      source_tables: currentEntitySourceTables.value
+    })
+    await loadEntityMapping()
+    await loadSemanticView()
+    await Promise.all([loadPropertyMappings(), loadEntities(), loadMappingGraph()])
+    syncSnapshot()
+    ElMessage.success('语义整合视图已保存')
+  } finally {
+    semanticViewSaving.value = false
+  }
+}
+
+const suggestSemanticView = async () => {
+  if (!currentEntityId.value || !currentDomainId.value || !selectedSourceId.value) {
+    ElMessage.warning('请先选择当前业务分析域和数据源')
+    return
+  }
+  semanticSuggestionLoading.value = true
+  try {
+    const res = await mappingApi.suggestEntitySemanticView(currentEntityId.value, {
+      entity_id: currentEntityId.value, domain_id: currentDomainId.value, source_id: selectedSourceId.value,
+      schema: selectedSchema.value || null, sample_limit: 3
+    })
+    const suggestion = res.data || {}
+    semanticView.value = { ...semanticView.value, view_name: suggestion.view_name || semanticView.value.view_name, view_sql: suggestion.view_sql || semanticView.value.view_sql, anchor_table: suggestion.anchor_table || '', anchor_key_column: suggestion.anchor_key_column || '' }
+    ElMessage.success('已生成语义整合视图建议，请核对后保存')
+  } finally {
+    semanticSuggestionLoading.value = false
   }
 }
 

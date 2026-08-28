@@ -400,6 +400,31 @@ class LLMService:
             "mapping_count": len(result.get("mappings", []) if isinstance(result, dict) else []),
         }
 
+    async def generate_semantic_view_suggestion(self, entity: SysOntologyEntity, properties: List[SysOntologyProperty], property_mappings: List[Dict[str, Any]], source_tables: List[Dict[str, Any]], config_id: Optional[str] = None) -> Dict[str, Any]:
+        """Suggest a reviewable Oracle source-integration view for a multi-source entity."""
+        config = self._get_config_by_id(config_id) if config_id else self._get_default_config()
+        payload = self._make_json_safe({
+            "entity": {"name": entity.entity_name, "display_name": entity.entity_display_name, "description": entity.entity_desc},
+            "properties": [{"property_id": p.property_id, "property_name": p.property_name, "display_name": p.property_display_name, "is_primary_key": p.is_primary_key} for p in properties],
+            "current_property_mappings": property_mappings,
+            "source_tables": [self._compact_auto_mapping_prompt_table(table) for table in source_tables],
+        })
+        system_prompt = """你是 Oracle 数据建模专家。为多来源本体实体生成可审阅的语义整合视图建议。必须以一个稳定主表和业务键为锚点；一对多补充表必须先使用 ROW_NUMBER、聚合或 EXISTS 收敛为一行，避免节点重复。只使用输入存在的表和字段。视图 SQL 必须以全部输入本体属性的 property_name 作为 SELECT 输出别名；没有可靠来源的属性也要 CAST(NULL AS 对应类型) 并保留该别名。视图 SQL 只能是 Oracle SELECT/WITH 查询体，不包含 CREATE VIEW 或分号。输出严格 JSON。"""
+        user_prompt = f"""输入：
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+输出：
+{{
+  "view_name": "VW_实体_SOURCE",
+  "anchor_table": "锚点表",
+  "anchor_key_column": "锚点键",
+  "view_sql": "WITH ... SELECT ...",
+  "reason": "Join、去重和属性输出说明"
+}}"""
+        raw = await self.call_llm(system_prompt, user_prompt, config)
+        parsed = self._extract_json_object(raw) or {}
+        return {**parsed, "llm_raw_output": raw}
+
     async def design_ontology_property_graph_mapping(
         self,
         *,
@@ -495,7 +520,7 @@ class LLMService:
       "keyPropertyName": "本体主键属性名",
       "keyOutputColumn": "节点SQL输出的主键列名",
       "nodeSql": "SELECT ...",
-      "multiSourceJoinPlan": {"anchorSourceTable": "主来源表", "anchorKeyColumn": "锚点业务键", "joins": [{"sourceTable": "补充来源表", "sourceJoinColumn": "补充表关联键", "anchorJoinColumn": "锚点表关联键", "cardinality": "ONE_TO_MANY", "rowSelection": "LATEST_BY", "orderByColumns": ["事件时间 DESC", "业务ID DESC"]}]},
+      "multiSourceJoinPlan": {{"anchorSourceTable": "主来源表", "anchorKeyColumn": "锚点业务键", "joins": [{{"sourceTable": "补充来源表", "sourceJoinColumn": "补充表关联键", "anchorJoinColumn": "锚点表关联键", "cardinality": "ONE_TO_MANY", "rowSelection": "LATEST_BY", "orderByColumns": ["事件时间 DESC", "业务ID DESC"]}}]}},
       "designReason": "节点构建说明"
     }}
   ],

@@ -3,7 +3,7 @@ import re
 from typing import Dict, List, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from app.models.models import SysDataSource, SysOntologyBlueprint, SysOntologyEntity, SysOntologyProperty, SysOntologyRelation, SysDomain
+from app.models.models import SysDataSource, SysOntologyBlueprint, SysOntologyEntity, SysOntologyProperty, SysOntologyRelation, SysDomain, SysSemanticView
 from app.services.llm_service import LLMService
 from app.services.source_data_service import SourceDataService
 
@@ -31,6 +31,7 @@ class DDLService:
         if issues:
             raise DDLPreflightValidationError(issues)
         blueprint_package = self._load_latest_blueprint(domain.domain_id)
+        configured_semantic_views = self._generate_configured_semantic_view_ddl(domain.domain_id)
         template_statements = self._generate_template_ddl(domain, entities, relations)
         relation_warnings = self._collect_relation_mapping_warnings(relations, entities)
 
@@ -39,11 +40,12 @@ class DDLService:
         llm_result = await llm_service.generate_ddl_prompt(domain, entities, relations, blueprint_package=blueprint_package)
 
         # Parse DDL from LLM response or generate template DDL
-        ddl_statements = self._parse_ddl_from_response(llm_result)
-        ddl_statements = self._filter_to_required_object_views(ddl_statements, entities)
-        ddl_statements = self._filter_unconfirmed_semantic_views(ddl_statements, blueprint_package)
+        llm_ddl_statements = self._parse_ddl_from_response(llm_result)
+        llm_ddl_statements = self._filter_to_required_object_views(llm_ddl_statements, entities)
+        llm_ddl_statements = self._filter_unconfirmed_semantic_views(llm_ddl_statements, blueprint_package)
 
-        ddl_statements = self._merge_statements(template_statements, ddl_statements)
+        ddl_statements = self._merge_statements(configured_semantic_views, template_statements)
+        ddl_statements = self._merge_statements(ddl_statements, llm_ddl_statements)
 
         semantic_statements = self._generate_semantic_layer_ddl(domain, blueprint_package, entities, relations)
         ddl_statements = self._merge_statements(ddl_statements, semantic_statements)
@@ -327,7 +329,7 @@ class DDLService:
         cleanup: List[Dict[str, Any]] = []
         for name in names_by_type["create_graph"]:
             cleanup.append({"type": "drop_graph", "name": name, "sql": f"DROP PROPERTY GRAPH {name};"})
-        for name in names_by_type["create_view"]:
+        for name in reversed(names_by_type["create_view"]):
             cleanup.append({"type": "drop_view", "name": name, "sql": f"DROP VIEW {name};"})
         # Oracle 26ai permits views as graph element objects. A node/edge that
         # was deployed by an earlier version as a table can therefore be
@@ -340,6 +342,17 @@ class DDLService:
         for name in table_cleanup_names:
             cleanup.append({"type": "drop_table", "name": name, "sql": f"DROP TABLE {name} CASCADE CONSTRAINTS PURGE;"})
         return cleanup
+
+    def _generate_configured_semantic_view_ddl(self, domain_id: str) -> List[Dict[str, Any]]:
+        """Confirmed source integration views must exist before ONTO_NODE views."""
+        SysSemanticView.__table__.create(bind=self.db.bind, checkfirst=True)
+        rows = self.db.query(SysSemanticView).filter(SysSemanticView.domain_id == domain_id, SysSemanticView.status == "CONFIRMED").all()
+        statements = []
+        for row in rows:
+            name, sql_body = (row.view_name or "").upper(), (row.view_sql or "").strip().rstrip(";")
+            if self._is_safe_ddl_identifier(name) and sql_body.upper().startswith(("SELECT", "WITH")):
+                statements.append({"type": "create_view", "name": name, "sql": f"-- 多表语义整合视图: {name}\nCREATE OR REPLACE VIEW {name} AS\n{sql_body};"})
+        return statements
 
     def _generate_obsolete_semantic_view_cleanup(
         self,

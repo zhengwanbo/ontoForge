@@ -270,6 +270,14 @@ class EntityMappingUpdate(BaseModel):
     mapping_status: Optional[str] = None
 
 
+class SemanticViewUpdate(BaseModel):
+    view_name: str
+    view_sql: str
+    anchor_table: Optional[str] = None
+    anchor_key_column: Optional[str] = None
+    source_tables: List[str] = []
+
+
 # ====== 关系映射 ======
 class RelationMappingCreate(BaseModel):
     relation_id: str

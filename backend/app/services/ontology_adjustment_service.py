@@ -14,6 +14,7 @@ from app.models.models import (
     SysOntologyProperty,
     SysOntologyRelation,
     SysPropertyMapping,
+    SysSemanticView,
     generate_id,
 )
 from app.services.llm_service import LLMService
@@ -561,6 +562,9 @@ class OntologyAdjustmentService:
         )
         for relation in related_relations:
             self.db.delete(relation)
+        self.db.query(SysSemanticView).filter(
+            SysSemanticView.entity_id == entity_id,
+        ).delete(synchronize_session=False)
         self.db.delete(entity)
         self.db.flush()
 

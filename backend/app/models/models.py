@@ -127,6 +127,24 @@ class SysEntityMapping(Base):
     entity = relationship("SysOntologyEntity", back_populates="entity_mapping")
 
 
+class SysSemanticView(Base):
+    """Confirmed source integration view for one multi-source ontology entity."""
+    __tablename__ = "sys_semantic_view"
+
+    semantic_view_id = Column(String(50), primary_key=True, default=lambda: generate_id("sview"))
+    domain_id = Column(String(50), ForeignKey("sys_domain.domain_id"), nullable=False)
+    entity_id = Column(String(50), ForeignKey("sys_ontology_entity.entity_id"), nullable=False, unique=True)
+    view_name = Column(String(128), nullable=False)
+    view_sql = Column(Text, nullable=False)
+    anchor_table = Column(String(100))
+    anchor_key_column = Column(String(100))
+    source_tables_json = Column(Text)
+    status = Column(String(20), default="CONFIRMED")
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SysPropertyMapping(Base):
     __tablename__ = "sys_property_mapping"
 

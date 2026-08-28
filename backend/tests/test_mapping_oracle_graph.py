@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from app.api.mapping import (
@@ -8,9 +9,35 @@ from app.api.mapping import (
 )
 from app.models.models import SysOntologyEntity, SysOntologyProperty, SysOntologyRelation
 from app.schemas.schemas import BulkMappingApplyRequest
+from app.services.llm_service import LLMService
+
+
+class _PromptCaptureLLMService(LLMService):
+    def _get_default_config(self):
+        return object()
+
+    async def call_llm(self, system_prompt, user_prompt, config, **kwargs):
+        self.system_prompt = system_prompt
+        self.user_prompt = user_prompt
+        return '{"entityMappings": [], "relationMappings": []}'
 
 
 class MappingOracleGraphTest(unittest.TestCase):
+    def test_holistic_graph_mapping_prompt_handles_multisource_json_example(self):
+        """Regression: nested JSON example in f-string must not abort relation design."""
+        service = _PromptCaptureLLMService(db=None)
+        result = asyncio.run(service.design_ontology_property_graph_mapping(
+            domain_context={"domain_name": "轮胎 MES"},
+            ontology_entities=[],
+            ontology_relations=[],
+            source_tables=[],
+            entity_mapping_results=[],
+        ))
+
+        self.assertEqual(result["relation_mappings"], [])
+        self.assertIn('"multiSourceJoinPlan"', service.user_prompt)
+        self.assertIn('"anchorSourceTable"', service.user_prompt)
+
     def test_vertex_mapping_marks_ontology_primary_property_as_key(self):
         entity = SysOntologyEntity(
             entity_id="entity_work_order",
