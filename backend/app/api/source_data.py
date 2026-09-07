@@ -131,6 +131,14 @@ async def get_graph_query_recommendations(
     )
     recommendations = _load_cached_recommendations(cached)
     cached_errors: list[str] = []
+    # v2 开始，图查询除路径 ID 外还会返回节点和边的分析证据属性。旧缓存
+    # 虽可执行，但无法满足后续大模型基于数据事实分析的输入要求。
+    if recommendations and not all(
+        isinstance(item, dict) and item.get("projection_version") == "analysis-evidence-v2"
+        for item in recommendations
+    ):
+        recommendations = []
+        cached_errors.append("历史 Graph SQL 未携带完整分析证据属性，请重新生成")
     # 新机制保存的计划已经做过结构、语法及命中预检，可直接复用；旧缓存
     # 没有 query_plan 时才做一次兼容性检查，防止历史自由 SQL 继续误导用户。
     if recommendations and not all(isinstance(item, dict) and item.get("query_plan") for item in recommendations):
@@ -158,7 +166,7 @@ async def get_graph_query_recommendations(
         "graphs": topology.get("graphs") or [],
         "recommendations": recommendations,
         "generation_mode": "cached" if recommendations else "idle",
-        "generation_message": "已显示此前生成并保存的 6 条业务场景与 Graph SQL；已通过 Oracle 语法和路径命中预检。" if recommendations else ("此前保存的 Graph SQL 未通过当前 Oracle 语法或路径命中预检，请点击“生成业务场景与 SQL”修复。" if cached_errors else "尚未生成业务场景。请点击“生成业务场景与 SQL”，系统将按当前业务分析域和属性图生成 6 条查询。"),
+        "generation_message": "已显示此前生成并保存的 6 条业务场景与 Graph SQL；SQL 已包含节点及边的分析证据属性，并通过 Oracle 语法和路径命中预检。" if recommendations else ("此前保存的 Graph SQL 缺少分析证据属性或未通过当前预检，请点击“生成业务场景与 SQL”重新生成。" if cached_errors else "尚未生成业务场景。请点击“生成业务场景与 SQL”，系统将按当前业务分析域和属性图生成 6 条查询。"),
         "generated_at": cached.updated_at.isoformat() if cached and recommendations else None,
     })
 

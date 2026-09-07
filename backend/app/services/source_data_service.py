@@ -1296,7 +1296,13 @@ class SourceDataService:
 
     @staticmethod
     def compile_property_graph_query_plan(contract: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate a structured LLM plan against the graph contract and compile SQL."""
+        """Validate a plan and compile an Oracle Graph query with analysis evidence.
+
+        The returned rows are used not only to draw a path but also as factual
+        input for a follow-up LLM analysis.  Therefore every participating
+        vertex contributes a broad, typed business-property projection and
+        every traversed edge contributes its available relationship properties.
+        """
         graph_name = str(contract.get("graph_name") or "").upper()
         if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", graph_name):
             raise ValueError("属性图名称不合法")
@@ -1307,6 +1313,7 @@ class SourceDataService:
             raise ValueError("查询计划必须包含 1 至 5 条关系路径")
         variable_labels: Dict[str, str] = {}
         rendered_patterns = []
+        pattern_edges: list[tuple[str, Dict[str, Any]]] = []
         for index, pattern in enumerate(patterns, 1):
             if not isinstance(pattern, dict):
                 raise ValueError("查询路径格式不正确")
@@ -1340,6 +1347,7 @@ class SourceDataService:
             edge_label = str(edge.get("edge_label") or "").upper()
             edge_var = f"e{index}"
             rendered_patterns.append(f"({source_var} IS {source_label})-[{edge_var} IS {edge_label}]->({target_var} IS {target_label})")
+            pattern_edges.append((edge_var, edge))
         anchor_var, target_var = str(plan.get("anchor_var") or ""), str(plan.get("target_var") or "")
         if anchor_var not in variable_labels or target_var not in variable_labels:
             raise ValueError("查询计划的起点或终点不在关系路径中")
@@ -1356,7 +1364,51 @@ class SourceDataService:
             f"'{sql_literal}' AS RELATION_NAME",
         ]
         used_aliases = {"SOURCE_ID", "SOURCE_LABEL", "TARGET_ID", "TARGET_LABEL", "RELATION_NAME"}
-        for prop in (plan.get("properties") or [])[:15]:
+
+        def property_name_list(element: Dict[str, Any], limit: int) -> list[str]:
+            """Keep a rich but bounded evidence projection for one graph element."""
+            raw_properties = [item for item in (element.get("properties") or []) if isinstance(item, dict)]
+            key_names = {str(name or "").upper() for name in (element.get("key_properties") or [])}
+
+            def score(item: Dict[str, Any]) -> tuple[int, int]:
+                name = str(item.get("name") or "").upper()
+                data_type = str(item.get("data_type") or "").upper()
+                priority = 0
+                if name in key_names or name.endswith("_ID"):
+                    priority += 100
+                if any(token in name for token in ("CODE", "NAME", "STATUS", "TYPE", "LEVEL", "STATE")):
+                    priority += 60
+                if any(token in name for token in ("TIME", "DATE", "AMOUNT", "QTY", "QUANTITY", "RATE", "RESULT", "VALUE", "DESC", "REASON")):
+                    priority += 40
+                # Large binary / text payloads are available in the graph but
+                # are unsuitable for a multi-row analysis prompt by default.
+                if any(token in data_type for token in ("BLOB", "CLOB", "LONG RAW", "LONG")):
+                    priority -= 1000
+                return (-priority, raw_properties.index(item))
+
+            ordered = sorted(raw_properties, key=score)
+            names: list[str] = []
+            for item in ordered:
+                name = str(item.get("name") or "").upper()
+                if name and re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", name) and name not in names:
+                    names.append(name)
+                if len(names) >= limit:
+                    break
+            return names
+
+        def projection_alias(prefix: str, property_name: str) -> str:
+            base = re.sub(r"[^A-Z0-9_]+", "_", f"{prefix}_{property_name}".upper()).strip("_")[:30]
+            if not base:
+                base = f"{prefix}_PROPERTY"
+            candidate, suffix = base, 2
+            while candidate in used_aliases:
+                candidate = f"{base[:27]}_{suffix}"[:30]
+                suffix += 1
+            used_aliases.add(candidate)
+            return candidate
+
+        requested_by_variable: Dict[str, list[str]] = {}
+        for prop in (plan.get("properties") or [])[:36]:
             if not isinstance(prop, dict):
                 continue
             variable, property_name = str(prop.get("var") or ""), str(prop.get("property") or "").upper()
@@ -1365,11 +1417,27 @@ class SourceDataService:
             allowed = {str(item.get("name") or "").upper() for item in vertices[variable_labels[variable]].get("properties") or []}
             if property_name not in allowed:
                 raise ValueError(f"顶点 {variable_labels[variable]} 不存在属性 {property_name}")
-            alias = re.sub(r"[^A-Z0-9_]+", "_", str(prop.get("alias") or f"{variable}_{property_name}").upper()).strip("_")[:30]
-            if not alias or alias in used_aliases:
-                continue
-            used_aliases.add(alias)
-            columns.append(f"{variable}.{property_name} AS {alias}")
+            requested_by_variable.setdefault(variable, []).append(property_name)
+
+        # The anchor/target prefixes are consumed by the query-result graph UI;
+        # intermediate variable prefixes remain in the result table as analysis
+        # evidence for the downstream LLM.
+        for variable, label in variable_labels.items():
+            prefix = "SOURCE" if variable == anchor_var else "TARGET" if variable == target_var else variable.upper()
+            property_names = requested_by_variable.get(variable, []) + property_name_list(vertices[label], limit=18)
+            emitted: set[str] = set()
+            for property_name in property_names:
+                if property_name in emitted:
+                    continue
+                emitted.add(property_name)
+                columns.append(f"{variable}.{property_name} AS {projection_alias(prefix, property_name)}")
+
+        # Relationship properties are often the most important evidence for a
+        # business conclusion (quantity, status, timestamp, source channel).
+        # Return them even if the LLM plan did not mention them explicitly.
+        for edge_var, edge in pattern_edges:
+            for property_name in property_name_list(edge, limit=10):
+                columns.append(f"{edge_var}.{property_name} AS {projection_alias(edge_var.upper(), property_name)}")
         sql = "SELECT *\nFROM GRAPH_TABLE (\n  {graph}\n  MATCH\n    {patterns}\n  COLUMNS (\n    {columns}\n  )\n)".format(
             graph=graph_name,
             patterns=",\n    ".join(rendered_patterns),
@@ -1382,6 +1450,7 @@ class SourceDataService:
             "graph_name": graph_name,
             "sql": sql,
             "query_plan": plan,
+            "projection_version": "analysis-evidence-v2",
         }
 
     def get_remote_property_graph_instances(

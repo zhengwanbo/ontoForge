@@ -8,13 +8,13 @@ class GraphQueryContractTest(unittest.TestCase):
         self.contract = {
             "graph_name": "TIRE_GRAPH",
             "vertices": [
-                {"label": "TIRE", "properties": [{"name": "TIRE_BARCODE"}]},
-                {"label": "PROCESSEVENT", "properties": [{"name": "PROCESS_EVENT_ID"}]},
+                {"label": "TIRE", "key_properties": ["TIRE_BARCODE"], "properties": [{"name": "TIRE_BARCODE"}, {"name": "TIRE_STATUS"}, {"name": "CREATE_TIME"}]},
+                {"label": "PROCESSEVENT", "key_properties": ["PROCESS_EVENT_ID"], "properties": [{"name": "PROCESS_EVENT_ID"}, {"name": "RESULT_STATUS"}, {"name": "START_TIME"}]},
                 {"label": "PROCESSSTEP", "properties": [{"name": "STEP_NAME"}]},
                 {"label": "EQUIPMENT", "properties": [{"name": "EQUIPMENT_NAME"}]},
             ],
             "edges": [
-                {"edge_element": "TIRE_EVENT", "edge_label": "TIRE_EVENT", "source_label": "TIRE", "target_label": "PROCESSEVENT", "row_count": 10},
+                {"edge_element": "TIRE_EVENT", "edge_label": "TIRE_EVENT", "source_label": "TIRE", "target_label": "PROCESSEVENT", "row_count": 10, "properties": [{"name": "RELATION_STATUS"}, {"name": "CREATE_TIME"}]},
                 {"edge_element": "EVENT_STEP", "edge_label": "EVENT_STEP", "source_label": "PROCESSEVENT", "target_label": "PROCESSSTEP", "row_count": 10},
                 {"edge_element": "EVENT_EQUIPMENT", "edge_label": "EVENT_EQUIPMENT", "source_label": "PROCESSEVENT", "target_label": "EQUIPMENT", "row_count": 10},
             ],
@@ -33,6 +33,10 @@ class GraphQueryContractTest(unittest.TestCase):
         })
         self.assertIn("(pe IS PROCESSEVENT)-[e2 IS EVENT_STEP]->(st IS PROCESSSTEP)", result["sql"])
         self.assertIn("(pe IS PROCESSEVENT)-[e3 IS EVENT_EQUIPMENT]->(eq IS EQUIPMENT)", result["sql"])
+        self.assertIn("t.TIRE_STATUS AS SOURCE_TIRE_STATUS", result["sql"])
+        self.assertIn("pe.RESULT_STATUS AS TARGET_RESULT_STATUS", result["sql"])
+        self.assertIn("e1.RELATION_STATUS AS E1_RELATION_STATUS", result["sql"])
+        self.assertEqual(result["projection_version"], "analysis-evidence-v2")
 
     def test_nonexistent_downstream_chain_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "不存在关系路径"):

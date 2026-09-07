@@ -1853,9 +1853,10 @@ class LLMService:
 强制规则：
 1. 恰好输出 6 个 plans；每个 plan 只使用图契约中 row_count 大于 0 的 edge_element，且 source_label、target_label 必须与该 edge_element 的两端完全一致。
 2. 一个对象分别关联多个下游对象时，必须使用共享变量的多个 patterns，例如 `(pe→step), (pe→equipment)`；禁止将两个下游对象串接为 `step→equipment`，除非契约明确存在该边。
-3. 每个 plan 最多 5 条 patterns、15 个 properties；properties 必须属于其 var 所绑定的顶点。
-4. 场景应基于实际业务域与可用节点/关系，六条覆盖不同的业务问题；不要假设阈值、时间范围或不存在的数据。
-5. 不得输出 SQL、CTE、SELECT、MATCH 或任何自由文本路径。"""
+3. 每个 plan 最多 5 条 patterns、36 个 properties；properties 必须属于其 var 所绑定的顶点。请为路径中的每个关键对象选择可支撑业务判断的标识、名称、状态、时间、数量/金额、结果、类型等属性，而不是只选择 ID。
+4. 后端会自动补充路径节点的更多安全属性和边属性；properties 仍应优先表达本场景的关键分析指标与事实字段。
+5. 场景应基于实际业务域与可用节点/关系，六条覆盖不同的业务问题；不要假设阈值、时间范围或不存在的数据。
+6. 不得输出 SQL、CTE、SELECT、MATCH 或任何自由文本路径。"""
         if validation_feedback:
             user_prompt += "\n\n上一轮查询计划未通过图契约或 Oracle 数据校验，以下错误必须全部修复；请重新输出完整 6 条 JSON，不得保留错误计划：\n" + "\n".join(
                 f"- {self._truncate_text(str(item), 800)}" for item in validation_feedback[:12]
