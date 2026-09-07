@@ -1,0 +1,23 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-oracle+oracledb://oonbuild:Welcome%23%23131@host.docker.internal:1521/?service_name=freepdb1}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      SQL_ECHO: "${SQL_ECHO:-False}"
+      DEBUG: "${DEBUG:-False}"
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8080","http://127.0.0.1:8080","http://localhost","http://127.0.0.1","http://localhost:80","http://127.0.0.1:80"]}'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s

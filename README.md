@@ -103,8 +103,6 @@ pip install -r requirements.txt
 
 ```dotenv
 DATABASE_URL=oracle+oracledb://<username>:<password>@<host>:1521/<service_name>
-JWT_SECRET_KEY=<replace-with-a-strong-random-secret>
-CORS_ORIGINS=["http://localhost:5173"]
 ```
 
 启动 API：
@@ -154,6 +152,115 @@ npm run dev
 4. 在“数据映射”确认实体、属性与关系的来源及 Join 条件。
 5. 在“DDL 生成与应用”预览、生成并执行节点、边和 Property Graph DDL。
 6. 在“本体图谱浏览”和“图数据查询”中验证已部署图谱；按需为业务域配置智能体技能。
+
+## Docker 部署：单容器一键启动
+
+当前仓库已提供单容器部署方案：一个镜像内同时包含
+
+- FastAPI 后端
+- Vue 3 前端构建产物
+- Nginx 静态站点与反向代理
+
+容器启动顺序如下：
+
+```text
+docker/start.sh
+  ├─ 先启动 Uvicorn / FastAPI（127.0.0.1:8000）
+  ├─ 轮询 /health 直到后端可用
+  └─ 再前台启动 Nginx（对外暴露 80）
+```
+
+因此，对外只需要暴露一个 HTTP 端口，前端页面和 `/api/v1` 接口都通过同一个容器访问。
+
+### 1. 前置条件
+
+- 已安装 Docker 与 `docker-compose`
+- 可访问的 Oracle 数据库
+- 部署机上的 Docker 能拉取基础镜像，或已配置内网镜像仓库 / 加速器
+
+> 当前 Compose 不包含 Oracle 数据库本身。应用仍然依赖外部 Oracle 实例。
+
+### 2. 启动方式
+
+在仓库根目录执行：
+
+```sh
+docker-compose up -d --build
+```
+
+默认行为：
+
+- 容器服务名：`app`
+- 宿主机端口：`8080`
+- 容器内 Nginx：`80`
+- 容器内 FastAPI：`127.0.0.1:8000`
+
+启动后访问：
+
+```text
+http://localhost:8080
+```
+
+健康检查：
+
+```text
+http://localhost:8080/health
+```
+
+### 3. 覆盖数据库连接
+
+默认 `docker-compose.yml` 会将后端 Oracle 连接指向宿主机：
+
+```text
+oracle+oracledb://oonbuild:***@host.docker.internal:1521/?service_name=freepdb1
+```
+
+如果你的 Oracle 不在 Docker 宿主机，请在启动前覆盖 `DATABASE_URL`：
+
+```sh
+export DATABASE_URL='oracle+oracledb://<username>:<password>@<oracle-host>:1521/?service_name=<service_name>'
+docker-compose up -d --build
+```
+
+也可以同时覆盖应用端口：
+
+```sh
+export APP_PORT=80
+docker-compose up -d --build
+```
+
+### 4. 常用运维命令
+
+查看容器状态：
+
+```sh
+docker-compose ps
+```
+
+查看日志：
+
+```sh
+docker-compose logs -f app
+```
+
+停止并删除容器：
+
+```sh
+docker-compose down
+```
+
+重新构建并启动：
+
+```sh
+docker-compose up -d --build
+```
+
+### 5. 相关文件
+
+- [Dockerfile](/Users/wanzheng/src/ontoForge/Dockerfile:1)：单容器镜像定义
+- [docker-compose.yml](/Users/wanzheng/src/ontoForge/docker-compose.yml:1)：一键启动编排
+- [docker/nginx.conf](/Users/wanzheng/src/ontoForge/docker/nginx.conf:1)：前端静态资源与 API 代理
+- [docker/start.sh](/Users/wanzheng/src/ontoForge/docker/start.sh:1)：先启动后端，再启动 Nginx
 
 ## 开发与验证
 
