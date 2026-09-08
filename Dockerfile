@@ -19,6 +19,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nginx curl wget unzip vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
+RUN wget -nc https://download.oracle.com/java/21/latest/jdk-21_linux-x64_bin.deb && \
+    apt install -y ./jdk-21_linux-x64_bin.deb && \
+    java -version && \
+    rm -f ./jdk-21_linux-x64_bin.deb
+
 RUN wget -nc https://download.oracle.com/otn_software/java/sqldeveloper/sqlcl-latest.zip && \
     unzip -o sqlcl-*.zip && \
     ln -s $PWD/sqlcl/bin/sql /usr/local/bin/sql && \
