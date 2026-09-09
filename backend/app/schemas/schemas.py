@@ -125,7 +125,13 @@ class EntityCreate(BaseModel):
     entity_name: str
     entity_display_name: Optional[str] = None
     entity_desc: Optional[str] = None
+    object_type: Optional[str] = None
     build_type: str = "TABLE"
+    governance_status: Optional[str] = None
+    data_owner: Optional[str] = None
+    security_level: Optional[str] = None
+    update_frequency: Optional[str] = None
+    governance_tags: List[str] = Field(default_factory=list)
     icon: Optional[str] = None
     color: Optional[str] = None
 
@@ -134,8 +140,14 @@ class EntityUpdate(BaseModel):
     entity_name: Optional[str] = None
     entity_display_name: Optional[str] = None
     entity_desc: Optional[str] = None
+    object_type: Optional[str] = None
     build_type: Optional[str] = None
     status: Optional[str] = None
+    governance_status: Optional[str] = None
+    data_owner: Optional[str] = None
+    security_level: Optional[str] = None
+    update_frequency: Optional[str] = None
+    governance_tags: Optional[List[str]] = None
     icon: Optional[str] = None
     color: Optional[str] = None
     table_name: Optional[str] = None
@@ -147,9 +159,15 @@ class EntityResponse(BaseModel):
     entity_name: str
     entity_display_name: Optional[str] = None
     entity_desc: Optional[str] = None
+    object_type: Optional[str] = None
     build_type: str
     table_name: Optional[str] = None
     status: str
+    governance_status: Optional[str] = None
+    data_owner: Optional[str] = None
+    security_level: Optional[str] = None
+    update_frequency: Optional[str] = None
+    governance_tags: List[str] = Field(default_factory=list)
     icon: Optional[str] = None
     color: Optional[str] = None
     graph_position: Optional[str] = None
@@ -166,6 +184,11 @@ class PropertyCreate(BaseModel):
     data_type: str = "VARCHAR2"
     is_primary_key: str = "N"
     is_nullable: str = "Y"
+    unit: Optional[str] = None
+    value_constraint: Optional[str] = None
+    usage_codes: List[str] = Field(default_factory=list)
+    is_required_filter: str = "N"
+    ref_property_id: Optional[str] = None
     property_desc: Optional[str] = None
     order_num: int = 0
 
@@ -176,6 +199,11 @@ class PropertyUpdate(BaseModel):
     data_type: Optional[str] = None
     is_primary_key: Optional[str] = None
     is_nullable: Optional[str] = None
+    unit: Optional[str] = None
+    value_constraint: Optional[str] = None
+    usage_codes: Optional[List[str]] = None
+    is_required_filter: Optional[str] = None
+    ref_property_id: Optional[str] = None
     property_desc: Optional[str] = None
     order_num: Optional[int] = None
 
@@ -188,6 +216,12 @@ class PropertyResponse(BaseModel):
     data_type: Optional[str] = None
     is_primary_key: str
     is_nullable: str
+    unit: Optional[str] = None
+    value_constraint: Optional[str] = None
+    usage_codes: List[str] = Field(default_factory=list)
+    is_required_filter: str = "N"
+    ref_property_id: Optional[str] = None
+    ref_display: Optional[str] = None
     property_desc: Optional[str] = None
     order_num: int
     source_mark: str
@@ -287,6 +321,7 @@ class RelationMappingCreate(BaseModel):
     join_condition: Optional[str] = None
     edge_sql: Optional[str] = None
     mapping_mode: str = "DIRECT"
+    relation_cardinality: Optional[str] = None
     relation_table: Optional[str] = None
     relation_source_column: Optional[str] = None
     relation_target_column: Optional[str] = None
@@ -301,6 +336,7 @@ class RelationMappingUpdate(BaseModel):
     edge_sql: Optional[str] = None
     mapping_status: Optional[str] = None
     mapping_mode: Optional[str] = None
+    relation_cardinality: Optional[str] = None
     relation_table: Optional[str] = None
     relation_source_column: Optional[str] = None
     relation_target_column: Optional[str] = None
@@ -369,6 +405,15 @@ class AgentSkillCreate(BaseModel):
     analysis_goal: Optional[str] = None
     execution_rules: Optional[str] = None
     output_requirements: Optional[str] = None
+    analysis_scenario_code: Optional[str] = None
+    analysis_modes: List[str] = Field(default_factory=list)
+    entry_entity_ids: List[str] = Field(default_factory=list)
+    selected_metric_ids: List[str] = Field(default_factory=list)
+    selected_rule_ids: List[str] = Field(default_factory=list)
+    selected_activity_ids: List[str] = Field(default_factory=list)
+    enable_activity_recommendation: bool = True
+    default_time_window: Optional[str] = None
+    max_path_depth: Optional[int] = 2
     status: str = "ACTIVE"
 
 
@@ -382,6 +427,15 @@ class AgentSkillUpdate(BaseModel):
     analysis_goal: Optional[str] = None
     execution_rules: Optional[str] = None
     output_requirements: Optional[str] = None
+    analysis_scenario_code: Optional[str] = None
+    analysis_modes: Optional[List[str]] = None
+    entry_entity_ids: Optional[List[str]] = None
+    selected_metric_ids: Optional[List[str]] = None
+    selected_rule_ids: Optional[List[str]] = None
+    selected_activity_ids: Optional[List[str]] = None
+    enable_activity_recommendation: Optional[bool] = None
+    default_time_window: Optional[str] = None
+    max_path_depth: Optional[int] = None
     status: Optional[str] = None
 
 
@@ -405,6 +459,15 @@ class AgentSkillResponse(BaseModel):
     analysis_goal: Optional[str] = None
     execution_rules: Optional[str] = None
     output_requirements: Optional[str] = None
+    analysis_scenario_code: Optional[str] = None
+    analysis_modes: List[str] = Field(default_factory=list)
+    entry_entity_ids: List[str] = Field(default_factory=list)
+    selected_metric_ids: List[str] = Field(default_factory=list)
+    selected_rule_ids: List[str] = Field(default_factory=list)
+    selected_activity_ids: List[str] = Field(default_factory=list)
+    enable_activity_recommendation: bool = True
+    default_time_window: Optional[str] = None
+    max_path_depth: Optional[int] = None
     prompt_template: Optional[str] = None
     context_json: Optional[str] = None
     status: str
@@ -423,7 +486,7 @@ class AgentSkillTestRequest(BaseModel):
     conversation_history: List[Dict[str, str]] = Field(default_factory=list)
     session_id: Optional[str] = None
     start_session: bool = False
-    sample_limit: int = Field(default=100, ge=1, le=100)
+    sample_limit: int = Field(default=100, ge=1, le=1000)
 
 
 # ====== 业务规则与活动 ======
@@ -738,6 +801,7 @@ class BulkMappingApplyItem(BaseModel):
 class BulkRelationMappingApplyItem(BaseModel):
     relation_id: str
     edge_table_name: Optional[str] = None
+    relation_cardinality: Optional[str] = None
     source_table: Optional[str] = None
     target_table: Optional[str] = None
     join_condition: Optional[str] = None

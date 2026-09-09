@@ -8,15 +8,18 @@ from typing import Any, Dict, List, Optional
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.models import (
     SysAgentSkill,
+    SysBusinessActivity,
+    SysBusinessRule,
     SysManagedAgentSkill,
     SysManagedAgentSkillTestSession,
     SysDataSource,
     SysDomain,
     SysLLMConfig,
+    SysMetricDefinition,
     SysOntologyEntity,
     SysOntologyProperty,
     SysOntologyRelation,
@@ -26,12 +29,704 @@ from app.models.models import (
 from app.services.llm_service import LLMService, normalize_model_name
 from app.services.source_data_service import SourceDataService
 
+MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX = 1000
+DEFAULT_SKILL_ANALYSIS_MODES = ["DEFECT_ANALYSIS", "ROOT_CAUSE", "IMPACT_INFERENCE"]
+ALLOWED_SKILL_ANALYSIS_MODES = {
+    "DEFECT_ANALYSIS",
+    "ROOT_CAUSE",
+    "IMPACT_INFERENCE",
+    "TRACEBACK",
+    "MIXED",
+}
+SKILL_ANALYSIS_MODE_OPTIONS = [
+    {"value": "DEFECT_ANALYSIS", "label": "缺陷分析", "description": "围绕缺陷现象、异常分布和异常分层做分析。"},
+    {"value": "ROOT_CAUSE", "label": "根因分析", "description": "沿设备、工艺、物料和批次关系寻找高疑似根因。"},
+    {"value": "IMPACT_INFERENCE", "label": "影响推断", "description": "沿下游链路推断异常批次、工单、产品或客户影响范围。"},
+    {"value": "TRACEBACK", "label": "追溯分析", "description": "根据码、批次或单据做上下游链路追溯。"},
+    {"value": "MIXED", "label": "综合分析", "description": "允许 Agent 组合缺陷、根因和影响推断策略。"},
+]
+ANALYSIS_SCENARIO_TEMPLATES = [
+    {
+        "scenario_code": "QUALITY_DEFECT",
+        "scenario_name": "质量缺陷分析",
+        "description": "围绕缺陷现象、超规指标、批次与设备分布进行分析，并可继续下钻根因与影响。",
+        "recommended_analysis_modes": ["DEFECT_ANALYSIS", "ROOT_CAUSE", "IMPACT_INFERENCE"],
+        "default_time_window": "30D",
+        "max_path_depth": 3,
+        "enable_activity_recommendation": True,
+        "entity_keywords": ["DEFECT", "缺陷", "INSPECT", "检验", "QUALITY", "质量", "METRIC", "指标", "BATCH", "批次"],
+        "metric_keywords": ["DEFECT", "缺陷", "NG", "不良", "异常", "超规", "良率", "直通", "质量"],
+        "rule_keywords": ["DEFECT", "缺陷", "异常", "超规", "判定", "质量", "ROOT", "根因"],
+        "activity_types": ["MANUAL_REVIEW", "CREATE_TASK", "CALL_PROCESS", "NOTIFY"],
+    },
+    {
+        "scenario_code": "QUALITY_ROOT_CAUSE",
+        "scenario_name": "质量根因分析",
+        "description": "聚焦异常样本、设备、工艺、物料与前序批次之间的因果追溯和根因筛选。",
+        "recommended_analysis_modes": ["ROOT_CAUSE", "DEFECT_ANALYSIS"],
+        "default_time_window": "90D",
+        "max_path_depth": 4,
+        "enable_activity_recommendation": True,
+        "entity_keywords": ["CAUSE", "根因", "DEFECT", "缺陷", "DEVICE", "设备", "MATERIAL", "物料", "BATCH", "批次", "PROCESS", "工艺"],
+        "metric_keywords": ["异常", "缺陷", "超规", "波动", "覆盖率", "命中", "富集"],
+        "rule_keywords": ["根因", "超规", "异常", "设备", "物料", "批次", "因果"],
+        "activity_types": ["MANUAL_REVIEW", "CREATE_TASK", "CALL_PROCESS"],
+    },
+    {
+        "scenario_code": "SUPPLY_TRACE",
+        "scenario_name": "供应链追溯分析",
+        "description": "围绕码、箱、托、批次、出入库、经销商等对象进行上下游链路追溯。",
+        "recommended_analysis_modes": ["TRACEBACK"],
+        "default_time_window": "30D",
+        "max_path_depth": 5,
+        "enable_activity_recommendation": False,
+        "entity_keywords": ["BOTTLE", "瓶码", "PACK", "包码", "CASE", "箱码", "PALLET", "托码", "STACK", "垛码", "TRACE", "追溯", "OUTBOUND", "出库", "INBOUND", "入库", "DISTRIBUTOR", "经销商"],
+        "metric_keywords": ["出库", "入库", "运输", "扫码", "数量", "库存", "经销"],
+        "rule_keywords": ["追溯", "链路", "码", "批次", "出库", "入库"],
+        "activity_types": ["MANUAL_REVIEW", "NOTIFY"],
+    },
+    {
+        "scenario_code": "SUPPLY_IMPACT",
+        "scenario_name": "供应链影响推断",
+        "description": "针对异常码、批次、订单或库存事件，分析下游波及范围和潜在召回影响。",
+        "recommended_analysis_modes": ["TRACEBACK", "IMPACT_INFERENCE"],
+        "default_time_window": "90D",
+        "max_path_depth": 5,
+        "enable_activity_recommendation": True,
+        "entity_keywords": ["BATCH", "批次", "OUTBOUND", "出库", "INVENTORY", "库存", "ORDER", "订单", "CUSTOMER", "客户", "DISTRIBUTOR", "经销商", "PRODUCT", "产品"],
+        "metric_keywords": ["影响", "覆盖", "出库", "库存", "召回", "客户", "数量", "范围"],
+        "rule_keywords": ["影响", "召回", "冻结", "预警", "库存", "出库"],
+        "activity_types": ["NOTIFY", "CREATE_TASK", "CALL_PROCESS", "MANUAL_REVIEW"],
+    },
+    {
+        "scenario_code": "GENERAL_GRAPH",
+        "scenario_name": "通用图探索分析",
+        "description": "适用于未明确定义场景的图对象探索、关系浏览和保守分析。",
+        "recommended_analysis_modes": ["MIXED"],
+        "default_time_window": "7D",
+        "max_path_depth": 2,
+        "enable_activity_recommendation": False,
+        "entity_keywords": [],
+        "metric_keywords": [],
+        "rule_keywords": [],
+        "activity_types": ["MANUAL_REVIEW"],
+    },
+]
+
 
 class AgentService:
     def __init__(self, db: Session):
         self.db = db
         self.source_service = SourceDataService(db)
         self.llm_service = LLMService(db)
+
+    def get_analysis_semantics(self, domain_id: str) -> Dict[str, Any]:
+        entities = self.db.query(SysOntologyEntity).filter(
+            SysOntologyEntity.domain_id == domain_id,
+        ).order_by(SysOntologyEntity.entity_display_name, SysOntologyEntity.entity_name).all()
+        relations = self.db.query(SysOntologyRelation).filter(
+            SysOntologyRelation.domain_id == domain_id,
+        ).order_by(SysOntologyRelation.relation_name).all()
+        processes = self.db.query(SysProcessDef).filter(
+            SysProcessDef.domain_id == domain_id,
+        ).order_by(SysProcessDef.process_name).all()
+        metrics = self.db.query(SysMetricDefinition).filter(
+            SysMetricDefinition.domain_id == domain_id,
+        ).order_by(SysMetricDefinition.updated_at.desc(), SysMetricDefinition.metric_name).all()
+        rules = self.db.query(SysBusinessRule).filter(
+            SysBusinessRule.domain_id == domain_id,
+        ).order_by(SysBusinessRule.priority.desc(), SysBusinessRule.updated_at.desc()).all()
+        activities = self.db.query(SysBusinessActivity).filter(
+            SysBusinessActivity.domain_id == domain_id,
+        ).order_by(SysBusinessActivity.updated_at.desc(), SysBusinessActivity.activity_name).all()
+        entity_index = {item.entity_id: item for item in entities}
+        relation_index = {item.relation_id: item for item in relations}
+        process_index = {item.process_id: item for item in processes}
+        activity_index = {item.activity_id: item for item in activities}
+        serialized_metrics = [
+            self._serialize_metric_definition(item, entity_index)
+            for item in metrics
+        ]
+        serialized_rules = [
+            self._serialize_rule_definition(item, entity_index, relation_index, activity_index)
+            for item in rules
+        ]
+        serialized_activities = [
+            self._serialize_activity_definition(item, process_index)
+            for item in activities
+        ]
+        return {
+            "scenario_templates": self._build_analysis_scenario_templates(
+                entities=[{
+                    "entity_id": item.entity_id,
+                    "entity_name": item.entity_name,
+                    "entity_display_name": item.entity_display_name,
+                    "object_type": item.object_type,
+                    "build_type": item.build_type,
+                    "status": item.status,
+                } for item in entities],
+                metrics=serialized_metrics,
+                rules=serialized_rules,
+                activities=serialized_activities,
+            ),
+            "analysis_mode_options": SKILL_ANALYSIS_MODE_OPTIONS,
+            "default_analysis_modes": list(DEFAULT_SKILL_ANALYSIS_MODES),
+            "default_time_window": "7D",
+            "default_max_path_depth": 2,
+            "entities": [
+                {
+                    "entity_id": item.entity_id,
+                    "entity_name": item.entity_name,
+                    "entity_display_name": item.entity_display_name,
+                    "object_type": item.object_type,
+                    "build_type": item.build_type,
+                    "status": item.status,
+                }
+                for item in entities
+            ],
+            "relations": [
+                {
+                    "relation_id": item.relation_id,
+                    "relation_name": item.relation_name,
+                    "relation_type": item.relation_type,
+                    "source_entity_id": item.source_entity_id,
+                    "target_entity_id": item.target_entity_id,
+                }
+                for item in relations
+            ],
+            "processes": [
+                {
+                    "process_id": item.process_id,
+                    "process_name": item.process_name,
+                    "process_desc": item.process_desc,
+                }
+                for item in processes
+            ],
+            "metrics": serialized_metrics,
+            "rules": serialized_rules,
+            "activities": serialized_activities,
+        }
+
+    @staticmethod
+    def _contains_any_keyword(texts: List[str], keywords: List[str]) -> bool:
+        normalized = " ".join(item.upper() for item in texts if item).strip()
+        return any(keyword.upper() in normalized for keyword in keywords if keyword)
+
+    def _build_analysis_scenario_templates(
+        self,
+        *,
+        entities: List[Dict[str, Any]],
+        metrics: List[Dict[str, Any]],
+        rules: List[Dict[str, Any]],
+        activities: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        templates = []
+        for template in ANALYSIS_SCENARIO_TEMPLATES:
+            entity_ids = [
+                item.get("entity_id")
+                for item in entities
+                if self._contains_any_keyword(
+                    [str(item.get("entity_name") or ""), str(item.get("entity_display_name") or "")],
+                    template.get("entity_keywords") or [],
+                )
+            ]
+            metric_ids = [
+                item.get("metric_id")
+                for item in metrics
+                if self._contains_any_keyword(
+                    [
+                        str(item.get("metric_name") or ""),
+                        str(item.get("metric_code") or ""),
+                        str(item.get("metric_desc") or ""),
+                        str(item.get("metric_category") or ""),
+                    ],
+                    template.get("metric_keywords") or [],
+                )
+            ]
+            rule_ids = [
+                item.get("rule_id")
+                for item in rules
+                if self._contains_any_keyword(
+                    [
+                        str(item.get("rule_name") or ""),
+                        str(item.get("rule_desc") or ""),
+                        str(item.get("rule_category") or ""),
+                        str(item.get("scope_entity_name") or ""),
+                        str(item.get("scope_entity_display_name") or ""),
+                        str(item.get("scope_relation_name") or ""),
+                    ],
+                    template.get("rule_keywords") or [],
+                )
+            ]
+            activity_ids = [
+                item.get("activity_id")
+                for item in activities
+                if (item.get("activity_type") or "") in set(template.get("activity_types") or [])
+            ]
+            templates.append({
+                "scenario_code": template["scenario_code"],
+                "scenario_name": template["scenario_name"],
+                "description": template["description"],
+                "recommended_analysis_modes": template["recommended_analysis_modes"],
+                "default_time_window": template["default_time_window"],
+                "max_path_depth": template["max_path_depth"],
+                "enable_activity_recommendation": template["enable_activity_recommendation"],
+                "recommended_entry_entity_ids": self._normalize_string_list(entity_ids)[:8],
+                "recommended_metric_ids": self._normalize_string_list(metric_ids)[:20],
+                "recommended_rule_ids": self._normalize_string_list(rule_ids)[:20],
+                "recommended_activity_ids": self._normalize_string_list(activity_ids)[:20],
+            })
+        return templates
+
+    def _load_domain_ontology_definition(self, domain_id: str) -> Dict[str, Any]:
+        entities = self.db.query(SysOntologyEntity).options(
+            selectinload(SysOntologyEntity.properties),
+        ).filter(
+            SysOntologyEntity.domain_id == domain_id,
+        ).order_by(
+            SysOntologyEntity.entity_display_name,
+            SysOntologyEntity.entity_name,
+        ).all()
+        relations = self.db.query(SysOntologyRelation).filter(
+            SysOntologyRelation.domain_id == domain_id,
+        ).order_by(
+            SysOntologyRelation.relation_name,
+        ).all()
+        entity_index = {entity.entity_id: entity for entity in entities}
+        serialized_entities = []
+        for entity in entities:
+            serialized_entities.append({
+                "entity_id": entity.entity_id,
+                "entity_name": entity.entity_name,
+                "entity_display_name": entity.entity_display_name,
+                "entity_desc": entity.entity_desc,
+                "object_type": entity.object_type,
+                "build_type": entity.build_type,
+                "table_name": entity.table_name,
+                "status": entity.status,
+                "governance_status": entity.governance_status,
+                "data_owner": entity.data_owner,
+                "security_level": entity.security_level,
+                "update_frequency": entity.update_frequency,
+                "properties": [
+                    {
+                        "property_id": prop.property_id,
+                        "property_name": prop.property_name,
+                        "property_display_name": prop.property_display_name,
+                        "property_desc": prop.property_desc,
+                        "data_type": prop.data_type,
+                        "is_primary_key": prop.is_primary_key,
+                        "is_nullable": prop.is_nullable,
+                        "unit": prop.unit,
+                        "value_constraint": prop.value_constraint,
+                        "usage_codes": self._safe_json_loads(getattr(prop, "usage_codes_json", None), []),
+                        "is_required_filter": prop.is_required_filter,
+                        "ref_property_id": prop.ref_property_id,
+                    }
+                    for prop in sorted(entity.properties or [], key=lambda item: (item.order_num or 0, item.property_name or ""))
+                ],
+            })
+        serialized_relations = []
+        for relation in relations:
+            source_entity = entity_index.get(relation.source_entity_id)
+            target_entity = entity_index.get(relation.target_entity_id)
+            serialized_relations.append({
+                "relation_id": relation.relation_id,
+                "relation_name": relation.relation_name,
+                "relation_type": relation.relation_type,
+                "relation_desc": relation.relation_desc,
+                "source_entity_id": relation.source_entity_id,
+                "source_entity_name": source_entity.entity_name if source_entity else "",
+                "target_entity_id": relation.target_entity_id,
+                "target_entity_name": target_entity.entity_name if target_entity else "",
+                "relation_table_name": relation.relation_table_name,
+            })
+        return {
+            "domain_id": domain_id,
+            "entity_count": len(serialized_entities),
+            "relation_count": len(serialized_relations),
+            "entities": serialized_entities,
+            "relations": serialized_relations,
+        }
+
+    def _build_ontology_graph_binding(
+        self,
+        ontology_model: Dict[str, Any],
+        topology: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        nodes_by_label = {
+            str(node.get("displayName") or node.get("name") or "").upper(): node
+            for node in (topology.get("nodes") or [])
+            if str(node.get("displayName") or node.get("name") or "").strip()
+        }
+        entity_bindings = []
+        property_bindings = []
+        entity_labels_by_id: Dict[str, List[str]] = {}
+        for entity in ontology_model.get("entities") or []:
+            graph_labels = self._graph_labels_for_entity(topology, entity.get("entity_name") or "")
+            entity_labels_by_id[entity.get("entity_id") or ""] = graph_labels
+            entity_bindings.append({
+                "entity_id": entity.get("entity_id"),
+                "entity_name": entity.get("entity_name"),
+                "entity_display_name": entity.get("entity_display_name"),
+                "graph_labels": graph_labels,
+                "matched": bool(graph_labels),
+                "reason": "按实体名与 Property Graph 节点标签匹配。" if graph_labels else "当前未在已部署 Property Graph 中匹配到同名或近似标签。",
+            })
+            node_properties = {}
+            for label in graph_labels:
+                node = nodes_by_label.get(label.upper()) or {}
+                node_properties[label] = {
+                    str(prop.get("property_name") or "").upper(): prop
+                    for prop in (node.get("properties") or [])
+                    if str(prop.get("property_name") or "").strip()
+                }
+            for prop in entity.get("properties") or []:
+                matched_columns = []
+                normalized_property_name = self._normalize_lookup_token(prop.get("property_name") or "")
+                for label, property_index in node_properties.items():
+                    for property_name, property_meta in property_index.items():
+                        normalized_graph_property = self._normalize_lookup_token(property_name)
+                        if (
+                            normalized_property_name
+                            and (normalized_graph_property == normalized_property_name
+                                 or normalized_property_name in normalized_graph_property
+                                 or normalized_graph_property in normalized_property_name)
+                        ):
+                            matched_columns.append({
+                                "graph_label": label,
+                                "graph_property_name": property_name,
+                                "graph_data_type": property_meta.get("data_type"),
+                                "is_primary_key": property_meta.get("is_primary_key"),
+                            })
+                property_bindings.append({
+                    "entity_id": entity.get("entity_id"),
+                    "entity_name": entity.get("entity_name"),
+                    "property_id": prop.get("property_id"),
+                    "property_name": prop.get("property_name"),
+                    "property_display_name": prop.get("property_display_name"),
+                    "matched_columns": matched_columns,
+                    "matched": bool(matched_columns),
+                })
+
+        relation_bindings = []
+        for relation in ontology_model.get("relations") or []:
+            source_labels = entity_labels_by_id.get(relation.get("source_entity_id") or "", [])
+            target_labels = entity_labels_by_id.get(relation.get("target_entity_id") or "", [])
+            matched_edges = []
+            for edge in topology.get("edges") or []:
+                edge_source = str(edge.get("source") or "").upper()
+                edge_target = str(edge.get("target") or "").upper()
+                if edge_source in {label.upper() for label in source_labels} and edge_target in {label.upper() for label in target_labels}:
+                    matched_edges.append({
+                        "graph_edge_id": edge.get("id"),
+                        "graph_edge_name": edge.get("name"),
+                        "graph_source_label": edge.get("source"),
+                        "graph_target_label": edge.get("target"),
+                        "graph_table_name": edge.get("relationTableName") or edge.get("tableName"),
+                    })
+            relation_bindings.append({
+                "relation_id": relation.get("relation_id"),
+                "relation_name": relation.get("relation_name"),
+                "source_entity_name": relation.get("source_entity_name"),
+                "target_entity_name": relation.get("target_entity_name"),
+                "source_graph_labels": source_labels,
+                "target_graph_labels": target_labels,
+                "matched_edges": matched_edges,
+                "matched": bool(matched_edges),
+            })
+        return {
+            "entity_bindings": entity_bindings,
+            "property_bindings": property_bindings,
+            "relation_bindings": relation_bindings,
+        }
+
+    @staticmethod
+    def _normalize_string_list(values: Any) -> List[str]:
+        result: List[str] = []
+        for value in values or []:
+            token = str(value or "").strip()
+            if token and token not in result:
+                result.append(token)
+        return result
+
+    def _normalize_analysis_modes(self, values: Any) -> List[str]:
+        normalized = []
+        for value in values or []:
+            token = str(value or "").strip().upper()
+            if token in ALLOWED_SKILL_ANALYSIS_MODES and token not in normalized:
+                normalized.append(token)
+        return normalized or list(DEFAULT_SKILL_ANALYSIS_MODES)
+
+    @staticmethod
+    def _normalize_time_window(value: Any) -> str:
+        token = str(value or "").strip().upper()
+        if re.fullmatch(r"\d+[DWMQY]", token):
+            return token
+        return "7D"
+
+    @staticmethod
+    def _normalize_max_path_depth(value: Any) -> int:
+        try:
+            return max(1, min(int(value or 2), 5))
+        except (TypeError, ValueError):
+            return 2
+
+    def _serialize_metric_definition(
+        self,
+        metric: SysMetricDefinition,
+        entity_index: Dict[str, SysOntologyEntity],
+    ) -> Dict[str, Any]:
+        entity = entity_index.get(metric.entity_id)
+        return {
+            "metric_id": metric.metric_id,
+            "domain_id": metric.domain_id,
+            "entity_id": metric.entity_id,
+            "entity_name": entity.entity_name if entity else "",
+            "entity_display_name": entity.entity_display_name if entity else "",
+            "metric_code": metric.metric_code,
+            "metric_name": metric.metric_name,
+            "metric_category": metric.metric_category,
+            "metric_desc": metric.metric_desc,
+            "calculation_expr": metric.calculation_expr,
+            "aggregation_method": metric.aggregation_method,
+            "calculation_period": metric.calculation_period,
+            "unit": metric.unit,
+            "threshold_config": metric.threshold_config,
+            "threshold_config_json": self._safe_json_loads(metric.threshold_config, {}),
+            "status": metric.status,
+        }
+
+    def _serialize_rule_definition(
+        self,
+        rule: SysBusinessRule,
+        entity_index: Dict[str, SysOntologyEntity],
+        relation_index: Dict[str, SysOntologyRelation],
+        activity_index: Dict[str, SysBusinessActivity],
+    ) -> Dict[str, Any]:
+        entity = entity_index.get(rule.scope_entity_id or "")
+        relation = relation_index.get(rule.scope_relation_id or "")
+        activity = activity_index.get(rule.activity_id or "")
+        return {
+            "rule_id": rule.rule_id,
+            "domain_id": rule.domain_id,
+            "rule_name": rule.rule_name,
+            "rule_category": rule.rule_category,
+            "rule_desc": rule.rule_desc,
+            "trigger_event": rule.trigger_event,
+            "scope_entity_id": rule.scope_entity_id,
+            "scope_entity_name": entity.entity_name if entity else "",
+            "scope_entity_display_name": entity.entity_display_name if entity else "",
+            "scope_relation_id": rule.scope_relation_id,
+            "scope_relation_name": relation.relation_name if relation else "",
+            "condition_json": rule.condition_json,
+            "condition_config": self._safe_json_loads(rule.condition_json, {}),
+            "activity_id": rule.activity_id,
+            "activity_name": activity.activity_name if activity else "",
+            "priority": rule.priority,
+            "status": rule.status,
+        }
+
+    def _serialize_activity_definition(
+        self,
+        activity: SysBusinessActivity,
+        process_index: Dict[str, SysProcessDef],
+    ) -> Dict[str, Any]:
+        process = process_index.get(activity.process_id or "")
+        return {
+            "activity_id": activity.activity_id,
+            "domain_id": activity.domain_id,
+            "activity_name": activity.activity_name,
+            "activity_type": activity.activity_type,
+            "activity_desc": activity.activity_desc,
+            "process_id": activity.process_id,
+            "process_name": process.process_name if process else "",
+            "config_json": activity.config_json,
+            "config": self._safe_json_loads(activity.config_json, {}),
+            "status": activity.status,
+        }
+
+    @staticmethod
+    def _normalize_lookup_token(value: Any) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+    def _graph_labels_for_entity(self, topology: Dict[str, Any], entity_name: str) -> List[str]:
+        normalized_entity = self._normalize_lookup_token(entity_name)
+        labels = []
+        for node in topology.get("nodes") or []:
+            label = str(node.get("displayName") or node.get("name") or "").strip().upper()
+            normalized_label = self._normalize_lookup_token(label)
+            if not label:
+                continue
+            if normalized_label == normalized_entity or normalized_entity in normalized_label or normalized_label in normalized_entity:
+                labels.append(label)
+        return list(dict.fromkeys(labels))
+
+    def _load_analysis_semantics_for_skill(
+        self,
+        *,
+        domain_id: str,
+        payload: Dict[str, Any],
+        topology: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        catalog = self.get_analysis_semantics(domain_id)
+        scenario_code = str(payload.get("analysis_scenario_code") or "").strip().upper()
+        scenario_template = next(
+            (item for item in (catalog.get("scenario_templates") or []) if str(item.get("scenario_code") or "").upper() == scenario_code),
+            None,
+        )
+        entities = catalog.get("entities") or []
+        relations = catalog.get("relations") or []
+        entity_index = {item["entity_id"]: item for item in entities}
+        relation_index = {item["relation_id"]: item for item in relations}
+
+        selected_metric_ids = set(self._normalize_string_list(payload.get("selected_metric_ids")))
+        selected_rule_ids = set(self._normalize_string_list(payload.get("selected_rule_ids")))
+        selected_activity_ids = set(self._normalize_string_list(payload.get("selected_activity_ids")))
+        if scenario_template and not selected_metric_ids:
+            selected_metric_ids = set(self._normalize_string_list(scenario_template.get("recommended_metric_ids")))
+        if scenario_template and not selected_rule_ids:
+            selected_rule_ids = set(self._normalize_string_list(scenario_template.get("recommended_rule_ids")))
+        if scenario_template and not selected_activity_ids:
+            selected_activity_ids = set(self._normalize_string_list(scenario_template.get("recommended_activity_ids")))
+
+        metrics = [item for item in (catalog.get("metrics") or []) if item.get("status") == "ACTIVE"]
+        rules = [item for item in (catalog.get("rules") or []) if item.get("status") == "ACTIVE"]
+        activities = [item for item in (catalog.get("activities") or []) if item.get("status") == "ACTIVE"]
+        if selected_metric_ids:
+            metrics = [item for item in (catalog.get("metrics") or []) if item.get("metric_id") in selected_metric_ids]
+        if selected_rule_ids:
+            rules = [item for item in (catalog.get("rules") or []) if item.get("rule_id") in selected_rule_ids]
+        if selected_activity_ids:
+            activities = [item for item in (catalog.get("activities") or []) if item.get("activity_id") in selected_activity_ids]
+
+        entry_entity_ids = self._normalize_string_list(payload.get("entry_entity_ids"))
+        if scenario_template and not entry_entity_ids:
+            entry_entity_ids = self._normalize_string_list(scenario_template.get("recommended_entry_entity_ids"))
+        if not entry_entity_ids:
+            derived_entry_ids = [item.get("entity_id") for item in metrics if item.get("entity_id")]
+            derived_entry_ids.extend(item.get("scope_entity_id") for item in rules if item.get("scope_entity_id"))
+            entry_entity_ids = self._normalize_string_list(derived_entry_ids)[:8]
+
+        analysis_profile = {
+            "analysis_scenario_code": scenario_code or (scenario_template or {}).get("scenario_code") or "GENERAL_GRAPH",
+            "analysis_scenario_name": (scenario_template or {}).get("scenario_name") or "通用图探索分析",
+            "analysis_modes": self._normalize_analysis_modes(
+                payload.get("analysis_modes") or (scenario_template or {}).get("recommended_analysis_modes")
+            ),
+            "entry_entity_ids": entry_entity_ids,
+            "entry_entities": [
+                {
+                    "entity_id": entity_id,
+                    "entity_name": (entity_index.get(entity_id) or {}).get("entity_name") or "",
+                    "entity_display_name": (entity_index.get(entity_id) or {}).get("entity_display_name") or "",
+                    "graph_labels": self._graph_labels_for_entity(topology, (entity_index.get(entity_id) or {}).get("entity_name") or ""),
+                }
+                for entity_id in entry_entity_ids
+                if entity_id in entity_index
+            ],
+            "default_time_window": self._normalize_time_window(
+                payload.get("default_time_window") or (scenario_template or {}).get("default_time_window")
+            ),
+            "max_path_depth": self._normalize_max_path_depth(
+                payload.get("max_path_depth") or (scenario_template or {}).get("max_path_depth")
+            ),
+            "enable_activity_recommendation": bool(
+                payload.get("enable_activity_recommendation")
+                if "enable_activity_recommendation" in payload
+                else (scenario_template or {}).get("enable_activity_recommendation", True)
+            ),
+        }
+
+        graph_semantic_map = self._build_graph_semantic_map(
+            topology=topology,
+            metrics=metrics,
+            rules=rules,
+            activities=activities,
+            entity_index=entity_index,
+            relation_index=relation_index,
+        )
+        return {
+            "analysis_profile": analysis_profile,
+            "metrics": metrics,
+            "rules": rules,
+            "activities": activities,
+            "graph_semantic_map": graph_semantic_map,
+        }
+
+    def _build_graph_semantic_map(
+        self,
+        *,
+        topology: Dict[str, Any],
+        metrics: List[Dict[str, Any]],
+        rules: List[Dict[str, Any]],
+        activities: List[Dict[str, Any]],
+        entity_index: Dict[str, Dict[str, Any]],
+        relation_index: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        metric_bindings = []
+        for metric in metrics:
+            entity_name = (entity_index.get(metric.get("entity_id")) or {}).get("entity_name") or metric.get("entity_name") or ""
+            graph_labels = self._graph_labels_for_entity(topology, entity_name)
+            metric_bindings.append({
+                "metric_id": metric.get("metric_id"),
+                "metric_name": metric.get("metric_name"),
+                "entity_id": metric.get("entity_id"),
+                "entity_name": entity_name,
+                "graph_labels": graph_labels,
+                "aggregation_method": metric.get("aggregation_method"),
+                "calculation_period": metric.get("calculation_period"),
+                "reason": "按指标关联本体对象匹配 Property Graph 节点标签。",
+            })
+
+        rule_bindings = []
+        for rule in rules:
+            scoped_entity = entity_index.get(rule.get("scope_entity_id")) or {}
+            scoped_relation = relation_index.get(rule.get("scope_relation_id")) or {}
+            entity_labels = self._graph_labels_for_entity(topology, scoped_entity.get("entity_name") or "")
+            source_labels = self._graph_labels_for_entity(
+                topology, (entity_index.get(scoped_relation.get("source_entity_id")) or {}).get("entity_name") or ""
+            ) if scoped_relation else []
+            target_labels = self._graph_labels_for_entity(
+                topology, (entity_index.get(scoped_relation.get("target_entity_id")) or {}).get("entity_name") or ""
+            ) if scoped_relation else []
+            rule_bindings.append({
+                "rule_id": rule.get("rule_id"),
+                "rule_name": rule.get("rule_name"),
+                "rule_category": rule.get("rule_category"),
+                "scope_entity_id": rule.get("scope_entity_id"),
+                "scope_entity_labels": entity_labels,
+                "scope_relation_id": rule.get("scope_relation_id"),
+                "scope_relation_name": scoped_relation.get("relation_name") or "",
+                "source_labels": source_labels,
+                "target_labels": target_labels,
+                "activity_id": rule.get("activity_id"),
+                "reason": "按规则作用域实体/关系映射图查询约束与结果解释范围。",
+            })
+
+        activity_rule_map: Dict[str, List[str]] = {}
+        for rule in rules:
+            activity_id = rule.get("activity_id")
+            if activity_id:
+                activity_rule_map.setdefault(activity_id, []).append(rule.get("rule_name") or rule.get("rule_id") or "")
+
+        activity_bindings = []
+        for activity in activities:
+            activity_bindings.append({
+                "activity_id": activity.get("activity_id"),
+                "activity_name": activity.get("activity_name"),
+                "activity_type": activity.get("activity_type"),
+                "process_id": activity.get("process_id"),
+                "process_name": activity.get("process_name"),
+                "triggered_by_rules": activity_rule_map.get(activity.get("activity_id"), []),
+                "reason": "分析结论命中规则后，按活动类型给出处置建议而非直接执行写操作。",
+            })
+
+        return {
+            "metric_bindings": metric_bindings,
+            "rule_bindings": rule_bindings,
+            "activity_bindings": activity_bindings,
+        }
 
     def list_skills(self, domain_id: Optional[str] = None) -> List[Dict[str, Any]]:
         query = (
@@ -87,6 +782,18 @@ class AgentService:
             property_graph_name=payload["property_graph_name"],
         )
         llm_config = self._get_llm_config(payload.get("llm_config_id"))
+        topology = self.source_service.get_remote_property_graph_topology(
+            entity.source_id,
+            entity.entity_name,
+            schema=getattr(entity, "schema", None),
+        )
+        ontology_model = self._load_domain_ontology_definition(domain_id)
+        ontology_graph_binding = self._build_ontology_graph_binding(ontology_model, topology)
+        analysis_semantics = self._load_analysis_semantics_for_skill(
+            domain_id=domain_id,
+            payload=payload,
+            topology=topology,
+        )
         skill = SysAgentSkill(
             skill_id=generate_id("skill"),
             domain_id=domain_id,
@@ -111,6 +818,10 @@ class AgentService:
             relations=relations,
             skill=skill,
             llm_config=llm_config,
+            topology=topology,
+            analysis_semantics=analysis_semantics,
+            ontology_model=ontology_model,
+            ontology_graph_binding=ontology_graph_binding,
         )
         skill.skill_desc = skill.skill_desc or generated["skill_desc"]
         skill.analysis_goal = skill.analysis_goal or generated["analysis_goal"]
@@ -118,7 +829,7 @@ class AgentService:
         skill.output_requirements = skill.output_requirements or generated["output_requirements"]
         skill.prompt_template = generated["prompt_template"]
         skill.context_json = json.dumps(
-            self._build_skill_context(domain, process, entity, properties, relations),
+            self._build_skill_context(domain, process, entity, properties, relations, topology, analysis_semantics, ontology_model, ontology_graph_binding),
             ensure_ascii=False,
         )
         self.db.add(skill)
@@ -142,6 +853,22 @@ class AgentService:
             property_graph_name=property_graph_name,
         )
         llm_config = self._get_llm_config(llm_config_id)
+        topology = self.source_service.get_remote_property_graph_topology(
+            entity.source_id,
+            entity.entity_name,
+            schema=getattr(entity, "schema", None),
+        )
+        ontology_model = self._load_domain_ontology_definition(skill.domain_id)
+        ontology_graph_binding = self._build_ontology_graph_binding(ontology_model, topology)
+        merged_payload = {
+            **self._skill_semantic_defaults_from_context(self._safe_json_loads(skill.context_json, {})),
+            **payload,
+        }
+        analysis_semantics = self._load_analysis_semantics_for_skill(
+            domain_id=skill.domain_id,
+            payload=merged_payload,
+            topology=topology,
+        )
 
         for field in ["skill_name", "skill_desc", "analysis_goal", "execution_rules", "output_requirements", "status"]:
             if field in payload and payload[field] is not None:
@@ -159,6 +886,10 @@ class AgentService:
             relations=relations,
             skill=skill,
             llm_config=llm_config,
+            topology=topology,
+            analysis_semantics=analysis_semantics,
+            ontology_model=ontology_model,
+            ontology_graph_binding=ontology_graph_binding,
         )
         skill.skill_desc = skill.skill_desc or generated["skill_desc"]
         skill.analysis_goal = skill.analysis_goal or generated["analysis_goal"]
@@ -166,7 +897,7 @@ class AgentService:
         skill.output_requirements = skill.output_requirements or generated["output_requirements"]
         skill.prompt_template = generated["prompt_template"]
         skill.context_json = json.dumps(
-            self._build_skill_context(domain, process, entity, properties, relations),
+            self._build_skill_context(domain, process, entity, properties, relations, topology, analysis_semantics, ontology_model, ontology_graph_binding),
             ensure_ascii=False,
         )
         skill.updated_at = datetime.utcnow()
@@ -328,11 +1059,13 @@ class AgentService:
         )
         if not topology.get("graph_name") or not topology.get("nodes"):
             raise ValueError("所选数据源没有可用 Oracle Property Graph，无法按本体属性执行图查询")
+        query_guidance = self._build_skill_query_guidance(skill_markdown, skill_files)
         graph_plan = await self._plan_graph_query_from_topology(
             question=question,
             conversation_context=self._format_conversation_history(conversation_history),
             topology=topology,
             llm_config=llm_config,
+            skill_guidance=query_guidance,
         )
         if not graph_plan:
             graph_plan = self._build_supply_chain_graph_plan(
@@ -347,6 +1080,7 @@ class AgentService:
                 question=question,
                 llm_config=llm_config,
                 topology=topology,
+                skill_guidance=query_guidance,
             )
             graph_sql = self._build_graph_node_property_sql(
                 graph_name=topology["graph_name"],
@@ -356,13 +1090,18 @@ class AgentService:
             source_id=payload["source_id"],
             graph_sql=graph_sql,
             schema=payload.get("schema"),
-            row_limit=max(1, min(int(payload.get("sample_limit") or 100), 100)),
+            row_limit=max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX)),
         )
         executed_sql = graph_sql
         references = "\n\n".join(
             f"## {path}\n{content}" for path, content in skill_files.items() if path != "SKILL.md"
         )[:30000]
-        sample_rows = json.dumps(graph_result.get("rows", [])[:100], ensure_ascii=False, indent=2, default=str)
+        sample_rows = json.dumps(
+            graph_result.get("rows", [])[: max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX))],
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
         columns = json.dumps(graph_result.get("columns", [])[:30], ensure_ascii=False, indent=2, default=str)
         system_prompt = """你是供应链数据分析智能体。严格遵守用户上传的 Skill：只依据给定 Skill、Oracle Property Graph 本体属性、只读查询结果和用户问题分析，不臆造字段、数据或查询结果。
 
@@ -402,10 +1141,11 @@ class AgentService:
         self.db.commit()
         trace = [
             {"step_no": 1, "stage": "SKILL_LOAD", "title": "加载上传 Skill", "status": "SUCCESS", "detail": f"已加载 SKILL.md 及 {len(skill_files) - 1} 个参考文件。"},
-            {"step_no": 2, "stage": "ONTOLOGY_NODE_SELECTION", "title": "Agent 选择本体查询对象", "status": "SUCCESS", "detail": f"在属性图 {topology.get('graph_name')} 中选择 {selected_node.get('displayName')}。原因：{selected_node.get('reason')}"},
-            {"step_no": 3, "stage": "GRAPH_SCHEMA_INSPECTION", "title": "检查本体属性与关系", "status": "SUCCESS", "detail": f"底层对象为 {selected_node.get('tableName')}，本次 GRAPH_TABLE 返回 {len(graph_result.get('columns', []))} 个本体属性或汇总字段。"},
-            {"step_no": 4, "stage": "ORACLE_GRAPH_QUERY", "title": "执行 Oracle Graph SQL", "status": "SUCCESS", "detail": f"使用 GRAPH_TABLE 查询并返回 {len(graph_result.get('rows', []))} 条本体实例记录。", "sql": executed_sql},
-            {"step_no": 5, "stage": "AGENT_ANALYSIS", "title": "Agent 按 Skill 分析", "status": "SUCCESS", "detail": "已将 Skill 指令、会话上下文、本体属性字段、Graph SQL 结果和当前问题发送给分析 Agent。"},
+            {"step_no": 2, "stage": "SEMANTIC_GUIDANCE_LOAD", "title": "加载指标规则活动语义", "status": "SUCCESS", "detail": "已向查询规划器和分析 Agent 提供 Skill 中的指标目录、规则目录、活动手册与分析策略。"},
+            {"step_no": 3, "stage": "ONTOLOGY_NODE_SELECTION", "title": "Agent 选择本体查询对象", "status": "SUCCESS", "detail": f"在属性图 {topology.get('graph_name')} 中选择 {selected_node.get('displayName')}。原因：{selected_node.get('reason')}"},
+            {"step_no": 4, "stage": "GRAPH_SCHEMA_INSPECTION", "title": "检查本体属性与关系", "status": "SUCCESS", "detail": f"底层对象为 {selected_node.get('tableName')}，本次 GRAPH_TABLE 返回 {len(graph_result.get('columns', []))} 个本体属性或汇总字段。"},
+            {"step_no": 5, "stage": "ORACLE_GRAPH_QUERY", "title": "执行 Oracle Graph SQL", "status": "SUCCESS", "detail": f"使用 GRAPH_TABLE 查询并返回 {len(graph_result.get('rows', []))} 条本体实例记录。", "sql": executed_sql},
+            {"step_no": 6, "stage": "AGENT_ANALYSIS", "title": "Agent 按 Skill 分析", "status": "SUCCESS", "detail": "已将 Skill 指令、指标规则活动语义、会话上下文、本体属性字段、Graph SQL 结果和当前问题发送给分析 Agent。"},
         ]
         conversation = stored_conversation_history + ([] if is_session_start else [{"role": "user", "content": question}])
         conversation.append({"role": "assistant", "content": agent_output})
@@ -418,7 +1158,7 @@ class AgentService:
             "agent_output": agent_output,
             "execution_trace": trace,
             "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
-            "warnings": ["当前测试使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，会在图关系定位后通过经批准的只读事实表聚合。"],
+            "warnings": ["当前测试优先使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，Skill 可在图关系定位后继续建议只读事实表聚合。"],
         }
         turn_results = previous_turn_results + ([] if is_session_start else [current_turn])
         response = {
@@ -429,7 +1169,7 @@ class AgentService:
             "agent_output": agent_output,
             "execution_trace": trace,
             "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
-            "warnings": ["当前测试使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，会在图关系定位后通过经批准的只读事实表聚合。"],
+            "warnings": ["当前测试优先使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，Skill 可在图关系定位后继续建议只读事实表聚合。"],
             "table_preview": table_preview,
             "turn_results": turn_results,
         }
@@ -467,10 +1207,11 @@ class AgentService:
                 source_name=source.source_name if source else "",
                 schema_name=payload.get("schema") or "",
                 llm_config_id=payload["llm_config_id"],
-                sample_limit=max(1, min(int(payload.get("sample_limit") or 100), 100)),
+                sample_limit=max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX)),
                 created_by=created_by or "unknown",
             )
             self.db.add(session)
+        session.sample_limit = max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX))
         session.session_title = question[:500]
         session.last_question = question[:2000]
         session.message_count = len(conversation)
@@ -562,6 +1303,22 @@ class AgentService:
             data["result"] = self._safe_json_loads(session.result_json, {})
         return data
 
+    @staticmethod
+    def _build_skill_query_guidance(skill_markdown: str, skill_files: Dict[str, str]) -> str:
+        sections = [skill_markdown[:8000]]
+        for path in [
+            "references/ontology-model.json",
+            "references/ontology-graph-binding.json",
+            "references/analysis-strategy.md",
+            "references/metric-catalog.json",
+            "references/rule-catalog.json",
+            "references/activity-playbook.json",
+        ]:
+            content = skill_files.get(path)
+            if content:
+                sections.append(f"## {path}\n{content[:8000]}")
+        return "\n\n".join(sections)
+
     async def _select_managed_skill_graph_node(
         self,
         *,
@@ -569,6 +1326,7 @@ class AgentService:
         question: str,
         llm_config: SysLLMConfig,
         topology: Dict[str, Any],
+        skill_guidance: str = "",
     ) -> Dict[str, Any]:
         candidates = topology.get("nodes") or []
         if len(candidates) == 1:
@@ -587,6 +1345,9 @@ class AgentService:
 
 Skill：
 {skill_markdown[:12000]}
+
+语义与策略：
+{skill_guidance[:12000] or '无'}
 
 用户问题：{question}
 
@@ -633,6 +1394,7 @@ FROM GRAPH_TABLE(
         conversation_context: str,
         topology: Dict[str, Any],
         llm_config: SysLLMConfig,
+        skill_guidance: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Plan a graph query from live topology, then compile it without accepting model SQL."""
         nodes = topology.get("nodes") or []
@@ -668,7 +1430,9 @@ FROM GRAPH_TABLE(
 7. 若无法从知识地图精确映射用户要求的对象或展示字段，返回 {{}}，由系统选择其他受控查询方式。
 8. 当前问题优先于会话上下文：若当前问题含有 BOT-、BATCH-、CASE-、PACK-、PALLET-、STACK- 等精确业务编码，filter_value 必须取当前问题中的编码；只有当前问题未给出精确编码且使用“该瓶码/继续”等指代时，才可从上下文继承。
 9. 用户显式提到 `ONTO_NODE_XXX` 时，`XXX` 就是必须覆盖的目标图节点标签；图关系可顺向或反向遍历。
+10. 若 Skill 明确给出了优先分析入口、关键指标、规则约束或活动建议，应优先选择与这些业务语义最匹配的起点节点和目标节点。
 
+Skill 语义与策略：{skill_guidance[:12000] or '无'}
 当前问题：{question}
 会话上下文：{conversation_context or '无'}
 知识地图：{json.dumps(catalog, ensure_ascii=False)}'''
@@ -1229,6 +1993,7 @@ Skill：
             skill.property_graph_name,
             schema=getattr(entity, "schema", None),
         )
+        skill_context = self._safe_json_loads(skill.context_json, {})
         package_files = await self._generate_skill_package_files(
             domain=domain,
             process=process,
@@ -1236,6 +2001,7 @@ Skill：
             skill=skill,
             llm_config=llm_config,
             topology=topology,
+            skill_context=skill_context,
         )
         archive = BytesIO()
         with ZipFile(archive, "w", ZIP_DEFLATED) as zip_file:
@@ -1257,13 +2023,29 @@ Skill：
         skill: SysAgentSkill,
         llm_config: SysLLMConfig,
         topology: Dict[str, Any],
+        skill_context: Dict[str, Any],
     ) -> Dict[str, str]:
         graph_reference = self._build_graph_reference(topology)
         flow_reference = self._build_flow_reference(process)
+        semantics = (skill_context or {}).get("analysis_semantics") or {}
+        ontology_model = (skill_context or {}).get("ontology_model") or {}
+        ontology_graph_binding = (skill_context or {}).get("ontology_graph_binding") or {}
+        metric_reference = self._build_metric_reference(semantics.get("metrics") or [])
+        rule_reference = self._build_rule_reference(semantics.get("rules") or [])
+        activity_reference = self._build_activity_reference(semantics.get("activities") or [])
+        ontology_model_reference = self._build_ontology_model_reference(ontology_model)
+        ontology_graph_binding_reference = self._build_ontology_graph_binding_reference(ontology_graph_binding)
+        strategy_reference = self._build_analysis_strategy_reference(skill, skill_context, topology)
         fallback = {
-            "SKILL.md": self._build_skill_markdown(domain, process, entity, skill, topology),
+            "SKILL.md": self._build_skill_markdown(domain, process, entity, skill, topology, skill_context),
             "references/property-graph.md": graph_reference,
+            "references/ontology-model.json": ontology_model_reference,
+            "references/ontology-graph-binding.json": ontology_graph_binding_reference,
             "references/analysis-flow.md": flow_reference,
+            "references/metric-catalog.json": metric_reference,
+            "references/rule-catalog.json": rule_reference,
+            "references/activity-playbook.json": activity_reference,
+            "references/analysis-strategy.md": strategy_reference,
         }
         system_prompt = """你是 Agent Skill 打包专家。根据用户给出的技能配置、业务流程和 Oracle Property Graph 实时拓扑，生成可直接被 Agent 加载的技能包文件。
 
@@ -1274,7 +2056,8 @@ Skill：
 4. 数据库只允许 SELECT / WITH ... SELECT / GRAPH_TABLE 查询；严禁 DDL、DML、PL/SQL、权限操作、凭据及任何密码。
 5. 所有图标签、关系、顶点属性必须来自提供的实时拓扑；不要臆造数据库对象。对于图形结果，要求返回 SOURCE_ID、TARGET_ID、RELATION_NAME，并为不同类型 ID 加前缀。
 6. 文件路径必须是相对路径，不能包含 ..；总文件数不超过 8 个，每个文件不超过 24000 字符。
-7. 用中文编写说明和规则，SQL 保持 Oracle 语法。"""
+7. 用中文编写说明和规则，SQL 保持 Oracle 语法。
+8. 必须把给定的指标定义、业务规则、业务活动和图语义绑定写入 Skill；不能只描述图拓扑。"""
         payload = {
             "skill_config": {
                 "skill_name": skill.skill_name,
@@ -1290,9 +2073,18 @@ Skill：
                 "steps": self._extract_process_steps(process.process_json),
             },
             "property_graph": self._compact_topology(topology),
+            "ontology_model": ontology_model,
+            "ontology_graph_binding": ontology_graph_binding,
+            "analysis_semantics": semantics,
             "required_references": {
                 "property_graph_reference": graph_reference,
+                "ontology_model_reference": ontology_model_reference,
+                "ontology_graph_binding_reference": ontology_graph_binding_reference,
                 "analysis_flow_reference": flow_reference,
+                "metric_reference": metric_reference,
+                "rule_reference": rule_reference,
+                "activity_reference": activity_reference,
+                "analysis_strategy_reference": strategy_reference,
             },
         }
         try:
@@ -1307,7 +2099,13 @@ Skill：
             if "SKILL.md" in files:
                 # Real database facts are always included even if the model omitted its references.
                 files.setdefault("references/property-graph.md", graph_reference)
+                files.setdefault("references/ontology-model.json", ontology_model_reference)
+                files.setdefault("references/ontology-graph-binding.json", ontology_graph_binding_reference)
                 files.setdefault("references/analysis-flow.md", flow_reference)
+                files.setdefault("references/metric-catalog.json", metric_reference)
+                files.setdefault("references/rule-catalog.json", rule_reference)
+                files.setdefault("references/activity-playbook.json", activity_reference)
+                files.setdefault("references/analysis-strategy.md", strategy_reference)
                 return files
         except Exception:
             pass
@@ -1393,10 +2191,95 @@ Skill：
             lines.append(f"{step['step_no']}. {step['label']}（{step['type_label']}）{('：' + step['desc']) if step['desc'] else ''}")
         return "\n".join(lines)
 
-    def _build_skill_markdown(self, domain: SysDomain, process: SysProcessDef, entity: Any, skill: SysAgentSkill, topology: Dict[str, Any]) -> str:
+    def _build_ontology_model_reference(self, ontology_model: Dict[str, Any]) -> str:
+        return json.dumps({
+            "ontology_model": ontology_model,
+            "usage": "Agent 可从这里读取平台定义的本体对象、属性、关系及其业务语义，不得臆造未定义对象。",
+        }, ensure_ascii=False, indent=2)
+
+    def _build_ontology_graph_binding_reference(self, ontology_graph_binding: Dict[str, Any]) -> str:
+        return json.dumps({
+            "ontology_graph_binding": ontology_graph_binding,
+            "usage": "Agent 可从这里读取平台本体定义与已部署 Property Graph 之间的标签、属性、关系绑定。",
+        }, ensure_ascii=False, indent=2)
+
+    def _build_metric_reference(self, metrics: List[Dict[str, Any]]) -> str:
+        return json.dumps({
+            "metrics": metrics,
+            "usage": "Agent 只能使用这里出现的指标定义、口径、聚合方式和阈值配置。",
+        }, ensure_ascii=False, indent=2)
+
+    def _build_rule_reference(self, rules: List[Dict[str, Any]]) -> str:
+        return json.dumps({
+            "rules": rules,
+            "usage": "Agent 只能依据这里的规则定义做判定、分级、派生或预警解释。",
+        }, ensure_ascii=False, indent=2)
+
+    def _build_activity_reference(self, activities: List[Dict[str, Any]]) -> str:
+        return json.dumps({
+            "activities": activities,
+            "usage": "Agent 只能从这里的活动中选择建议动作；默认只建议，不直接执行。",
+        }, ensure_ascii=False, indent=2)
+
+    def _build_analysis_strategy_reference(self, skill: SysAgentSkill, skill_context: Dict[str, Any], topology: Dict[str, Any]) -> str:
+        analysis_profile = (skill_context or {}).get("analysis_semantics", {}).get("analysis_profile", {})
+        graph_map = (skill_context or {}).get("analysis_semantics", {}).get("graph_semantic_map", {})
+        ontology_model = (skill_context or {}).get("ontology_model") or {}
+        ontology_graph_binding = (skill_context or {}).get("ontology_graph_binding") or {}
+        lines = [
+            "# 分析策略参考",
+            "",
+            f"- Skill：{skill.skill_name}",
+            f"- 分析场景：{analysis_profile.get('analysis_scenario_name') or '通用图探索分析'}",
+            f"- 分析模式：{', '.join(analysis_profile.get('analysis_modes') or DEFAULT_SKILL_ANALYSIS_MODES)}",
+            f"- 默认时间窗：{analysis_profile.get('default_time_window') or '7D'}",
+            f"- 最大路径跳数：{analysis_profile.get('max_path_depth') or 2}",
+            f"- 是否输出活动建议：{'是' if analysis_profile.get('enable_activity_recommendation', True) else '否'}",
+            f"- Property Graph：`{topology.get('schema')}.{topology.get('graph_name')}`",
+            "",
+            "## 执行原则",
+            "1. 先识别问题属于缺陷分析、根因分析、影响推断还是追溯分析。",
+            "2. 先用 Property Graph 定位入口节点与关联路径，再使用指标做聚合和异常解释。",
+            "3. 只有命中规则时才能给出强结论；证据不足时必须输出疑似或待人工确认。",
+            "4. 活动只作为建议动作输出，不直接执行写操作、通知或流程调用。",
+            "",
+            "## 图语义绑定摘要",
+            f"- 本体对象数：{ontology_model.get('entity_count') or len(ontology_model.get('entities') or [])}",
+            f"- 本体关系数：{ontology_model.get('relation_count') or len(ontology_model.get('relations') or [])}",
+            f"- 本体对象绑定数：{len(ontology_graph_binding.get('entity_bindings') or [])}",
+            f"- 本体属性绑定数：{len(ontology_graph_binding.get('property_bindings') or [])}",
+            f"- 本体关系绑定数：{len(ontology_graph_binding.get('relation_bindings') or [])}",
+            f"- 指标绑定数：{len(graph_map.get('metric_bindings') or [])}",
+            f"- 规则绑定数：{len(graph_map.get('rule_bindings') or [])}",
+            f"- 活动绑定数：{len(graph_map.get('activity_bindings') or [])}",
+        ]
+        return "\n".join(lines)
+
+    def _build_skill_markdown(
+        self,
+        domain: SysDomain,
+        process: SysProcessDef,
+        entity: Any,
+        skill: SysAgentSkill,
+        topology: Dict[str, Any],
+        skill_context: Dict[str, Any],
+    ) -> str:
         steps = self._extract_process_steps(process.process_json)
         step_text = "\n".join(f"{item['step_no']}. {item['label']}（{item['type_label']}）" for item in steps) or "1. 校验输入并准备分析上下文。"
         graph_name = topology.get("graph_name") or entity.entity_name
+        analysis_profile = (skill_context or {}).get("analysis_semantics", {}).get("analysis_profile", {})
+        analysis_modes = "、".join(analysis_profile.get("analysis_modes") or DEFAULT_SKILL_ANALYSIS_MODES)
+        ontology_model = (skill_context or {}).get("ontology_model") or {}
+        ontology_graph_binding = (skill_context or {}).get("ontology_graph_binding") or {}
+        metrics = (skill_context or {}).get("analysis_semantics", {}).get("metrics") or []
+        rules = (skill_context or {}).get("analysis_semantics", {}).get("rules") or []
+        activities = (skill_context or {}).get("analysis_semantics", {}).get("activities") or []
+        metric_names = "、".join(item.get("metric_name") or item.get("metric_code") or "" for item in metrics[:12]) or "无已选择指标"
+        rule_names = "、".join(item.get("rule_name") or "" for item in rules[:12]) or "无已选择规则"
+        activity_names = "、".join(item.get("activity_name") or "" for item in activities[:12]) or "无已选择活动"
+        ontology_entity_count = ontology_model.get("entity_count") or len(ontology_model.get("entities") or [])
+        ontology_relation_count = ontology_model.get("relation_count") or len(ontology_model.get("relations") or [])
+        matched_entity_count = sum(1 for item in (ontology_graph_binding.get("entity_bindings") or []) if item.get("matched"))
         return f"""---
 name: {self._safe_package_name(skill.skill_name).lower()}
 description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_name}。'}
@@ -1412,6 +2295,10 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 
 - 分析域：{domain.domain_name}
 - Oracle Property Graph：`{graph_name}`
+- 分析场景：{analysis_profile.get('analysis_scenario_name') or '通用图探索分析'}
+- 分析模式：{analysis_modes}
+- 默认时间窗：{analysis_profile.get('default_time_window') or '7D'}
+- 最大路径跳数：{analysis_profile.get('max_path_depth') or 2}
 - 使用用户提供的精确业务标识（如码、批次、单据）作为查询入口；标识无法命中时如实说明，不做无边界检索。
 
 ## 执行工作流
@@ -1426,7 +2313,24 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 
 - 仅允许 `SELECT` 或 `WITH ... SELECT`，图查询使用 `GRAPH_TABLE`。
 - 禁止 DDL、DML、PL/SQL、权限操作、凭据和密码。
+- 先参考 `references/ontology-model.json` 理解平台定义的本体对象、属性、关系语义。
+- 再参考 `references/ontology-graph-binding.json` 确认本体定义如何映射到当前已部署 Property Graph。
 - 只使用 `references/property-graph.md` 中存在的图标签、关系和属性；不要臆造对象。
+- 只使用 `references/metric-catalog.json` 中的指标口径做聚合或趋势解释。
+- 只使用 `references/rule-catalog.json` 中的规则做异常判定、风险分级和派生结论。
+- 只使用 `references/activity-playbook.json` 中的活动输出建议动作；默认不直接执行活动。
+
+## 已加载本体
+
+- 本体对象数：{ontology_entity_count}
+- 本体关系数：{ontology_relation_count}
+- 已映射到当前 Property Graph 的对象数：{matched_entity_count}
+
+## 已加载业务语义
+
+- 核心指标：{metric_names}
+- 关键规则：{rule_names}
+- 可建议活动：{activity_names}
 
 ## 输出要求
 
@@ -1434,8 +2338,14 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 
 ## 参考文件
 
+- `references/ontology-model.json`：平台定义的本体对象、属性、关系和属性业务语义。
+- `references/ontology-graph-binding.json`：平台本体定义与当前 Property Graph 的标签、属性、关系绑定。
 - `references/property-graph.md`：从数据库实时读取的图谱拓扑。
 - `references/analysis-flow.md`：当前技能配置的分析流程。
+- `references/metric-catalog.json`：当前技能允许使用的指标定义。
+- `references/rule-catalog.json`：当前技能允许使用的业务规则。
+- `references/activity-playbook.json`：当前技能允许输出的业务活动建议。
+- `references/analysis-strategy.md`：当前技能的分析策略、限制和图语义绑定摘要。
 """
 
     async def test_skill(self, skill_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1447,6 +2357,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         context = self._safe_json_loads(skill.context_json, {})
         process_steps = self._extract_process_steps(context.get("process", {}).get("process_json"))
         entity_context = context.get("entity", {})
+        analysis_semantics = context.get("analysis_semantics") or {}
         table_detail = self.source_service.get_remote_table_detail(
             source_id=payload["source_id"],
             table_name=payload["graph_table"],
@@ -1479,7 +2390,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
             f"FROM {table_detail.get('owner')}.{table_detail.get('table_name')}\n"
             f"FETCH FIRST {max(1, min(int(payload.get('sample_limit') or 5), 10))} ROWS ONLY"
         )
-        prompt_preview = self._build_test_prompt(skill, entity_context, table_detail, payload)
+        prompt_preview = self._build_test_prompt(skill, entity_context, table_detail, payload, analysis_semantics)
         agent_output = await self._execute_skill_test_with_llm(
             skill=skill,
             llm_config=llm_config,
@@ -1521,6 +2432,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
                 "summary": f"技能 {skill.skill_name} 将围绕 {entity_context.get('entity_display_name') or entity_context.get('entity_name')} 对 {table_detail.get('table_name')} 进行分析。",
                 "focus_points": [
                     skill.analysis_goal or "围绕业务对象完成数据分析",
+                    f"使用 {len(analysis_semantics.get('metrics') or [])} 个指标、{len(analysis_semantics.get('rules') or [])} 条规则和 {len(analysis_semantics.get('activities') or [])} 个活动建议语义",
                     "按既定流程节点逐步执行",
                     "结合 graph 表字段和样例数据形成分析结论",
                 ],
@@ -1636,6 +2548,10 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         entity: SysOntologyEntity,
         properties: List[SysOntologyProperty],
         relations: List[SysOntologyRelation],
+        topology: Dict[str, Any],
+        analysis_semantics: Dict[str, Any],
+        ontology_model: Dict[str, Any],
+        ontology_graph_binding: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "domain": {
@@ -1687,6 +2603,10 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
                 "graph_name": entity.entity_name,
                 "object_type": "PROPERTY GRAPH",
             },
+            "topology_summary": self._compact_topology(topology),
+            "ontology_model": ontology_model,
+            "ontology_graph_binding": ontology_graph_binding,
+            "analysis_semantics": analysis_semantics,
         }
 
     async def _generate_skill_blueprint(
@@ -1698,13 +2618,17 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         relations: List[SysOntologyRelation],
         skill: SysAgentSkill,
         llm_config: SysLLMConfig,
+        topology: Dict[str, Any],
+        analysis_semantics: Dict[str, Any],
+        ontology_model: Dict[str, Any],
+        ontology_graph_binding: Dict[str, Any],
     ) -> Dict[str, str]:
         fallback = {
             "skill_desc": self._default_skill_desc(domain, process, entity, llm_config),
             "analysis_goal": self._default_analysis_goal(domain, entity),
             "execution_rules": skill.execution_rules or "优先按照流程节点顺序执行，遇到数据不完整时给出风险提示。",
             "output_requirements": skill.output_requirements or "输出结构化结论、关键指标、异常点和建议动作。",
-            "prompt_template": self._build_fallback_prompt_template(domain, process, entity, properties, relations, skill, llm_config),
+            "prompt_template": self._build_fallback_prompt_template(domain, process, entity, properties, relations, skill, llm_config, analysis_semantics),
         }
         prop_payload = [
             {
@@ -1733,7 +2657,8 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 3. analysis_goal 用中文，聚焦该技能要完成的业务分析目标。
 4. execution_rules 用中文，强调执行顺序、风险控制和异常处理。
 5. output_requirements 用中文，描述输出结构与重点。
-6. prompt_template 直接生成给大模型执行的提示词正文，中文为主，结构清晰，可引用流程步骤、本体属性和关系。
+6. prompt_template 直接生成给大模型执行的提示词正文，中文为主，结构清晰，可引用流程步骤、本体属性、关系、指标、规则与活动。
+7. prompt_template 必须明确要求 Agent：先识别分析意图，再按图探索、指标计算、规则判定、活动建议的顺序输出。
 
 输出格式：
 {
@@ -1759,6 +2684,9 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
                 "execution_rules": skill.execution_rules,
                 "output_requirements": skill.output_requirements,
             },
+            "ontology_model": ontology_model,
+            "ontology_graph_binding": ontology_graph_binding,
+            "analysis_semantics": analysis_semantics,
             "entity": {
                 "entity_name": entity.entity_name,
                 "entity_display_name": entity.entity_display_name,
@@ -1771,6 +2699,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
                 "process_desc": process.process_desc,
                 "steps": process_steps,
             },
+            "property_graph": self._compact_topology(topology),
         }, ensure_ascii=False, indent=2)
         try:
             result_text = await self.llm_service.call_llm(system_prompt, user_prompt, llm_config)
@@ -1796,7 +2725,11 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         relations: List[SysOntologyRelation],
         skill: SysAgentSkill,
         llm_config: SysLLMConfig,
+        analysis_semantics: Dict[str, Any],
     ) -> str:
+        # Graph runtime is the source of truth for executable labels/properties,
+        # while ontology-model and ontology-graph-binding provide business
+        # semantics and allowed mapping context.
         prop_text = "、".join(
             [
                 item.property_display_name or item.property_name
@@ -1804,6 +2737,10 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
             ]
         ) or "无已配置属性"
         relation_text = "、".join([rel.relation_name for rel in relations[:6]]) or "无显式关系"
+        metric_text = "、".join([item.get("metric_name") or item.get("metric_code") or "" for item in (analysis_semantics.get("metrics") or [])[:8]]) or "无已配置指标"
+        rule_text = "、".join([item.get("rule_name") or "" for item in (analysis_semantics.get("rules") or [])[:8]]) or "无已配置规则"
+        activity_text = "、".join([item.get("activity_name") or "" for item in (analysis_semantics.get("activities") or [])[:8]]) or "无已配置活动"
+        analysis_profile = analysis_semantics.get("analysis_profile") or {}
         steps = self._extract_process_steps(process.process_json)
         step_text = "\n".join([f"{idx + 1}. {step['label']}（{step['type_label']}）" for idx, step in enumerate(steps[:10])]) or "1. 开始准备分析"
         return (
@@ -1811,13 +2748,22 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
             f"本技能构建所使用的大模型：{llm_config.config_name} / {normalize_model_name(llm_config.model_name, llm_config.api_base_url)}\n"
             f"分析域：{domain.domain_name}\n"
             f"分析目标：{skill.analysis_goal or self._default_analysis_goal(domain, entity)}\n"
+            f"分析场景：{analysis_profile.get('analysis_scenario_name') or '通用图探索分析'}\n"
+            f"分析模式：{'、'.join(analysis_profile.get('analysis_modes') or DEFAULT_SKILL_ANALYSIS_MODES)}\n"
+            f"默认时间窗：{analysis_profile.get('default_time_window') or '7D'}\n"
+            f"最大路径跳数：{analysis_profile.get('max_path_depth') or 2}\n"
             f"本体对象：{entity.entity_display_name or entity.entity_name}\n"
             f"对象说明：{entity.entity_desc or '暂无'}\n"
             f"关键属性：{prop_text}\n"
             f"相关关系：{relation_text}\n"
+            f"关键指标：{metric_text}\n"
+            f"关键规则：{rule_text}\n"
+            f"建议活动：{activity_text}\n"
             f"业务流程：\n{step_text}\n"
             f"执行规则：{skill.execution_rules or '优先按照流程节点顺序执行，遇到数据不完整时给出风险提示。'}\n"
-            f"输出要求：{skill.output_requirements or '输出结构化结论、关键指标、异常点和建议动作。'}"
+            f"输出要求：{skill.output_requirements or '输出结构化结论、关键指标、异常点和建议动作。'}\n"
+            "回答时必须先依据 references/ontology-model.json 理解本体对象与属性语义，再依据 references/ontology-graph-binding.json 确认其在当前 Property Graph 中的映射，最后结合 references/property-graph.md、指标、规则和活动做分析。\n"
+            "回答时必须依次说明：分析意图、图查询路径、关键指标、命中规则、结论、建议活动、风险与限制。"
         )
 
     def _extract_process_steps(self, process_json: Any) -> List[Dict[str, Any]]:
@@ -1926,10 +2872,16 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         entity_context: Dict[str, Any],
         table_detail: Dict[str, Any],
         payload: Dict[str, Any],
+        analysis_semantics: Optional[Dict[str, Any]] = None,
     ) -> str:
         columns = "、".join([col["column_name"] for col in table_detail.get("columns", [])[:10]])
         sample_rows = self._safe_json_dumps(table_detail.get("sample_rows", [])[:2])
         input_payload = payload.get("input_payload") or ""
+        analysis_semantics = analysis_semantics or {}
+        profile = analysis_semantics.get("analysis_profile") or {}
+        metric_names = "、".join(item.get("metric_name") or item.get("metric_code") or "" for item in (analysis_semantics.get("metrics") or [])[:8]) or "无"
+        rule_names = "、".join(item.get("rule_name") or "" for item in (analysis_semantics.get("rules") or [])[:8]) or "无"
+        activity_names = "、".join(item.get("activity_name") or "" for item in (analysis_semantics.get("activities") or [])[:8]) or "无"
         return (
             f"{skill.prompt_template or ''}\n\n"
             f"测试上下文：\n"
@@ -1937,6 +2889,11 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
             f"- 表说明：{table_detail.get('table_comment') or '暂无'}\n"
             f"- 字段：{columns or '暂无'}\n"
             f"- 样例数据：{sample_rows}\n"
+            f"- 分析模式：{'、'.join(profile.get('analysis_modes') or DEFAULT_SKILL_ANALYSIS_MODES)}\n"
+            f"- 默认时间窗：{profile.get('default_time_window') or '7D'}\n"
+            f"- 指标：{metric_names}\n"
+            f"- 规则：{rule_names}\n"
+            f"- 活动：{activity_names}\n"
             f"- 测试问题：{payload.get('test_question') or '未提供'}\n"
             f"- 额外输入：{input_payload or '无'}\n"
             f"- 分析对象：{entity_context.get('entity_display_name') or entity_context.get('entity_name')}"
@@ -1973,6 +2930,8 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
         process_name: Optional[str],
         source_name: Optional[str],
     ) -> Dict[str, Any]:
+        context = self._safe_json_loads(skill.context_json, {})
+        defaults = self._skill_semantic_defaults_from_context(context)
         return {
             "skill_id": skill.skill_id,
             "domain_id": skill.domain_id,
@@ -1993,12 +2952,36 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
             "analysis_goal": skill.analysis_goal,
             "execution_rules": skill.execution_rules,
             "output_requirements": skill.output_requirements,
+            "analysis_scenario_code": defaults["analysis_scenario_code"],
+            "analysis_modes": defaults["analysis_modes"],
+            "entry_entity_ids": defaults["entry_entity_ids"],
+            "selected_metric_ids": defaults["selected_metric_ids"],
+            "selected_rule_ids": defaults["selected_rule_ids"],
+            "selected_activity_ids": defaults["selected_activity_ids"],
+            "enable_activity_recommendation": defaults["enable_activity_recommendation"],
+            "default_time_window": defaults["default_time_window"],
+            "max_path_depth": defaults["max_path_depth"],
             "prompt_template": skill.prompt_template,
             "context_json": skill.context_json,
             "status": skill.status,
             "created_by": skill.created_by,
             "created_at": skill.created_at,
             "updated_at": skill.updated_at,
+        }
+
+    def _skill_semantic_defaults_from_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        semantics = (context or {}).get("analysis_semantics") or {}
+        profile = semantics.get("analysis_profile") or {}
+        return {
+            "analysis_scenario_code": str(profile.get("analysis_scenario_code") or "").strip().upper() or "GENERAL_GRAPH",
+            "analysis_modes": self._normalize_analysis_modes(profile.get("analysis_modes")),
+            "entry_entity_ids": self._normalize_string_list(profile.get("entry_entity_ids")),
+            "selected_metric_ids": self._normalize_string_list([item.get("metric_id") for item in (semantics.get("metrics") or []) if item.get("metric_id")]),
+            "selected_rule_ids": self._normalize_string_list([item.get("rule_id") for item in (semantics.get("rules") or []) if item.get("rule_id")]),
+            "selected_activity_ids": self._normalize_string_list([item.get("activity_id") for item in (semantics.get("activities") or []) if item.get("activity_id")]),
+            "enable_activity_recommendation": bool(profile.get("enable_activity_recommendation", True)),
+            "default_time_window": profile.get("default_time_window") or "7D",
+            "max_path_depth": self._normalize_max_path_depth(profile.get("max_path_depth")),
         }
 
     def _default_skill_desc(self, domain: SysDomain, process: SysProcessDef, entity: SysOntologyEntity, llm_config: Optional[SysLLMConfig] = None) -> str:

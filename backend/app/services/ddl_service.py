@@ -240,7 +240,7 @@ class DDLService:
                 continue
             # 表/列注释由模板基于当前实体映射生成。LLM 附带的注释可能
             # 引用未被 CTAS 投影的列，且会与模板注释重复。
-            if statement_type in {"comment_table", "comment_column"}:
+            if statement_type in {"comment_table", "comment_column", "annotate_table_column", "annotate_view_column"}:
                 continue
             if statement_type == "create_view" and base_name not in required_view_names:
                 continue
@@ -274,7 +274,7 @@ class DDLService:
             stmt_type = (item.get("type") or "").strip().lower()
             stmt_name = (item.get("name") or "").strip().upper()
             base_name = stmt_name.split(".", 1)[0]
-            if stmt_type in {"create_view", "comment_table", "comment_column"} and (base_name in blocked_names or base_name in edge_blocked_names):
+            if stmt_type in {"create_view", "comment_table", "comment_column", "annotate_table_column", "annotate_view_column"} and (base_name in blocked_names or base_name in edge_blocked_names):
                 continue
             filtered.append(item)
         return filtered
@@ -427,7 +427,7 @@ class DDLService:
         """从LLM响应中解析DDL语句"""
         statements = []
         # Try to find SQL blocks
-        sql_pattern = r'(CREATE\s+(TABLE|VIEW|OR\s+REPLACE\s+VIEW|(?:OR\s+REPLACE\s+)?PROPERTY\s+GRAPH)[^;]+;|COMMENT\s+ON\s+(TABLE|COLUMN)[^;]+;)'
+        sql_pattern = r'(CREATE\s+(TABLE|VIEW|OR\s+REPLACE\s+VIEW|(?:OR\s+REPLACE\s+)?PROPERTY\s+GRAPH)[^;]+;|COMMENT\s+ON\s+(TABLE|COLUMN)[^;]+;|ALTER\s+(?:TABLE|VIEW)\s+[^;]+\bANNOTATIONS\s*\([^;]+\)\s*;)'
         matches = re.findall(sql_pattern, response, re.IGNORECASE | re.DOTALL)
 
         for match in matches:
@@ -443,6 +443,10 @@ class DDLService:
                 stmt_type = "comment_table"
             elif "COMMENT ON COLUMN" in sql.upper():
                 stmt_type = "comment_column"
+            elif re.search(r"(?i)^ALTER\s+TABLE\b", sql) and "ANNOTATIONS" in sql.upper():
+                stmt_type = "annotate_table_column"
+            elif re.search(r"(?i)^ALTER\s+VIEW\b", sql) and "ANNOTATIONS" in sql.upper():
+                stmt_type = "annotate_view_column"
             else:
                 stmt_type = "other"
 
@@ -487,6 +491,9 @@ class DDLService:
             comment_sql = self._generate_comments_ddl(entity)
             for cs in comment_sql:
                 statements.append(cs)
+            annotation_sql = self._generate_column_annotations_ddl(entity, entities)
+            for annotation in annotation_sql:
+                statements.append(annotation)
 
         # Oracle 26ai supports edge views. Every relation with a verified Join
         # can therefore remain a live projection of its node objects instead
@@ -501,6 +508,97 @@ class DDLService:
                 })
 
         return statements
+
+    def _generate_column_annotations_ddl(
+        self,
+        entity: SysOntologyEntity,
+        entities: List[SysOntologyEntity],
+    ) -> List[Dict[str, Any]]:
+        object_name = entity.table_name or f"ONTO_NODE_{entity.entity_name.upper()}"
+        projected_columns = self._get_entity_projected_columns(entity)
+        property_path_by_id: Dict[str, str] = {}
+        for item in entities:
+            entity_name = (item.entity_name or item.entity_id or "").strip()
+            for prop in (item.properties or []):
+                if prop.property_id and prop.property_name:
+                    property_path_by_id[prop.property_id] = f"{entity_name}.{prop.property_name}"
+
+        statements: List[Dict[str, Any]] = []
+        for prop in entity.properties or []:
+            column_name = (prop.property_name or "").strip().upper()
+            if not column_name or (projected_columns and column_name not in projected_columns):
+                continue
+            annotations = self._build_property_annotation_items(prop, property_path_by_id)
+            if not annotations:
+                continue
+            if (entity.build_type or "").upper() == "VIEW":
+                sql = f"ALTER VIEW {object_name} MODIFY ({column_name} ANNOTATIONS({annotations}));"
+                stmt_type = "annotate_view_column"
+            else:
+                sql = f"ALTER TABLE {object_name} MODIFY {column_name} ANNOTATIONS({annotations});"
+                stmt_type = "annotate_table_column"
+            statements.append({
+                "type": stmt_type,
+                "sql": sql,
+                "name": f"{object_name}.{column_name}",
+            })
+        return statements
+
+    def _build_property_annotation_items(
+        self,
+        prop: SysOntologyProperty,
+        property_path_by_id: Dict[str, str],
+    ) -> str:
+        annotations: List[tuple[str, str]] = []
+        if (prop.unit or "").strip():
+            annotations.append(("ONTOLOGY_UNIT", (prop.unit or "").strip()))
+        if (prop.value_constraint or "").strip():
+            annotations.append(("ONTOLOGY_VALUE_CONSTRAINT", (prop.value_constraint or "").strip()))
+        usage_codes = self._parse_property_usage_codes(prop)
+        if usage_codes:
+            annotations.append(("ONTOLOGY_USAGE", json.dumps(usage_codes, ensure_ascii=False)))
+        if str(getattr(prop, "is_required_filter", "") or "").strip().upper() == "Y":
+            annotations.append(("ONTOLOGY_REQUIRED_FILTER", "Y"))
+        ref_label = property_path_by_id.get(str(getattr(prop, "ref_property_id", "") or "").strip())
+        if ref_label:
+            annotations.append(("ONTOLOGY_REF", ref_label))
+
+        if not annotations:
+            return ""
+
+        parts: List[str] = []
+        for name, value in annotations:
+            safe_value = self._escape_oracle_comment(value)
+            parts.append(f"DROP IF EXISTS {name}")
+            parts.append(f"ADD {name} '{safe_value}'")
+        return ", ".join(parts)
+
+    def _parse_property_usage_codes(self, prop: SysOntologyProperty) -> List[str]:
+        raw_value = getattr(prop, "usage_codes_json", None)
+        if not raw_value:
+            return []
+        try:
+            payload = json.loads(raw_value)
+        except Exception:
+            payload = []
+        if not isinstance(payload, list):
+            return []
+        normalized: List[str] = []
+        seen = set()
+        for item in payload:
+            token = str(item or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        return normalized
+
+    def _get_entity_projected_columns(self, entity: SysOntologyEntity) -> set[str]:
+        entity_mapping = getattr(entity, "entity_mapping", None)
+        explicit_sql = (entity_mapping.view_sql or "").strip() if entity_mapping else ""
+        if not explicit_sql:
+            return set()
+        return self._extract_final_select_aliases(explicit_sql)
 
     def _generate_semantic_layer_ddl(
         self,
@@ -883,15 +981,12 @@ WHERE node_dedup.ONTO_KEY_RN = 1;"""
 
         entity_mapping = getattr(entity, "entity_mapping", None)
         explicit_sql = (entity_mapping.view_sql or "").strip() if entity_mapping else ""
-        # CTAS 形式的显式 SQL 有时只输出实体属性的子集。仅对明确出现在
-        # SELECT 别名中的列生成列注释，避免 ORA-00904 / ORA-00942 类失败。
-        projected_columns = {
-            column.upper()
-            for column in re.findall(r"\bAS\s+([A-Za-z][A-Za-z0-9_$#]*)\b", explicit_sql, re.IGNORECASE)
-        } if explicit_sql else set()
+        # 显式 SQL 有时只输出实体属性的子集。仅对明确出现在最终 SELECT 投影中的
+        # 列生成注释，避免给不存在的列或视图输出 COMMENT ON COLUMN。
+        projected_columns = self._get_entity_projected_columns(entity) if explicit_sql else set()
 
         # Table comment
-        desc = entity.entity_desc or entity.entity_display_name or entity.entity_name
+        desc = self._escape_oracle_comment(entity.entity_desc or entity.entity_display_name or entity.entity_name)
         sql = f"COMMENT ON TABLE {table_name} IS '{desc}';"
         statements.append({
             "type": "comment_table",
@@ -903,7 +998,7 @@ WHERE node_dedup.ONTO_KEY_RN = 1;"""
         for prop in entity.properties:
             if projected_columns and (prop.property_name or "").upper() not in projected_columns:
                 continue
-            prop_desc = prop.property_desc or prop.property_display_name or prop.property_name
+            prop_desc = self._escape_oracle_comment(prop.property_desc or prop.property_display_name or prop.property_name)
             sql = f"COMMENT ON COLUMN {table_name}.{prop.property_name.upper()} IS '{prop_desc}';"
             statements.append({
                 "type": "comment_column",
@@ -1253,10 +1348,75 @@ SELECT
                 final_from = final_select + 6 + match.start()
                 break
         projection = statement[final_select:final_from] if final_from else statement[final_select:]
-        return {
-            alias.upper()
-            for alias in re.findall(r"(?i)\bAS\s+([A-Z][A-Z0-9_$#]*)\b", projection)
-        }
+        aliases: set[str] = set()
+        for item in DDLService._split_top_level_sql_items(re.sub(r"(?is)^\s*SELECT\b", "", projection, count=1).strip()):
+            alias = DDLService._extract_projection_alias(item)
+            if alias:
+                aliases.add(alias.upper())
+        return aliases
+
+    @staticmethod
+    def _split_top_level_sql_items(projection: str) -> List[str]:
+        items: List[str] = []
+        current: List[str] = []
+        depth = 0
+        in_single_quote = False
+        i = 0
+        while i < len(projection):
+            ch = projection[i]
+            if ch == "'" and not in_single_quote:
+                in_single_quote = True
+                current.append(ch)
+            elif ch == "'" and in_single_quote:
+                current.append(ch)
+                if i + 1 < len(projection) and projection[i + 1] == "'":
+                    current.append("'")
+                    i += 1
+                else:
+                    in_single_quote = False
+            elif not in_single_quote and ch == "(":
+                depth += 1
+                current.append(ch)
+            elif not in_single_quote and ch == ")":
+                depth = max(depth - 1, 0)
+                current.append(ch)
+            elif not in_single_quote and depth == 0 and ch == ",":
+                item = "".join(current).strip()
+                if item:
+                    items.append(item)
+                current = []
+            else:
+                current.append(ch)
+            i += 1
+        tail = "".join(current).strip()
+        if tail:
+            items.append(tail)
+        return items
+
+    @staticmethod
+    def _extract_projection_alias(item: str) -> Optional[str]:
+        segment = (item or "").strip()
+        if not segment:
+            return None
+        as_match = re.search(r"(?i)\bAS\s+([A-Za-z][A-Za-z0-9_$#]*)\s*$", segment)
+        if as_match:
+            return as_match.group(1)
+        bare_alias_match = re.search(r"(?i)(?:^|[\s)])([A-Za-z][A-Za-z0-9_$#]*)\s*$", segment)
+        if bare_alias_match:
+            candidate = bare_alias_match.group(1)
+            upper_segment = segment.upper()
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_$#]*(?:\.[A-Za-z][A-Za-z0-9_$#]*)?", segment):
+                return segment.split(".")[-1]
+            if not upper_segment.endswith(candidate.upper()):
+                return None
+            prefix = segment[: bare_alias_match.start(1)].strip()
+            if prefix:
+                return candidate
+        return None
+
+    @staticmethod
+    def _escape_oracle_comment(value: str) -> str:
+        return str(value or "").replace("'", "''")
 
     def _build_entity_source_query(self, entity: SysOntologyEntity) -> str:
         entity_mapping = getattr(entity, "entity_mapping", None)
@@ -1407,7 +1567,9 @@ SELECT
             "create_view": r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(\w+)",
             "create_graph": r"CREATE\s+(?:OR\s+REPLACE\s+)?PROPERTY\s+GRAPH\s+(\w+)",
             "comment_table": r"COMMENT\s+ON\s+TABLE\s+(\w+)",
-            "comment_column": r"COMMENT\s+ON\s+COLUMN\s+(\w+\.\w+)"
+            "comment_column": r"COMMENT\s+ON\s+COLUMN\s+(\w+\.\w+)",
+            "annotate_table_column": r"ALTER\s+TABLE\s+(\w+\.\w+|\w+)",
+            "annotate_view_column": r"ALTER\s+VIEW\s+(\w+\.\w+|\w+)"
         }
         pattern = patterns.get(stmt_type, r"(\w+)")
         match = re.search(pattern, sql, re.IGNORECASE)
@@ -1632,6 +1794,7 @@ SELECT
             (r"(?:CREATE\s+(?:OR\s+REPLACE\s+)?|DROP\s+)PROPERTY\s+GRAPH(?:\s+IF\s+EXISTS)?\s+(\w+)", "PROPERTY GRAPH"),
             (r"COMMENT\s+ON\s+(?:TABLE|COLUMN)\s+([\w.]+)", "COMMENT"),
             (r"ALTER\s+TABLE\s+(\w+)", "TABLE"),
+            (r"ALTER\s+VIEW\s+(\w+)", "VIEW"),
         ]
         for pattern, object_type in patterns:
             match = re.search(pattern, statement, re.IGNORECASE)

@@ -90,6 +90,7 @@ def ensure_relation_mapping_columns():
         return
     additions = {
         "mapping_mode": "VARCHAR2(30)",
+        "relation_cardinality": "VARCHAR2(20)",
         "relation_table": "VARCHAR2(100)",
         "relation_source_column": "VARCHAR2(100)",
         "relation_target_column": "VARCHAR2(100)",
@@ -102,6 +103,57 @@ def ensure_relation_mapping_columns():
 
 
 ensure_relation_mapping_columns()
+
+
+def ensure_ontology_entity_semantic_columns():
+    inspector = inspect(engine)
+    try:
+        columns = {item["name"].lower() for item in inspector.get_columns("sys_ontology_entity")}
+    except Exception:
+        columns = set()
+    if not columns:
+        return
+    additions = {
+        "object_type": "VARCHAR2(20)",
+        "governance_status": "VARCHAR2(20)",
+        "data_owner": "VARCHAR2(200)",
+        "security_level": "VARCHAR2(20)",
+        "update_frequency": "VARCHAR2(50)",
+        "governance_tags_json": "CLOB",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE sys_ontology_entity ADD {name} {definition}"))
+
+
+ensure_ontology_entity_semantic_columns()
+
+
+def ensure_ontology_property_semantic_columns():
+    inspector = inspect(engine)
+    try:
+        columns = {item["name"].lower() for item in inspector.get_columns("sys_ontology_property")}
+    except Exception:
+        columns = set()
+    if not columns:
+        return
+    additions = {
+        "unit": "VARCHAR2(50)",
+        "value_constraint": "VARCHAR2(500)",
+        "usage_codes_json": "CLOB",
+        "is_required_filter": "CHAR(1)",
+        "ref_property_id": "VARCHAR2(50)",
+    }
+    with engine.begin() as connection:
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE sys_ontology_property ADD {name} {definition}"))
+        if "is_required_filter" not in columns:
+            connection.execute(text("UPDATE sys_ontology_property SET is_required_filter = 'N' WHERE is_required_filter IS NULL"))
+
+
+ensure_ontology_property_semantic_columns()
 
 # Check if admin user exists, create if not
 from sqlalchemy.orm import Session

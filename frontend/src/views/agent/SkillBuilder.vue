@@ -86,6 +86,87 @@
           <el-form-item label="输出要求">
             <el-input v-model="form.output_requirements" type="textarea" :rows="3" placeholder="如：输出摘要、关键指标、异常点、建议动作" />
           </el-form-item>
+          <el-form-item label="分析场景">
+            <el-select v-model="form.analysis_scenario_code" placeholder="选择分析场景" @change="handleScenarioChange">
+              <el-option
+                v-for="item in scenarioTemplates"
+                :key="item.scenario_code"
+                :label="item.scenario_name"
+                :value="item.scenario_code"
+              />
+            </el-select>
+            <div v-if="selectedScenarioTemplate" class="scenario-hint">
+              {{ selectedScenarioTemplate.description }}
+            </div>
+          </el-form-item>
+          <el-form-item label="分析模式">
+            <el-checkbox-group v-model="form.analysis_modes" class="mode-grid">
+              <el-checkbox
+                v-for="item in analysisModeOptions"
+                :key="item.value"
+                :value="item.value"
+                class="mode-item"
+              >
+                <span>{{ item.label }}</span>
+                <small>{{ item.description }}</small>
+              </el-checkbox>
+            </el-checkbox-group>
+          </el-form-item>
+          <el-form-item label="入口对象">
+            <el-select v-model="form.entry_entity_ids" multiple filterable collapse-tags collapse-tags-tooltip placeholder="选择优先分析入口">
+              <el-option
+                v-for="item in analysisSemantics.entities"
+                :key="item.entity_id"
+                :label="item.entity_display_name || item.entity_name"
+                :value="item.entity_id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="默认时间窗">
+            <el-select v-model="form.default_time_window" placeholder="选择默认分析窗口">
+              <el-option label="1天" value="1D" />
+              <el-option label="7天" value="7D" />
+              <el-option label="30天" value="30D" />
+              <el-option label="90天" value="90D" />
+              <el-option label="1年" value="1Y" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="最大路径跳数">
+            <el-input-number v-model="form.max_path_depth" :min="1" :max="5" />
+          </el-form-item>
+          <el-form-item label="活动建议">
+            <el-switch v-model="form.enable_activity_recommendation" active-text="输出建议活动" inactive-text="不输出活动建议" />
+          </el-form-item>
+          <el-form-item label="核心指标">
+            <el-select v-model="form.selected_metric_ids" multiple filterable collapse-tags collapse-tags-tooltip placeholder="选择当前 skill 可用指标">
+              <el-option
+                v-for="item in analysisSemantics.metrics"
+                :key="item.metric_id"
+                :label="`${item.metric_name} [${item.metric_code}]`"
+                :value="item.metric_id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="关键规则">
+            <el-select v-model="form.selected_rule_ids" multiple filterable collapse-tags collapse-tags-tooltip placeholder="选择当前 skill 可用规则">
+              <el-option
+                v-for="item in analysisSemantics.rules"
+                :key="item.rule_id"
+                :label="`${item.rule_name} (${item.rule_category})`"
+                :value="item.rule_id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="建议活动">
+            <el-select v-model="form.selected_activity_ids" multiple filterable collapse-tags collapse-tags-tooltip placeholder="选择当前 skill 可输出活动">
+              <el-option
+                v-for="item in analysisSemantics.activities"
+                :key="item.activity_id"
+                :label="`${item.activity_name} (${item.activity_type})`"
+                :value="item.activity_id"
+              />
+            </el-select>
+          </el-form-item>
           <el-form-item label="状态">
             <el-radio-group v-model="form.status">
               <el-radio-button label="ACTIVE">启用</el-radio-button>
@@ -135,6 +216,33 @@
               </div>
             </div>
             <el-empty v-else description="选择流程后显示节点顺序" :image-size="64" />
+          </div>
+          <div class="preview-section">
+            <div class="preview-title">业务语义预览</div>
+            <div class="preview-meta">分析模式：{{ selectedAnalysisModeLabels.join(' / ') || '未选择' }}</div>
+            <div class="preview-meta">分析场景：{{ selectedScenarioTemplate?.scenario_name || '未选择' }}</div>
+            <div class="preview-meta">入口对象：{{ selectedEntryEntityLabels.join(' / ') || '未选择' }}</div>
+            <div class="semantic-preview-group">
+              <div class="semantic-preview-title">核心指标（{{ selectedMetrics.length }}）</div>
+              <div class="tag-row">
+                <el-tag v-for="item in selectedMetrics.slice(0, 8)" :key="item.metric_id" size="small" effect="plain">{{ item.metric_name }}</el-tag>
+                <span v-if="!selectedMetrics.length" class="preview-placeholder">未选择</span>
+              </div>
+            </div>
+            <div class="semantic-preview-group">
+              <div class="semantic-preview-title">关键规则（{{ selectedRules.length }}）</div>
+              <div class="tag-row">
+                <el-tag v-for="item in selectedRules.slice(0, 8)" :key="item.rule_id" size="small" type="warning" effect="plain">{{ item.rule_name }}</el-tag>
+                <span v-if="!selectedRules.length" class="preview-placeholder">未选择</span>
+              </div>
+            </div>
+            <div class="semantic-preview-group">
+              <div class="semantic-preview-title">建议活动（{{ selectedActivities.length }}）</div>
+              <div class="tag-row">
+                <el-tag v-for="item in selectedActivities.slice(0, 8)" :key="item.activity_id" size="small" type="success" effect="plain">{{ item.activity_name }}</el-tag>
+                <span v-if="!selectedActivities.length" class="preview-placeholder">未选择</span>
+              </div>
+            </div>
           </div>
           <div class="preview-section">
             <div class="preview-title">Prompt 模板预览</div>
@@ -187,6 +295,17 @@ const dataSources = ref<any[]>([])
 const propertyGraphs = ref<any[]>([])
 const skills = ref<any[]>([])
 const llmConfigs = ref<any[]>([])
+const analysisSemantics = ref<any>({
+  scenario_templates: [],
+  analysis_mode_options: [],
+  entities: [],
+  metrics: [],
+  rules: [],
+  activities: [],
+  default_analysis_modes: ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE'],
+  default_time_window: '7D',
+  default_max_path_depth: 2
+})
 const currentDomainId = ref(appStore.currentDomainId || '')
 const saving = ref(false)
 const packagingSkillId = ref('')
@@ -202,16 +321,34 @@ const createEmptyForm = () => ({
   analysis_goal: '',
   execution_rules: '',
   output_requirements: '',
+  analysis_scenario_code: 'GENERAL_GRAPH',
+  analysis_modes: ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE'],
+  entry_entity_ids: [] as string[],
+  selected_metric_ids: [] as string[],
+  selected_rule_ids: [] as string[],
+  selected_activity_ids: [] as string[],
+  enable_activity_recommendation: true,
+  default_time_window: '7D',
+  max_path_depth: 2,
   status: 'ACTIVE'
 })
 
 const form = ref(createEmptyForm())
+const analysisModeOptions = computed(() => analysisSemantics.value.analysis_mode_options || [])
+const scenarioTemplates = computed(() => analysisSemantics.value.scenario_templates || [])
+const selectedScenarioTemplate = computed(() => scenarioTemplates.value.find((item: any) => item.scenario_code === form.value.analysis_scenario_code))
 
 const selectedProcess = computed(() => processes.value.find(item => item.process_id === form.value.process_id))
 const selectedDataSource = computed(() => dataSources.value.find(item => item.source_id === form.value.source_id))
 const selectedPropertyGraph = computed(() => propertyGraphs.value.find(item => item.graph_name === form.value.property_graph_name))
 const currentDomain = computed(() => domains.value.find(item => item.domain_id === currentDomainId.value))
 const selectedModel = computed(() => llmConfigs.value.find(item => item.config_id === form.value.llm_config_id))
+const selectedMetrics = computed(() => (analysisSemantics.value.metrics || []).filter((item: any) => form.value.selected_metric_ids.includes(item.metric_id)))
+const selectedRules = computed(() => (analysisSemantics.value.rules || []).filter((item: any) => form.value.selected_rule_ids.includes(item.rule_id)))
+const selectedActivities = computed(() => (analysisSemantics.value.activities || []).filter((item: any) => form.value.selected_activity_ids.includes(item.activity_id)))
+const selectedEntryEntities = computed(() => (analysisSemantics.value.entities || []).filter((item: any) => form.value.entry_entity_ids.includes(item.entity_id)))
+const selectedAnalysisModeLabels = computed(() => (analysisModeOptions.value || []).filter((item: any) => form.value.analysis_modes.includes(item.value)).map((item: any) => item.label))
+const selectedEntryEntityLabels = computed(() => selectedEntryEntities.value.map((item: any) => item.entity_display_name || item.entity_name))
 
 const processSteps = computed(() => {
   const parsed = parseProcessJson(selectedProcess.value?.process_json)
@@ -262,6 +399,9 @@ const promptPreview = computed(() => {
   const graphName = selectedPropertyGraph.value?.graph_name || '待选 Property Graph'
   const processName = selectedProcess.value?.process_name || '待选分析流程'
   const processText = processSteps.value.map(item => `${item.step_no}. ${item.label}（${item.typeLabel}）`).join('\n') || '1. 开始准备分析'
+  const metricText = selectedMetrics.value.map((item: any) => item.metric_name).join('、') || '未选择'
+  const ruleText = selectedRules.value.map((item: any) => item.rule_name).join('、') || '未选择'
+  const activityText = selectedActivities.value.map((item: any) => item.activity_name).join('、') || '未选择'
   return [
     `你是业务分析智能体中的数据分析技能“${form.value.skill_name || '待命名技能'}”。`,
     `构建模型：${selectedModel.value ? `${selectedModel.value.config_name} / ${selectedModel.value.model_name}` : '未选择'}`,
@@ -269,6 +409,14 @@ const promptPreview = computed(() => {
     `分析目标：${form.value.analysis_goal || `围绕 ${graphName} 完成图数据分析`}`,
     `Oracle 属性图：${graphName}`,
     `源数据库：${selectedDataSource.value?.source_name || '未选择'}`,
+    `分析场景：${selectedScenarioTemplate.value?.scenario_name || '未选择'}`,
+    `分析模式：${selectedAnalysisModeLabels.value.join('、') || '未选择'}`,
+    `入口对象：${selectedEntryEntityLabels.value.join('、') || '未选择'}`,
+    `默认时间窗：${form.value.default_time_window || '7D'}`,
+    `最大路径跳数：${form.value.max_path_depth || 2}`,
+    `核心指标：${metricText}`,
+    `关键规则：${ruleText}`,
+    `建议活动：${activityText}`,
     `业务流程：`,
     processText,
     `执行规则：${form.value.execution_rules || '优先按照流程顺序执行，数据不足时标记风险。'}`,
@@ -326,6 +474,65 @@ const loadModels = async () => {
   }
 }
 
+const loadAnalysisSemantics = async () => {
+  if (!currentDomainId.value) {
+    analysisSemantics.value = {
+      scenario_templates: [],
+      analysis_mode_options: [],
+      entities: [],
+      metrics: [],
+      rules: [],
+      activities: [],
+      default_analysis_modes: ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE'],
+      default_time_window: '7D',
+      default_max_path_depth: 2
+    }
+    return
+  }
+  try {
+    const res = await agentApi.getAnalysisSemantics(currentDomainId.value)
+    analysisSemantics.value = res.data || analysisSemantics.value
+    if (!scenarioTemplates.value.some((item: any) => item.scenario_code === form.value.analysis_scenario_code)) {
+      form.value.analysis_scenario_code = 'GENERAL_GRAPH'
+    }
+    if (!form.value.analysis_modes.length) {
+      form.value.analysis_modes = analysisSemantics.value.default_analysis_modes || ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE']
+    }
+    if (!form.value.default_time_window) {
+      form.value.default_time_window = analysisSemantics.value.default_time_window || '7D'
+    }
+    if (!form.value.max_path_depth) {
+      form.value.max_path_depth = analysisSemantics.value.default_max_path_depth || 2
+    }
+  } catch (e) {
+    analysisSemantics.value = {
+      scenario_templates: [],
+      analysis_mode_options: [],
+      entities: [],
+      metrics: [],
+      rules: [],
+      activities: [],
+      default_analysis_modes: ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE'],
+      default_time_window: '7D',
+      default_max_path_depth: 2
+    }
+  }
+}
+
+const applyScenarioTemplate = (scenarioCode?: string) => {
+  const scenario = scenarioTemplates.value.find((item: any) => item.scenario_code === (scenarioCode || form.value.analysis_scenario_code))
+  if (!scenario) return
+  form.value.analysis_scenario_code = scenario.scenario_code
+  form.value.analysis_modes = [...(scenario.recommended_analysis_modes || [])]
+  form.value.entry_entity_ids = [...(scenario.recommended_entry_entity_ids || [])]
+  form.value.selected_metric_ids = [...(scenario.recommended_metric_ids || [])]
+  form.value.selected_rule_ids = [...(scenario.recommended_rule_ids || [])]
+  form.value.selected_activity_ids = [...(scenario.recommended_activity_ids || [])]
+  form.value.enable_activity_recommendation = scenario.enable_activity_recommendation !== false
+  form.value.default_time_window = scenario.default_time_window || '7D'
+  form.value.max_path_depth = scenario.max_path_depth || 2
+}
+
 const loadDomainResources = async () => {
   if (!currentDomainId.value) {
     processes.value = []
@@ -335,14 +542,19 @@ const loadDomainResources = async () => {
     return
   }
   try {
-    const [processRes, sourceRes, skillRes] = await Promise.all([
+    const [processRes, sourceRes, skillRes, semanticsRes] = await Promise.all([
       processApi.list(currentDomainId.value),
       sourceApi.listDataSources(currentDomainId.value),
-      agentApi.listSkills(currentDomainId.value)
+      agentApi.listSkills(currentDomainId.value),
+      agentApi.getAnalysisSemantics(currentDomainId.value)
     ])
     processes.value = processRes.data || []
     dataSources.value = (sourceRes.data || []).filter((item: any) => (item.db_type || '').toLowerCase() === 'oracle')
     skills.value = skillRes.data || []
+    analysisSemantics.value = semanticsRes.data || analysisSemantics.value
+    if (!form.value.skill_id) {
+      applyScenarioTemplate(form.value.analysis_scenario_code || 'GENERAL_GRAPH')
+    }
     if (form.value.source_id && !dataSources.value.some((item: any) => item.source_id === form.value.source_id)) {
       form.value.source_id = ''
       form.value.property_graph_name = ''
@@ -384,6 +596,10 @@ const handleDomainChange = (val: string) => {
   loadDomainResources()
 }
 
+const handleScenarioChange = (val: string) => {
+  applyScenarioTemplate(val)
+}
+
 const handleSourceChange = () => {
   form.value.property_graph_name = ''
   loadPropertyGraphs()
@@ -401,6 +617,15 @@ const fillForm = (row: any) => {
     analysis_goal: row.analysis_goal || '',
     execution_rules: row.execution_rules || '',
     output_requirements: row.output_requirements || '',
+    analysis_scenario_code: row.analysis_scenario_code || 'GENERAL_GRAPH',
+    analysis_modes: row.analysis_modes || analysisSemantics.value.default_analysis_modes || ['DEFECT_ANALYSIS', 'ROOT_CAUSE', 'IMPACT_INFERENCE'],
+    entry_entity_ids: row.entry_entity_ids || [],
+    selected_metric_ids: row.selected_metric_ids || [],
+    selected_rule_ids: row.selected_rule_ids || [],
+    selected_activity_ids: row.selected_activity_ids || [],
+    enable_activity_recommendation: row.enable_activity_recommendation !== false,
+    default_time_window: row.default_time_window || analysisSemantics.value.default_time_window || '7D',
+    max_path_depth: row.max_path_depth || analysisSemantics.value.default_max_path_depth || 2,
     status: row.status || 'ACTIVE'
   }
   loadPropertyGraphs()
@@ -410,6 +635,8 @@ const resetForm = () => {
   form.value = createEmptyForm()
   const defaultModel = llmConfigs.value.find((item: any) => item.is_default === 'Y') || llmConfigs.value[0]
   form.value.llm_config_id = defaultModel?.config_id || ''
+  form.value.analysis_scenario_code = 'GENERAL_GRAPH'
+  applyScenarioTemplate('GENERAL_GRAPH')
 }
 
 const saveSkill = async () => {
@@ -431,6 +658,15 @@ const saveSkill = async () => {
       analysis_goal: form.value.analysis_goal,
       execution_rules: form.value.execution_rules,
       output_requirements: form.value.output_requirements,
+      analysis_scenario_code: form.value.analysis_scenario_code,
+      analysis_modes: form.value.analysis_modes,
+      entry_entity_ids: form.value.entry_entity_ids,
+      selected_metric_ids: form.value.selected_metric_ids,
+      selected_rule_ids: form.value.selected_rule_ids,
+      selected_activity_ids: form.value.selected_activity_ids,
+      enable_activity_recommendation: form.value.enable_activity_recommendation,
+      default_time_window: form.value.default_time_window,
+      max_path_depth: form.value.max_path_depth,
       status: form.value.status
     }
     if (form.value.skill_id) {
@@ -486,6 +722,11 @@ watch(() => appStore.currentDomainId, async (val) => {
   currentDomainId.value = val
   resetForm()
   await loadDomainResources()
+})
+
+watch(() => form.value.analysis_scenario_code, (val, oldVal) => {
+  if (!val || val === oldVal) return
+  applyScenarioTemplate(val)
 })
 
 watch(() => [form.value.process_id, form.value.property_graph_name], syncSuggestedName)
@@ -569,6 +810,36 @@ onMounted(async () => {
 .builder-form :deep(.el-textarea) {
   width: 100%;
 }
+.scenario-hint {
+  margin-top: 6px;
+  color: #647b90;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+.mode-item {
+  margin-right: 0;
+  padding: 10px 12px;
+  border: 1px solid #d7e4ef;
+  border-radius: 10px;
+  background: #f8fbfd;
+}
+.mode-item :deep(.el-checkbox__label) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  white-space: normal;
+}
+.mode-item small {
+  color: #6f8191;
+  font-size: 12px;
+  line-height: 1.4;
+}
 .preview-column {
   display: flex;
   flex-direction: column;
@@ -587,6 +858,24 @@ onMounted(async () => {
 .entity-desc {
   color: #5a6778;
   line-height: 1.7;
+}
+.preview-meta {
+  margin-bottom: 8px;
+  color: #597086;
+  font-size: 13px;
+}
+.semantic-preview-group {
+  margin-top: 10px;
+}
+.semantic-preview-title {
+  margin-bottom: 6px;
+  color: #24445f;
+  font-size: 13px;
+  font-weight: 600;
+}
+.preview-placeholder {
+  color: #90a0ad;
+  font-size: 12px;
 }
 .model-chip {
   display: inline-flex;
@@ -657,6 +946,11 @@ onMounted(async () => {
   }
   .hero-panel {
     flex-direction: column;
+  }
+}
+@media (max-width: 900px) {
+  .mode-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict, Set, Any
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
@@ -24,6 +24,9 @@ router = APIRouter(tags=["本体构建"])
 logger = get_logger(__name__)
 
 SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+ALLOWED_OBJECT_TYPES = {"FACT", "DIM"}
+ALLOWED_GOVERNANCE_STATUS = {"ACTIVE", "INACTIVE", "DEPRECATED"}
+ALLOWED_PROPERTY_USAGE_CODES = {"find", "fetch", "analyze"}
 
 
 def _normalize_identifier(name: Optional[str]) -> str:
@@ -65,6 +68,222 @@ def _build_relation_edge_view_name(relation_name: Optional[str], relation_id: Op
     token = re.sub(r"[^A-Za-z0-9_]+", "_", raw_name.upper()).strip("_")
     token = token[:20] or "EDGE"
     return f"ONTO_EDGE_{token}_V"
+
+
+def _parse_json_list(raw_value: Optional[str]) -> List[str]:
+    if not raw_value:
+        return []
+    try:
+        payload = json.loads(raw_value)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [str(item).strip() for item in payload if str(item).strip()]
+
+
+def _dump_json_list(values: Optional[List[str]]) -> Optional[str]:
+    if values is None:
+        return None
+    cleaned = [str(item).strip() for item in values if str(item).strip()]
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def _normalize_object_type(value: Optional[str]) -> Optional[str]:
+    token = str(value or "").strip().upper()
+    if not token:
+        return None
+    if token not in ALLOWED_OBJECT_TYPES:
+        raise HTTPException(status_code=400, detail="对象类型仅支持 FACT 或 DIM")
+    return token
+
+
+def _normalize_governance_status(value: Optional[str]) -> Optional[str]:
+    token = str(value or "").strip().upper()
+    if not token:
+        return None
+    if token not in ALLOWED_GOVERNANCE_STATUS:
+        raise HTTPException(status_code=400, detail="治理状态仅支持 ACTIVE、INACTIVE 或 DEPRECATED")
+    return token
+
+
+def _normalize_flag(value: Optional[str], field_label: str, default: Optional[str] = None) -> Optional[str]:
+    token = str(value or "").strip().upper()
+    if not token:
+        return default
+    if token not in {"Y", "N"}:
+        raise HTTPException(status_code=400, detail=f"{field_label} 仅支持 Y 或 N")
+    return token
+
+
+def _normalize_usage_codes(values: Optional[List[str]]) -> Optional[List[str]]:
+    if values is None:
+        return None
+    normalized: List[str] = []
+    seen = set()
+    for item in values:
+        token = str(item or "").strip().lower()
+        if not token:
+            continue
+        if token not in ALLOWED_PROPERTY_USAGE_CODES:
+            raise HTTPException(status_code=400, detail="属性用途仅支持 find、fetch、analyze")
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _normalize_governance_tags(values: Optional[List[str]]) -> Optional[List[str]]:
+    if values is None:
+        return None
+    normalized: List[str] = []
+    seen = set()
+    for item in values:
+        token = str(item or "").strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token[:50])
+    return normalized
+
+
+def _resolve_ref_property(
+    db: Session,
+    entity: SysOntologyEntity,
+    ref_property_id: Optional[str],
+    current_property_id: Optional[str] = None,
+) -> Optional[SysOntologyProperty]:
+    if ref_property_id is None:
+        return None
+    normalized = str(ref_property_id).strip()
+    if not normalized:
+        return None
+    if current_property_id and normalized == current_property_id:
+        raise HTTPException(status_code=400, detail="属性不能引用自身")
+    referenced = db.query(SysOntologyProperty).filter(
+        SysOntologyProperty.property_id == normalized
+    ).first()
+    if not referenced:
+        raise HTTPException(status_code=400, detail="引用属性不存在")
+    referenced_entity = db.query(SysOntologyEntity).filter(
+        SysOntologyEntity.entity_id == referenced.entity_id
+    ).first()
+    if not referenced_entity or referenced_entity.domain_id != entity.domain_id:
+        raise HTTPException(status_code=400, detail="引用属性必须属于同一分析域")
+    return referenced
+
+
+def _build_ref_display_map(db: Session, properties: List[SysOntologyProperty]) -> Dict[str, str]:
+    ref_ids = {str(prop.ref_property_id).strip() for prop in properties if str(prop.ref_property_id or "").strip()}
+    if not ref_ids:
+        return {}
+    referenced_props = db.query(SysOntologyProperty).filter(
+        SysOntologyProperty.property_id.in_(list(ref_ids))
+    ).all()
+    entity_ids = list({prop.entity_id for prop in referenced_props if prop.entity_id})
+    entities = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id.in_(entity_ids)).all() if entity_ids else []
+    entity_name_by_id = {entity.entity_id: entity.entity_name for entity in entities}
+    return {
+        prop.property_id: f"{entity_name_by_id.get(prop.entity_id, 'Unknown')}.{prop.property_name}"
+        for prop in referenced_props
+    }
+
+
+def _build_property_response(
+    prop: SysOntologyProperty,
+    ref_display_map: Optional[Dict[str, str]] = None,
+) -> PropertyResponse:
+    return PropertyResponse(
+        property_id=prop.property_id,
+        entity_id=prop.entity_id,
+        property_name=prop.property_name,
+        property_display_name=prop.property_display_name,
+        data_type=prop.data_type,
+        is_primary_key=prop.is_primary_key,
+        is_nullable=prop.is_nullable,
+        unit=prop.unit,
+        value_constraint=prop.value_constraint,
+        usage_codes=_parse_json_list(prop.usage_codes_json),
+        is_required_filter=prop.is_required_filter or "N",
+        ref_property_id=prop.ref_property_id,
+        ref_display=(ref_display_map or {}).get(prop.ref_property_id or ""),
+        property_desc=prop.property_desc,
+        order_num=prop.order_num,
+        source_mark=prop.source_mark,
+        created_at=prop.created_at,
+        mapping=None
+    )
+
+
+def _build_entity_response(
+    entity: SysOntologyEntity,
+    properties: Optional[List[SysOntologyProperty]] = None,
+    ref_display_map: Optional[Dict[str, str]] = None,
+) -> EntityResponse:
+    props = properties if properties is not None else list(entity.properties or [])
+    return EntityResponse(
+        entity_id=entity.entity_id,
+        domain_id=entity.domain_id,
+        entity_name=entity.entity_name,
+        entity_display_name=entity.entity_display_name,
+        entity_desc=entity.entity_desc,
+        object_type=entity.object_type,
+        build_type=entity.build_type,
+        table_name=entity.table_name,
+        status=entity.status,
+        governance_status=entity.governance_status,
+        data_owner=entity.data_owner,
+        security_level=entity.security_level,
+        update_frequency=entity.update_frequency,
+        governance_tags=_parse_json_list(entity.governance_tags_json),
+        icon=entity.icon,
+        color=entity.color,
+        graph_position=entity.graph_position,
+        created_by=entity.created_by,
+        created_at=entity.created_at,
+        updated_at=entity.updated_at,
+        properties=[_build_property_response(prop, ref_display_map).model_dump() for prop in props]
+    )
+
+
+def _apply_entity_semantic_fields(entity: SysOntologyEntity, payload: Dict[str, Any]) -> None:
+    if "object_type" in payload:
+        entity.object_type = _normalize_object_type(payload.get("object_type"))
+    if "governance_status" in payload:
+        entity.governance_status = _normalize_governance_status(payload.get("governance_status"))
+    if "data_owner" in payload:
+        entity.data_owner = (str(payload.get("data_owner") or "").strip() or None)
+    if "security_level" in payload:
+        entity.security_level = (str(payload.get("security_level") or "").strip().upper() or None)
+    if "update_frequency" in payload:
+        entity.update_frequency = (str(payload.get("update_frequency") or "").strip().upper() or None)
+    if "governance_tags" in payload:
+        entity.governance_tags_json = _dump_json_list(_normalize_governance_tags(payload.get("governance_tags")))
+
+
+def _apply_property_semantic_fields(
+    db: Session,
+    entity: SysOntologyEntity,
+    prop: SysOntologyProperty,
+    payload: Dict[str, Any],
+    current_property_id: Optional[str] = None,
+) -> None:
+    if "is_primary_key" in payload:
+        prop.is_primary_key = _normalize_flag(payload.get("is_primary_key"), "是否主键", "N") or "N"
+    if "is_nullable" in payload:
+        prop.is_nullable = _normalize_flag(payload.get("is_nullable"), "是否可空", "Y") or "Y"
+    if "unit" in payload:
+        prop.unit = (str(payload.get("unit") or "").strip() or None)
+    if "value_constraint" in payload:
+        prop.value_constraint = (str(payload.get("value_constraint") or "").strip() or None)
+    if "usage_codes" in payload:
+        prop.usage_codes_json = _dump_json_list(_normalize_usage_codes(payload.get("usage_codes")))
+    if "is_required_filter" in payload:
+        prop.is_required_filter = _normalize_flag(payload.get("is_required_filter"), "必带过滤", "N") or "N"
+    if "ref_property_id" in payload:
+        referenced = _resolve_ref_property(db, entity, payload.get("ref_property_id"), current_property_id=current_property_id)
+        prop.ref_property_id = referenced.property_id if referenced else None
 
 
 def _collect_blueprint_generated_objects(
@@ -229,41 +448,12 @@ async def list_entities(
     entities = db.query(SysOntologyEntity).filter(
         SysOntologyEntity.domain_id == domain_id
     ).order_by(SysOntologyEntity.created_at).all()
+    all_properties = [prop for entity in entities for prop in (entity.properties or [])]
+    ref_display_map = _build_ref_display_map(db, all_properties)
 
     data = []
     for e in entities:
-        props = [PropertyResponse(
-            property_id=p.property_id,
-            entity_id=p.entity_id,
-            property_name=p.property_name,
-            property_display_name=p.property_display_name,
-            data_type=p.data_type,
-            is_primary_key=p.is_primary_key,
-            is_nullable=p.is_nullable,
-            property_desc=p.property_desc,
-            order_num=p.order_num,
-            source_mark=p.source_mark,
-            created_at=p.created_at,
-            mapping=None
-        ).model_dump() for p in e.properties]
-
-        data.append(EntityResponse(
-            entity_id=e.entity_id,
-            domain_id=e.domain_id,
-            entity_name=e.entity_name,
-            entity_display_name=e.entity_display_name,
-            entity_desc=e.entity_desc,
-            build_type=e.build_type,
-            table_name=e.table_name,
-            status=e.status,
-            icon=e.icon,
-            color=e.color,
-            graph_position=e.graph_position,
-            created_by=e.created_by,
-            created_at=e.created_at,
-            updated_at=e.updated_at,
-            properties=props
-        ).model_dump())
+        data.append(_build_entity_response(e, list(e.properties or []), ref_display_map).model_dump())
 
     return ApiResponse(data=data)
 
@@ -306,27 +496,12 @@ async def create_entity(
         graph_position=json.dumps({"x": 200, "y": 200}),
         created_by=current_user.get("username", "unknown")
     )
+    _apply_entity_semantic_fields(entity, req.model_dump())
     db.add(entity)
     db.commit()
     db.refresh(entity)
 
-    return ApiResponse(data=EntityResponse(
-        entity_id=entity.entity_id,
-        domain_id=entity.domain_id,
-        entity_name=entity.entity_name,
-        entity_display_name=entity.entity_display_name,
-        entity_desc=entity.entity_desc,
-        build_type=entity.build_type,
-        table_name=entity.table_name,
-        status=entity.status,
-        icon=entity.icon,
-        color=entity.color,
-        graph_position=entity.graph_position,
-        created_by=entity.created_by,
-        created_at=entity.created_at,
-        updated_at=entity.updated_at,
-        properties=[]
-    ).model_dump())
+    return ApiResponse(data=_build_entity_response(entity, []).model_dump())
 
 
 @router.put("/entities/{entity_id}", response_model=ApiResponse)
@@ -356,7 +531,10 @@ async def update_entity(
             raise HTTPException(status_code=400, detail="同分析域内实体名称不可重复")
 
     for field, value in payload.items():
+        if field in {"object_type", "governance_status", "data_owner", "security_level", "update_frequency", "governance_tags"}:
+            continue
         setattr(entity, field, value)
+    _apply_entity_semantic_fields(entity, payload)
 
     if "table_name" not in payload and ("entity_name" in payload or "build_type" in payload):
         entity.table_name = (
@@ -408,21 +586,8 @@ async def list_properties(
     properties = db.query(SysOntologyProperty).filter(
         SysOntologyProperty.entity_id == entity_id
     ).order_by(SysOntologyProperty.order_num).all()
-
-    data = [PropertyResponse(
-        property_id=p.property_id,
-        entity_id=p.entity_id,
-        property_name=p.property_name,
-        property_display_name=p.property_display_name,
-        data_type=p.data_type,
-        is_primary_key=p.is_primary_key,
-        is_nullable=p.is_nullable,
-        property_desc=p.property_desc,
-        order_num=p.order_num,
-        source_mark=p.source_mark,
-        created_at=p.created_at,
-        mapping=None
-    ).model_dump() for p in properties]
+    ref_display_map = _build_ref_display_map(db, properties)
+    data = [_build_property_response(p, ref_display_map).model_dump() for p in properties]
 
     return ApiResponse(data=data)
 
@@ -453,29 +618,16 @@ async def create_property(
         property_name=req.property_name,
         property_display_name=req.property_display_name,
         data_type=req.data_type,
-        is_primary_key=req.is_primary_key,
-        is_nullable=req.is_nullable,
         property_desc=req.property_desc,
         order_num=req.order_num
     )
+    _apply_property_semantic_fields(db, entity, prop, req.model_dump(), current_property_id=prop.property_id)
     db.add(prop)
     db.commit()
     db.refresh(prop)
 
-    return ApiResponse(data=PropertyResponse(
-        property_id=prop.property_id,
-        entity_id=prop.entity_id,
-        property_name=prop.property_name,
-        property_display_name=prop.property_display_name,
-        data_type=prop.data_type,
-        is_primary_key=prop.is_primary_key,
-        is_nullable=prop.is_nullable,
-        property_desc=prop.property_desc,
-        order_num=prop.order_num,
-        source_mark=prop.source_mark,
-        created_at=prop.created_at,
-        mapping=None
-    ).model_dump())
+    ref_display_map = _build_ref_display_map(db, [prop])
+    return ApiResponse(data=_build_property_response(prop, ref_display_map).model_dump())
 
 
 @router.put("/properties/{property_id}", response_model=ApiResponse)
@@ -490,8 +642,15 @@ async def update_property(
         raise HTTPException(status_code=404, detail="属性不存在")
     _ensure_property_access(db, current_user, prop)
 
-    for field, value in req.model_dump(exclude_unset=True).items():
+    entity = db.query(SysOntologyEntity).filter(SysOntologyEntity.entity_id == prop.entity_id).first()
+    payload = req.model_dump(exclude_unset=True)
+    for field, value in payload.items():
+        if field in {"is_primary_key", "is_nullable", "unit", "value_constraint", "usage_codes", "is_required_filter", "ref_property_id"}:
+            continue
         setattr(prop, field, value)
+    if not entity:
+        raise HTTPException(status_code=400, detail="属性所属实体不存在")
+    _apply_property_semantic_fields(db, entity, prop, payload, current_property_id=prop.property_id)
     prop.updated_at = datetime.utcnow()
     db.commit()
     return ApiResponse(message="属性已更新")
@@ -511,6 +670,9 @@ async def delete_property(
     property_mappings = db.query(SysPropertyMapping).filter(
         SysPropertyMapping.property_id == property_id
     ).all()
+    db.query(SysOntologyProperty).filter(
+        SysOntologyProperty.ref_property_id == property_id
+    ).update({"ref_property_id": None}, synchronize_session=False)
     for property_mapping in property_mappings:
         db.delete(property_mapping)
     db.delete(prop)
@@ -1051,9 +1213,15 @@ async def get_ontology_graph(
             "name": e.entity_name,
             "displayName": e.entity_display_name,
             "desc": e.entity_desc,
+            "objectType": e.object_type,
             "buildType": e.build_type,
             "tableName": e.table_name,
             "status": e.status,
+            "governanceStatus": e.governance_status,
+            "dataOwner": e.data_owner,
+            "securityLevel": e.security_level,
+            "updateFrequency": e.update_frequency,
+            "governanceTags": _parse_json_list(e.governance_tags_json),
             "icon": e.icon,
             "color": e.color,
             "position": position,

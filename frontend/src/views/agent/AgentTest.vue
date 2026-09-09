@@ -52,8 +52,8 @@
             </el-select>
           </el-form-item>
           <el-form-item label="读取记录数">
-            <el-input-number v-model="form.sample_limit" :min="1" :max="100" />
-            <span class="sample-limit-hint">默认 100 条，仅用于 Agent 的受限只读数据检索</span>
+            <el-input-number v-model="form.sample_limit" :min="1" :max="1000" />
+            <span class="sample-limit-hint">默认 100 条，可在 1 - 1000 条之间调整，仅用于 Agent 的受限只读数据检索</span>
           </el-form-item>
           <el-alert title="无需手工选择数据对象：启动后 Agent 会依据 Skill 和数据源自动选择对象。请在右侧对话框中自由提问。" type="info" :closable="false" class="object-selection-hint" />
         </el-form>

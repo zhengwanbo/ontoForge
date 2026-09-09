@@ -58,9 +58,15 @@ class SysOntologyEntity(Base):
     entity_name = Column(String(100), nullable=False)
     entity_display_name = Column(String(200))
     entity_desc = Column(String(1000))
+    object_type = Column(String(20))
     build_type = Column(String(20), default="TABLE")  # VIEW / TABLE
     table_name = Column(String(100))
     status = Column(String(20), default="DRAFT")  # DRAFT/MAPPED/DDL_GENERATED/DEPLOYED
+    governance_status = Column(String(20))
+    data_owner = Column(String(200))
+    security_level = Column(String(20))
+    update_frequency = Column(String(50))
+    governance_tags_json = Column(Text)
     icon = Column(String(50))
     color = Column(String(20))
     graph_position = Column(Text)  # JSON
@@ -83,6 +89,11 @@ class SysOntologyProperty(Base):
     data_type = Column(String(50))
     is_primary_key = Column(CHAR(1), default="N")
     is_nullable = Column(CHAR(1), default="Y")
+    unit = Column(String(50))
+    value_constraint = Column(String(500))
+    usage_codes_json = Column(Text)
+    is_required_filter = Column(CHAR(1), default="N")
+    ref_property_id = Column(String(50))
     property_desc = Column(String(500))
     order_num = Column(Integer, default=0)
     source_mark = Column(String(20), default="PENDING")  # PENDING/MAPPED
@@ -173,6 +184,7 @@ class SysRelationMapping(Base):
     join_condition = Column(String(500))
     edge_sql = Column(Text)
     mapping_mode = Column(String(30), default="DIRECT")  # DIRECT / RELATION_TABLE
+    relation_cardinality = Column(String(20))
     relation_table = Column(String(100))
     relation_source_column = Column(String(100))
     relation_target_column = Column(String(100))

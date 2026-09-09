@@ -53,6 +53,16 @@ async def list_domain_property_graphs(
     return ApiResponse(data=data)
 
 
+@router.get("/domains/{domain_id}/analysis-semantics", response_model=ApiResponse)
+async def get_domain_analysis_semantics(
+    domain_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_domain_access(db, current_user, domain_id)
+    return ApiResponse(data=AgentService(db).get_analysis_semantics(domain_id))
+
+
 @router.get("/skills", response_model=ApiResponse)
 async def list_agent_skills(
     domain_id: Optional[str] = Query(default=None),

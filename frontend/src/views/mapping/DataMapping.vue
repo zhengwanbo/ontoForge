@@ -351,6 +351,24 @@
               <div v-if="needsRelationReview(row)" class="manual-review-hint">{{ relationReviewReason(row) }}</div>
             </template>
           </el-table-column>
+          <el-table-column label="关联基数" width="150">
+            <template #default="{ row }">
+              <el-select v-model="row.relation_cardinality" size="small" placeholder="选择基数">
+                <el-option
+                  v-for="item in relationCardinalityOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+              <div
+                v-if="row.draft_relation_cardinality && row.draft_relation_cardinality !== row.relation_cardinality"
+                class="relation-config-meta"
+              >
+                草案：{{ relationCardinalityLabel(row.draft_relation_cardinality) }}
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="英文边表名" min-width="230">
             <template #default="{ row }">
               <el-input v-model="row.edge_table_name" size="small" placeholder="如 BELONGS_TO" />
@@ -524,6 +542,7 @@ interface RelationMappingRow {
   mapping_id?: string
   relation_name: string
   relation_type: string
+  relation_cardinality: string
   source_entity_id: string
   target_entity_id: string
   source_entity_name: string
@@ -540,6 +559,7 @@ interface RelationMappingRow {
   relation_table: string
   relation_source_column: string
   relation_target_column: string
+  draft_relation_cardinality?: string
   draft_source_table?: string
   draft_target_table?: string
   draft_join_condition?: string
@@ -718,8 +738,25 @@ const nodeTableOptions = computed(() => entities.value.map(entity => ({
   table_name: getEntityNodeTable(entity.entity_id),
   label: `${getEntityNodeTable(entity.entity_id)}（${entity.entity_display_name || entity.entity_name}）`,
 })))
+const relationCardinalityOptions = [
+  { label: '一对一', value: 'ONE_TO_ONE' },
+  { label: '一对多', value: 'ONE_TO_MANY' },
+  { label: '多对一', value: 'MANY_TO_ONE' },
+  { label: '多对多', value: 'MANY_TO_MANY' },
+]
 
 const createLocalRowId = () => `row_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+
+const normalizeRelationCardinality = (value?: string | null) => {
+  const token = (value || '').trim().toUpperCase()
+  if (relationCardinalityOptions.some(item => item.value === token)) return token
+  return ''
+}
+
+const relationCardinalityLabel = (value?: string | null) => {
+  const normalized = normalizeRelationCardinality(value)
+  return relationCardinalityOptions.find(item => item.value === normalized)?.label || normalized || '未设置'
+}
 
 const buildSnapshot = () => JSON.stringify(
   {
@@ -919,6 +956,7 @@ const loadRelationMappings = async () => {
         mapping_id: mapping?.mapping_id || '',
         relation_name: edge.name || '',
         relation_type: edge.type || '',
+        relation_cardinality: normalizeRelationCardinality(mapping?.relation_cardinality || mapping?.draft?.relation_cardinality || edge.type),
         source_entity_id: edge.source,
         target_entity_id: edge.target,
         source_entity_name: getEntityName(edge.source),
@@ -935,6 +973,7 @@ const loadRelationMappings = async () => {
         relation_table: mapping?.relation_table || '',
         relation_source_column: mapping?.relation_source_column || '',
         relation_target_column: mapping?.relation_target_column || '',
+        draft_relation_cardinality: normalizeRelationCardinality(mapping?.draft?.relation_cardinality || ''),
         draft_source_table: mapping?.draft?.source_table || '',
         draft_target_table: mapping?.draft?.target_table || '',
         draft_join_condition: mapping?.draft?.join_condition || '',
@@ -948,6 +987,7 @@ const loadRelationMappings = async () => {
       mapping_id: '',
       relation_name: edge.name || '',
       relation_type: edge.type || '',
+      relation_cardinality: normalizeRelationCardinality(edge.type),
       source_entity_id: edge.source,
       target_entity_id: edge.target,
       source_entity_name: getEntityName(edge.source),
@@ -964,6 +1004,7 @@ const loadRelationMappings = async () => {
       relation_table: '',
       relation_source_column: '',
       relation_target_column: '',
+      draft_relation_cardinality: '',
       draft_source_table: '',
       draft_target_table: '',
       draft_join_condition: '',
@@ -974,11 +1015,12 @@ const loadRelationMappings = async () => {
 }
 
 const hasRelationDraft = (row: RelationMappingRow) => {
-  return Boolean(row.draft_source_table || row.draft_target_table || row.draft_join_condition)
+  return Boolean(row.draft_relation_cardinality || row.draft_source_table || row.draft_target_table || row.draft_join_condition)
 }
 
 const applyRelationDraft = (row: RelationMappingRow) => {
   if (!hasRelationDraft(row)) return
+  row.relation_cardinality = row.draft_relation_cardinality || row.relation_cardinality
   row.source_table = row.draft_source_table || row.source_table
   row.target_table = row.draft_target_table || row.target_table
   row.join_condition = row.draft_join_condition || row.join_condition
@@ -992,6 +1034,7 @@ const applyAllRelationDrafts = () => {
   let applied = 0
   relationMappingTable.value.forEach(row => {
     if (hasRelationDraft(row)) {
+      row.relation_cardinality = row.draft_relation_cardinality || row.relation_cardinality
       row.source_table = row.draft_source_table || row.source_table
       row.target_table = row.draft_target_table || row.target_table
       row.join_condition = row.draft_join_condition || row.join_condition
@@ -1367,6 +1410,7 @@ const saveRelationMappings = async () => {
     for (const row of relationMappingTable.value) {
       const hasMappingContent = Boolean(
         row.edge_table_name.trim() ||
+        row.relation_cardinality.trim() ||
         row.source_table.trim() ||
         row.target_table.trim() ||
         row.join_condition.trim() ||
@@ -1384,6 +1428,7 @@ const saveRelationMappings = async () => {
       const payload = {
         relation_id: row.relation_id,
         edge_table_name: row.edge_table_name.trim() || null,
+        relation_cardinality: row.relation_cardinality.trim() || null,
         source_table: row.source_table.trim() || null,
         target_table: row.target_table.trim() || null,
         join_condition: row.join_condition.trim() || null,

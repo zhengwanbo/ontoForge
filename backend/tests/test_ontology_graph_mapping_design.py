@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -499,6 +500,105 @@ class OntologyGraphMappingDesignTest(unittest.TestCase):
         self.assertIn("COMMENT ON COLUMN ONTO_NODE_TEST.ID", "\n".join(item["sql"] for item in comments))
         self.assertNotIn("MISSING_COL", "\n".join(item["sql"] for item in comments))
         self.assertEqual(filtered, [])
+
+    def test_comments_support_bare_projection_alias_and_escape_quotes(self) -> None:
+        entity = SysOntologyEntity(
+            entity_id="ent_view",
+            domain_id="dm_test",
+            entity_name="OrderView",
+            table_name="ONTO_NODE_ORDERVIEW_V",
+            entity_display_name="订单视图",
+            build_type="VIEW",
+        )
+        entity.properties = [
+            SysOntologyProperty(property_id="prop_total", property_name="total_amount", property_desc="订单金额'元"),
+            SysOntologyProperty(property_id="prop_missing", property_name="customer_name", property_desc="客户名称"),
+        ]
+        entity.entity_mapping = SysEntityMapping(
+            mapping_id="emap_view",
+            entity_id="ent_view",
+            view_sql="SELECT src.ORDER_TOTAL TOTAL_AMOUNT FROM ORDER_FACT src",
+        )
+
+        comments = self.ddl_service._generate_comments_ddl(entity)
+        ddl_text = "\n".join(item["sql"] for item in comments)
+
+        self.assertIn("COMMENT ON COLUMN ONTO_NODE_ORDERVIEW_V.TOTAL_AMOUNT IS '订单金额''元';", ddl_text)
+        self.assertNotIn("CUSTOMER_NAME", ddl_text)
+
+    def test_generates_table_column_annotations_from_property_metadata(self) -> None:
+        ref_entity = SysOntologyEntity(
+            entity_id="ent_store",
+            entity_name="Store",
+            table_name="ONTO_NODE_STORE",
+        )
+        ref_entity.properties = [
+            SysOntologyProperty(property_id="prop_store_id", property_name="store_id"),
+        ]
+        entity = SysOntologyEntity(
+            entity_id="ent_order",
+            domain_id="dm_test",
+            entity_name="Order",
+            table_name="ONTO_NODE_ORDER",
+            build_type="TABLE",
+        )
+        entity.properties = [
+            SysOntologyProperty(
+                property_id="prop_total",
+                property_name="total_amount",
+                unit="CNY",
+                value_constraint=">= 0",
+                usage_codes_json=json.dumps(["analyze"], ensure_ascii=False),
+                is_required_filter="Y",
+                ref_property_id="prop_store_id",
+            )
+        ]
+
+        statements = self.ddl_service._generate_column_annotations_ddl(entity, [entity, ref_entity])
+
+        self.assertEqual(1, len(statements))
+        self.assertEqual("annotate_table_column", statements[0]["type"])
+        self.assertIn("ALTER TABLE ONTO_NODE_ORDER MODIFY TOTAL_AMOUNT ANNOTATIONS(", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_UNIT, ADD ONTOLOGY_UNIT 'CNY'", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_VALUE_CONSTRAINT, ADD ONTOLOGY_VALUE_CONSTRAINT '>= 0'", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_USAGE, ADD ONTOLOGY_USAGE '[\"analyze\"]'", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_REQUIRED_FILTER, ADD ONTOLOGY_REQUIRED_FILTER 'Y'", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_REF, ADD ONTOLOGY_REF 'Store.store_id'", statements[0]["sql"])
+
+    def test_generates_view_column_annotations_only_for_projected_columns(self) -> None:
+        entity = SysOntologyEntity(
+            entity_id="ent_order_view",
+            domain_id="dm_test",
+            entity_name="OrderView",
+            table_name="ONTO_NODE_ORDERVIEW_V",
+            build_type="VIEW",
+        )
+        entity.properties = [
+            SysOntologyProperty(
+                property_id="prop_total",
+                property_name="total_amount",
+                unit="CNY",
+                usage_codes_json=json.dumps(["fetch", "analyze"], ensure_ascii=False),
+            ),
+            SysOntologyProperty(
+                property_id="prop_hidden",
+                property_name="hidden_col",
+                unit="PCS",
+            ),
+        ]
+        entity.entity_mapping = SysEntityMapping(
+            mapping_id="emap_view_anno",
+            entity_id="ent_order_view",
+            view_sql="SELECT src.ORDER_TOTAL TOTAL_AMOUNT FROM ORDER_FACT src",
+        )
+
+        statements = self.ddl_service._generate_column_annotations_ddl(entity, [entity])
+
+        self.assertEqual(1, len(statements))
+        self.assertEqual("annotate_view_column", statements[0]["type"])
+        self.assertIn("ALTER VIEW ONTO_NODE_ORDERVIEW_V MODIFY (TOTAL_AMOUNT ANNOTATIONS(", statements[0]["sql"])
+        self.assertIn("ONTOLOGY_USAGE '[\"fetch\", \"analyze\"]'", statements[0]["sql"])
+        self.assertNotIn("HIDDEN_COL", statements[0]["sql"])
 
 
 class DDLExecutionScriptTest(unittest.IsolatedAsyncioTestCase):

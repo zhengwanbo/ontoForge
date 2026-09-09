@@ -77,6 +77,83 @@ class OntologyGuideService:
         self._business_type_context: Dict[str, str] = {}
         self._selected_semantic_type_code: Optional[str] = None
 
+    @staticmethod
+    def _normalize_flag(value: Any, default: str = "N") -> str:
+        token = str(value or "").strip().upper()
+        return token if token in {"Y", "N"} else default
+
+    @staticmethod
+    def _normalize_usage_codes(value: Any) -> str:
+        raw_items = value if isinstance(value, list) else [value] if value else []
+        normalized: List[str] = []
+        seen = set()
+        for item in raw_items:
+            token = str(item or "").strip().lower()
+            if token not in {"find", "fetch", "analyze"} or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        return json.dumps(normalized, ensure_ascii=False)
+
+    @staticmethod
+    def _normalize_governance_tags(value: Any) -> str:
+        raw_items = value if isinstance(value, list) else [value] if value else []
+        normalized: List[str] = []
+        seen = set()
+        for item in raw_items:
+            token = str(item or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token[:50])
+        return json.dumps(normalized, ensure_ascii=False)
+
+    @staticmethod
+    def _infer_object_type(entity_name: str, entity_desc: str = "") -> Optional[str]:
+        sample = f"{entity_name} {entity_desc}".upper()
+        fact_tokens = ["ORDER", "EVENT", "RECORD", "LOG", "HISTORY", "TRANSACTION", "REFUND", "MEASURE", "RESULT", "工单", "事件", "记录", "履历", "交易", "订单", "测量", "结果"]
+        dim_tokens = ["STORE", "CUSTOMER", "DEVICE", "PRODUCT", "LINE", "MATERIAL", "WAREHOUSE", "REGION", "客户", "门店", "设备", "产品", "产线", "物料", "仓库", "区域"]
+        if any(token in sample for token in fact_tokens):
+            return "FACT"
+        if any(token in sample for token in dim_tokens):
+            return "DIM"
+        return None
+
+    def _normalize_object_type(self, value: Any, entity_name: str = "", entity_desc: str = "") -> Optional[str]:
+        token = str(value or "").strip().upper()
+        if token in {"FACT", "DIM"}:
+            return token
+        return self._infer_object_type(entity_name, entity_desc)
+
+    @staticmethod
+    def _extract_property_ref_token(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            property_id = str(value.get("propertyId") or value.get("property_id") or "").strip()
+            if property_id:
+                return property_id
+            entity_name = str(value.get("entityName") or value.get("entity_name") or "").strip()
+            property_name = str(value.get("propertyName") or value.get("property_name") or "").strip()
+            if entity_name and property_name:
+                return f"{entity_name}.{property_name}"
+            return None
+        token = str(value or "").strip()
+        return token or None
+
+    @staticmethod
+    def _resolve_property_ref_token(
+        token: Optional[str],
+        property_by_id: Dict[str, SysOntologyProperty],
+        property_by_path: Dict[str, SysOntologyProperty],
+    ) -> Optional[SysOntologyProperty]:
+        raw = str(token or "").strip()
+        if not raw:
+            return None
+        if raw in property_by_id:
+            return property_by_id[raw]
+        if "." in raw:
+            return property_by_path.get(raw.lower())
+        return None
+
     def _load_domain_semantic_patterns(self, domain: SysDomain) -> None:
         """Load user-maintained semantic patterns for the active business type."""
         ensure_default_business_types(self.db)
@@ -3512,6 +3589,7 @@ class OntologyGuideService:
                 "relation_name": relation.get("relationName"),
                 "source_entity_name": relation.get("sourceEntityName"),
                 "target_entity_name": relation.get("targetEntityName"),
+                "relation_cardinality": relation.get("relationCardinality") or relation.get("relation_cardinality") or relation.get("cardinality"),
                 "evidence_tables": relation.get("evidenceTables") or [],
                 "mapping_status": "PENDING",
                 "data_support_status": relation.get("data_support_status") or "DATA_SUPPORTED",
@@ -3853,6 +3931,7 @@ class OntologyGuideService:
         entity_result = {"created": 0, "updated": 0, "reused": 0}
         property_result = {"created": 0, "updated": 0}
         relation_result = {"created": 0, "updated": 0, "reused": 0, "skipped": 0}
+        pending_property_refs: List[tuple[SysOntologyProperty, Optional[str]]] = []
 
         applied_entities: List[Dict[str, Any]] = []
         for entity_data in entities_payload:
@@ -3866,6 +3945,24 @@ class OntologyGuideService:
                     entity.entity_display_name = entity_data.get("entityDisplayName") or entity.entity_display_name
                     entity.entity_desc = entity_data.get("entityDesc") or entity.entity_desc
                     entity.build_type = entity_data.get("buildType") or entity.build_type
+                    governance_info = entity_data.get("governanceInfo") or entity_data.get("governance_info") or {}
+                    if "objectType" in entity_data or "object_type" in entity_data:
+                        entity.object_type = self._normalize_object_type(
+                            entity_data.get("objectType") or entity_data.get("object_type"),
+                            entity_name,
+                            entity_data.get("entityDesc") or entity.entity_desc or "",
+                        )
+                    if isinstance(governance_info, dict):
+                        if any(key in governance_info for key in ["status", "governanceStatus"]):
+                            entity.governance_status = (str(governance_info.get("status") or governance_info.get("governanceStatus") or "").strip().upper() or None)
+                        if any(key in governance_info for key in ["dataOwner", "data_owner"]):
+                            entity.data_owner = (str(governance_info.get("dataOwner") or governance_info.get("data_owner") or "").strip() or None)
+                        if any(key in governance_info for key in ["securityLevel", "security_level"]):
+                            entity.security_level = (str(governance_info.get("securityLevel") or governance_info.get("security_level") or "").strip().upper() or None)
+                        if any(key in governance_info for key in ["updateFrequency", "update_frequency"]):
+                            entity.update_frequency = (str(governance_info.get("updateFrequency") or governance_info.get("update_frequency") or "").strip().upper() or None)
+                        if "tags" in governance_info:
+                            entity.governance_tags_json = self._normalize_governance_tags(governance_info.get("tags"))
                     entity.updated_at = self._utcnow()
                     if entity.build_type == "VIEW":
                         entity.table_name = f"ONTO_NODE_{entity.entity_name.upper()}_V"
@@ -3878,15 +3975,26 @@ class OntologyGuideService:
                     entity_action = "reused"
             else:
                 build_type = (entity_data.get("buildType") or "TABLE").upper()
+                governance_info = entity_data.get("governanceInfo") or entity_data.get("governance_info") or {}
                 entity = SysOntologyEntity(
                     entity_id=generate_id("ent"),
                     domain_id=domain_id,
                     entity_name=entity_name,
                     entity_display_name=entity_data.get("entityDisplayName"),
                     entity_desc=entity_data.get("entityDesc"),
+                    object_type=self._normalize_object_type(
+                        entity_data.get("objectType") or entity_data.get("object_type"),
+                        entity_name,
+                        entity_data.get("entityDesc") or "",
+                    ),
                     build_type=build_type,
                     table_name=f"ONTO_NODE_{entity_name.upper()}_V" if build_type == "VIEW" else f"ONTO_NODE_{entity_name.upper()}",
                     status="DRAFT",
+                    governance_status=(str(governance_info.get("status") or governance_info.get("governanceStatus") or "").strip().upper() or None) if isinstance(governance_info, dict) else None,
+                    data_owner=(str(governance_info.get("dataOwner") or governance_info.get("data_owner") or "").strip() or None) if isinstance(governance_info, dict) else None,
+                    security_level=(str(governance_info.get("securityLevel") or governance_info.get("security_level") or "").strip().upper() or None) if isinstance(governance_info, dict) else None,
+                    update_frequency=(str(governance_info.get("updateFrequency") or governance_info.get("update_frequency") or "").strip().upper() or None) if isinstance(governance_info, dict) else None,
+                    governance_tags_json=self._normalize_governance_tags(governance_info.get("tags")) if isinstance(governance_info, dict) else self._normalize_governance_tags(None),
                     graph_position=json.dumps(self._build_graph_position(next_position_index)),
                     created_by=created_by,
                 )
@@ -3905,6 +4013,7 @@ class OntologyGuideService:
                 if not property_name:
                     continue
                 prop = property_index.get(property_name)
+                created_new_property = False
                 if prop:
                     if overwrite_existing:
                         prop.property_display_name = prop_data.get("propertyDisplayName") or prop.property_display_name
@@ -3912,9 +4021,18 @@ class OntologyGuideService:
                         prop.data_type = prop_data.get("dataType") or prop.data_type
                         prop.is_primary_key = "Y" if str(prop_data.get("isPrimaryKey") or "N").upper() == "Y" else "N"
                         prop.is_nullable = "N" if str(prop_data.get("isNullable") or "Y").upper() == "N" else "Y"
+                        if "unit" in prop_data:
+                            prop.unit = (str(prop_data.get("unit") or "").strip() or None)
+                        if "valueConstraint" in prop_data or "value_constraint" in prop_data:
+                            prop.value_constraint = (str(prop_data.get("valueConstraint") or prop_data.get("value_constraint") or "").strip() or None)
+                        if any(key in prop_data for key in ["usage", "usageCodes", "usage_codes"]):
+                            prop.usage_codes_json = self._normalize_usage_codes(prop_data.get("usage") or prop_data.get("usageCodes") or prop_data.get("usage_codes"))
+                        if "isRequiredFilter" in prop_data or "is_required_filter" in prop_data:
+                            prop.is_required_filter = self._normalize_flag(prop_data.get("isRequiredFilter") or prop_data.get("is_required_filter"), "N")
                         prop.updated_at = self._utcnow()
                         property_result["updated"] += 1
                 else:
+                    created_new_property = True
                     prop = SysOntologyProperty(
                         property_id=generate_id("prop"),
                         entity_id=entity.entity_id,
@@ -3923,6 +4041,10 @@ class OntologyGuideService:
                         data_type=prop_data.get("dataType") or "VARCHAR2",
                         is_primary_key="Y" if str(prop_data.get("isPrimaryKey") or "N").upper() == "Y" else "N",
                         is_nullable="N" if str(prop_data.get("isNullable") or "Y").upper() == "N" else "Y",
+                        unit=(str(prop_data.get("unit") or "").strip() or None),
+                        value_constraint=(str(prop_data.get("valueConstraint") or prop_data.get("value_constraint") or "").strip() or None),
+                        usage_codes_json=self._normalize_usage_codes(prop_data.get("usage") or prop_data.get("usageCodes") or prop_data.get("usage_codes")),
+                        is_required_filter=self._normalize_flag(prop_data.get("isRequiredFilter") or prop_data.get("is_required_filter"), "N"),
                         property_desc=prop_data.get("propertyDesc"),
                         order_num=len(property_index),
                     )
@@ -3930,6 +4052,15 @@ class OntologyGuideService:
                     property_index[property_name] = prop
                     existing_props.append(prop)
                     property_result["created"] += 1
+                has_ref_payload = any(key in prop_data for key in ["ref", "refProperty", "ref_property", "refPropertyId", "ref_property_id"])
+                if has_ref_payload or created_new_property:
+                    pending_property_refs.append((prop, self._extract_property_ref_token(
+                        prop_data.get("ref")
+                        or prop_data.get("refProperty")
+                        or prop_data.get("ref_property")
+                        or prop_data.get("refPropertyId")
+                        or prop_data.get("ref_property_id")
+                    )))
                 if not logical_only:
                     self._upsert_property_mapping_seed(prop, prop_data, overwrite_existing=overwrite_existing, created_by=created_by)
 
@@ -3938,6 +4069,30 @@ class OntologyGuideService:
                 "entity_name": entity.entity_name,
                 "action": entity_action,
             })
+
+        all_entities = list(entity_index.values())
+        entity_name_by_id = {entity.entity_id: entity.entity_name for entity in all_entities}
+        all_properties = (
+            self.db.query(SysOntologyProperty)
+            .join(SysOntologyEntity, SysOntologyProperty.entity_id == SysOntologyEntity.entity_id)
+            .filter(SysOntologyEntity.domain_id == domain_id)
+            .all()
+        )
+        property_by_id = {prop.property_id: prop for prop in all_properties}
+        property_by_path = {
+            f"{entity_name_by_id.get(prop.entity_id, '').lower()}.{(prop.property_name or '').lower()}": prop
+            for prop in all_properties
+            if entity_name_by_id.get(prop.entity_id) and prop.property_name
+        }
+        for prop, ref_token in pending_property_refs:
+            if not ref_token:
+                prop.ref_property_id = None
+                continue
+            referenced = self._resolve_property_ref_token(ref_token, property_by_id, property_by_path)
+            if referenced and referenced.property_id != prop.property_id:
+                prop.ref_property_id = referenced.property_id
+            else:
+                prop.ref_property_id = None
 
         existing_relations = self.db.query(SysOntologyRelation).filter(SysOntologyRelation.domain_id == domain_id).all()
         relation_index = {
@@ -4185,6 +4340,15 @@ class OntologyGuideService:
         target_entity = entity_index.get(target_name)
         source_table = (relation_data.get("sourceTable") or relation_data.get("source_table") or "").strip().upper()
         target_table = (relation_data.get("targetTable") or relation_data.get("target_table") or "").strip().upper()
+        raw_relation_cardinality = (
+            relation_data.get("relationCardinality")
+            or relation_data.get("relation_cardinality")
+            or relation_data.get("cardinality")
+            or relation.relation_type
+        )
+        relation_cardinality = str(raw_relation_cardinality or "").strip().upper().replace("-", "_").replace(" ", "_") or None
+        if relation_cardinality not in {"ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY"}:
+            relation_cardinality = None
         join_condition = (relation_data.get("joinCondition") or relation_data.get("join_condition") or "").strip() or None
         edge_sql = (relation_data.get("edgeSql") or relation_data.get("edge_sql") or "").strip() or None
         if not source_table:
@@ -4202,6 +4366,7 @@ class OntologyGuideService:
                 relation_id=relation.relation_id,
                 source_table=source_table or None,
                 target_table=target_table or None,
+                relation_cardinality=relation_cardinality,
                 join_condition=join_condition,
                 edge_sql=edge_sql,
                 mapping_status="CONFIRMED" if edge_sql else "SUGGESTED",
@@ -4215,6 +4380,7 @@ class OntologyGuideService:
         if should_fill and mapping.mapping_status != "CONFIRMED":
             mapping.source_table = source_table or mapping.source_table
             mapping.target_table = target_table or mapping.target_table
+            mapping.relation_cardinality = relation_cardinality or mapping.relation_cardinality
             mapping.join_condition = join_condition or mapping.join_condition
             mapping.edge_sql = edge_sql or mapping.edge_sql
             mapping.mapping_status = "CONFIRMED" if (mapping.edge_sql or "").strip() else "SUGGESTED"

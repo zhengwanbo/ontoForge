@@ -25,7 +25,20 @@ class SourceDataService:
         "LONG RAW",
         "XMLTYPE",
     }
-    MAPPING_EXCLUDED_TABLE_PREFIXES = ("SYS_",)
+    NON_BUSINESS_TABLE_PREFIXES = (
+        "SYS_",
+        "DR$",
+        "MLOG$",
+        "RUPD$",
+        "BIN$",
+        "AQ$",
+        "LOGMNR_",
+        "REPCAT$",
+        "DEF$",
+        "MDRT_",
+        "MDXT_",
+        "MVIEW$",
+    )
 
     def __init__(self, db: Session):
         self.db = db
@@ -267,7 +280,7 @@ class SourceDataService:
             self._execute_remote_sql(cursor, source, sql, params)
             rows = self._fetchall_logged(cursor, source, f"remote_tables:{schema_name}")
 
-            tables = [
+            raw_tables = [
                 {
                     "owner": row[0],
                     "table_name": row[1],
@@ -276,6 +289,18 @@ class SourceDataService:
                 }
                 for row in rows
             ]
+            tables = [
+                table for table in raw_tables
+                if self._is_business_relevant_table(table.get("table_name"))
+            ]
+            logger.info(
+                "Filter remote business tables: source_id=%s schema=%s raw_count=%s filtered_count=%s excluded_count=%s",
+                source_id,
+                schema_name,
+                len(raw_tables),
+                len(tables),
+                len(raw_tables) - len(tables),
+            )
 
             return {
                 "schema": schema_name,
@@ -1941,7 +1966,10 @@ class SourceDataService:
         return base_type not in self.UNSUPPORTED_MAPPING_TYPES
 
     def _is_mapping_candidate_table(self, table_name: Optional[str]) -> bool:
+        return self._is_business_relevant_table(table_name)
+
+    def _is_business_relevant_table(self, table_name: Optional[str]) -> bool:
         normalized = (table_name or "").upper().strip()
         if not normalized:
             return False
-        return not any(normalized.startswith(prefix) for prefix in self.MAPPING_EXCLUDED_TABLE_PREFIXES)
+        return not any(normalized.startswith(prefix) for prefix in self.NON_BUSINESS_TABLE_PREFIXES)

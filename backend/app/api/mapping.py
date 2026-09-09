@@ -25,6 +25,24 @@ from app.models.models import (
 router = APIRouter(prefix="/mapping", tags=["数据映射"])
 logger = get_logger(__name__)
 SAFE_ORACLE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+ALLOWED_RELATION_CARDINALITIES = {
+    "ONE_TO_ONE",
+    "ONE_TO_MANY",
+    "MANY_TO_ONE",
+    "MANY_TO_MANY",
+}
+RELATION_CARDINALITY_ALIASES = {
+    "ONE2ONE": "ONE_TO_ONE",
+    "ONE2MANY": "ONE_TO_MANY",
+    "MANY2ONE": "MANY_TO_ONE",
+    "MANY2MANY": "MANY_TO_MANY",
+    "1_TO_1": "ONE_TO_ONE",
+    "1_TO_MANY": "ONE_TO_MANY",
+    "MANY_TO_1": "MANY_TO_ONE",
+    "N_TO_1": "MANY_TO_ONE",
+    "1_TO_N": "ONE_TO_MANY",
+    "N_TO_N": "MANY_TO_MANY",
+}
 
 
 @router.post("/domains/{domain_id}/ddl-readiness-check", response_model=ApiResponse)
@@ -63,6 +81,19 @@ def _ensure_entity_access(db: Session, current_user: dict, entity: Optional[SysO
 def _ensure_relation_access(db: Session, current_user: dict, relation: Optional[SysOntologyRelation]) -> None:
     if relation:
         ensure_domain_access(db, current_user, relation.domain_id)
+
+
+def _normalize_relation_cardinality(value: Optional[str], fallback: Optional[str] = None) -> Optional[str]:
+    for candidate in (value, fallback):
+        token = re.sub(r"[^A-Z0-9]+", "_", str(candidate or "").strip().upper()).strip("_")
+        if not token:
+            continue
+        normalized = RELATION_CARDINALITY_ALIASES.get(token, token)
+        if normalized in ALLOWED_RELATION_CARDINALITIES:
+            return normalized
+        if normalized in {"ASSOCIATION", "INHERITANCE"}:
+            return None
+    return None
 
 
 def _normalize_edge_table_name(value: Optional[str]) -> str:
@@ -305,6 +336,7 @@ def _find_blueprint_relation_recommendation(
                 "relation_name": item.get("relationName"),
                 "source_entity_name": item.get("sourceEntityName"),
                 "target_entity_name": item.get("targetEntityName"),
+                "relation_cardinality": item.get("relationCardinality") or item.get("relation_cardinality") or item.get("cardinality"),
                 "evidence_tables": item.get("evidenceTables") or [],
                 "source_table": item.get("sourceTable") or "",
                 "target_table": item.get("targetTable") or "",
@@ -595,6 +627,12 @@ def _build_relation_mapping_draft(
         or relation_recommendation.get("joinCondition")
         or ""
     ).strip()
+    relation_cardinality = _normalize_relation_cardinality(
+        relation_recommendation.get("relation_cardinality")
+        or relation_recommendation.get("relationCardinality")
+        or relation_recommendation.get("cardinality"),
+        fallback=relation.relation_type,
+    )
     draft_edge_sql = str(
         relation_recommendation.get("edge_sql")
         or relation_recommendation.get("edgeSql")
@@ -623,6 +661,7 @@ def _build_relation_mapping_draft(
             )
 
     return {
+        "relation_cardinality": relation_cardinality,
         "source_table": source_table,
         "target_table": target_table,
         "join_condition": draft_join_condition,
@@ -695,6 +734,15 @@ def _find_latest_relation_task_recommendation(
         if not source_table or not target_table:
             continue
         return {
+            "relation_cardinality": _normalize_relation_cardinality(
+                recommendation.get("relation_cardinality")
+                or recommendation.get("relationCardinality")
+                or recommendation.get("cardinality")
+                or join_recommendation.get("relation_cardinality")
+                or join_recommendation.get("relationCardinality")
+                or join_recommendation.get("cardinality"),
+                fallback=relation.relation_type,
+            ),
             "source_table": source_table,
             "target_table": target_table,
             "join_condition": join_condition,
@@ -745,6 +793,12 @@ def _build_bulk_relation_mapping_result(
     source_table = source_vertex_table
     target_table = target_vertex_table
     join_condition = str(graph_relation_mapping.get("join_condition") or "").strip()
+    relation_cardinality = _normalize_relation_cardinality(
+        graph_relation_mapping.get("relation_cardinality")
+        or graph_relation_mapping.get("relationCardinality")
+        or graph_relation_mapping.get("cardinality"),
+        fallback=relation.relation_type,
+    )
     node_ready = bool(source_vertex_table and target_vertex_table and source_key_property and target_key_property)
     ready = bool(node_ready and source_table and target_table and join_condition)
 
@@ -752,6 +806,7 @@ def _build_bulk_relation_mapping_result(
         "relation_id": relation.relation_id,
         "relation_name": relation.relation_name,
         "relation_type": relation.relation_type,
+        "relation_cardinality": relation_cardinality,
         "relation_desc": relation.relation_desc,
         "edge_table_name": (
             graph_relation_mapping.get("edge_table_name")
@@ -781,6 +836,7 @@ def _build_bulk_relation_mapping_result(
         },
         "join_recommendation": {
             "join_condition": join_condition,
+            "relation_cardinality": relation_cardinality,
             "source_tables": graph_relation_mapping.get("source_tables") or source_data_tables + target_data_tables,
             "design_reason": graph_relation_mapping.get("design_reason") or "",
             "validated": bool(join_condition),
@@ -1027,6 +1083,10 @@ def _apply_mapping_for_relation(
     mapping.join_condition = mapping_payload.get("join_condition") or None
     mapping.edge_sql = mapping_payload.get("edge_sql") or None
     mapping.mapping_mode = (mapping_payload.get("mapping_mode") or "DIRECT").upper()
+    mapping.relation_cardinality = _normalize_relation_cardinality(
+        mapping_payload.get("relation_cardinality"),
+        fallback=relation.relation_type,
+    )
     mapping.relation_table = mapping_payload.get("relation_table") or None
     mapping.relation_source_column = mapping_payload.get("relation_source_column") or None
     mapping.relation_target_column = mapping_payload.get("relation_target_column") or None
@@ -2231,6 +2291,29 @@ def _relation_join_candidates(
 
     source_props = { (prop.property_name or "").strip().upper(): prop for prop in (relation.source_entity.properties or []) }
     target_props = { (prop.property_name or "").strip().upper(): prop for prop in (relation.target_entity.properties or []) }
+    target_props_by_id = {prop.property_id: prop for prop in (relation.target_entity.properties or []) if prop.property_id}
+    source_props_by_id = {prop.property_id: prop for prop in (relation.source_entity.properties or []) if prop.property_id}
+
+    for source_prop in (relation.source_entity.properties or []):
+        referenced = target_props_by_id.get(getattr(source_prop, "ref_property_id", None) or "")
+        if not referenced:
+            continue
+        source_mapping = getattr(source_prop, "mapping", None)
+        target_mapping = getattr(referenced, "mapping", None)
+        source_column = (getattr(source_mapping, "source_column", None) or source_prop.property_name or "").strip().upper()
+        target_column = (getattr(target_mapping, "source_column", None) or referenced.property_name or "").strip().upper()
+        add(source_column, target_column, 110, f"源实体属性“{source_prop.property_name}”明确引用目标实体属性“{referenced.property_name}”", "PROPERTY_REF")
+
+    for target_prop in (relation.target_entity.properties or []):
+        referenced = source_props_by_id.get(getattr(target_prop, "ref_property_id", None) or "")
+        if not referenced:
+            continue
+        source_mapping = getattr(referenced, "mapping", None)
+        target_mapping = getattr(target_prop, "mapping", None)
+        source_column = (getattr(source_mapping, "source_column", None) or referenced.property_name or "").strip().upper()
+        target_column = (getattr(target_mapping, "source_column", None) or target_prop.property_name or "").strip().upper()
+        add(source_column, target_column, 109, f"目标实体属性“{target_prop.property_name}”明确引用源实体属性“{referenced.property_name}”", "PROPERTY_REF")
+
     for property_name in set(source_props).intersection(target_props):
         source_prop, target_prop = source_props[property_name], target_props[property_name]
         source_mapping, target_mapping = getattr(source_prop, "mapping", None), getattr(target_prop, "mapping", None)
@@ -2325,6 +2408,11 @@ async def get_relation_mapping(
         "mapping_id": mapping.mapping_id if mapping else "",
         "relation_id": relation.relation_id,
         "edge_table_name": relation.relation_table_name or "",
+        "relation_cardinality": (
+            _normalize_relation_cardinality(mapping.relation_cardinality, fallback=relation.relation_type)
+            if mapping else
+            (draft.get("relation_cardinality") or _normalize_relation_cardinality(relation.relation_type))
+        ),
         "source_table": mapping.source_table if mapping and mapping.source_table else draft.get("source_table", ""),
         "target_table": mapping.target_table if mapping and mapping.target_table else draft.get("target_table", ""),
         "join_condition": mapping.join_condition if mapping and mapping.join_condition else draft.get("join_condition", ""),
@@ -2362,11 +2450,9 @@ async def create_relation_mapping(
     if not relation:
         raise HTTPException(status_code=404, detail="关系不存在")
     _ensure_relation_access(db, current_user, relation)
-    has_mapping_content = (
-        bool(req.relation_table and req.relation_source_column and req.relation_target_column)
-        if (req.mapping_mode or "DIRECT").upper() == "RELATION_TABLE"
-        else bool(req.source_table and req.target_table and req.join_condition)
-    )
+    normalized_cardinality = _normalize_relation_cardinality(req.relation_cardinality, fallback=relation.relation_type)
+    if req.relation_cardinality and not normalized_cardinality:
+        raise HTTPException(status_code=400, detail="关系基数仅支持 ONE_TO_ONE / ONE_TO_MANY / MANY_TO_ONE / MANY_TO_MANY")
     mapping = SysRelationMapping(
         mapping_id=generate_id("rmap"),
         relation_id=relation_id,
@@ -2375,12 +2461,14 @@ async def create_relation_mapping(
         join_condition=req.join_condition,
         edge_sql=req.edge_sql,
         mapping_mode=(req.mapping_mode or "DIRECT").upper(),
+        relation_cardinality=normalized_cardinality,
         relation_table=req.relation_table,
         relation_source_column=req.relation_source_column,
         relation_target_column=req.relation_target_column,
         edge_property_columns_json=req.edge_property_columns_json,
-        mapping_status="STALE" if has_mapping_content else "PENDING"
+        mapping_status="PENDING"
     )
+    mapping.mapping_status = "STALE" if _is_relation_mapping_ddl_ready(mapping) else "PENDING"
     db.add(mapping)
     _set_relation_edge_table_name(db, relation, req.edge_table_name)
     db.commit()
@@ -2408,6 +2496,11 @@ async def update_relation_mapping(
 
     payload = req.model_dump(exclude_unset=True)
     edge_table_name = payload.pop("edge_table_name", None)
+    if "relation_cardinality" in payload:
+        normalized_cardinality = _normalize_relation_cardinality(payload.get("relation_cardinality"), fallback=relation.relation_type)
+        if payload.get("relation_cardinality") and not normalized_cardinality:
+            raise HTTPException(status_code=400, detail="关系基数仅支持 ONE_TO_ONE / ONE_TO_MANY / MANY_TO_ONE / MANY_TO_MANY")
+        payload["relation_cardinality"] = normalized_cardinality
     if "edge_table_name" in req.model_fields_set:
         _set_relation_edge_table_name(db, relation, edge_table_name)
     for field, value in payload.items():

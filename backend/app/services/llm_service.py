@@ -42,6 +42,36 @@ class LLMService:
         self.db = db
 
     @staticmethod
+    def _infer_object_type(entity_name: str, entity_desc: str = "") -> Optional[str]:
+        sample = f"{entity_name} {entity_desc}".upper()
+        fact_tokens = ["ORDER", "EVENT", "RECORD", "LOG", "HISTORY", "TRANSACTION", "REFUND", "MEASURE", "RESULT", "工单", "事件", "记录", "履历", "交易", "订单", "测量", "结果"]
+        dim_tokens = ["STORE", "CUSTOMER", "DEVICE", "PRODUCT", "LINE", "MATERIAL", "WAREHOUSE", "REGION", "客户", "门店", "设备", "产品", "产线", "物料", "仓库", "区域"]
+        if any(token in sample for token in fact_tokens):
+            return "FACT"
+        if any(token in sample for token in dim_tokens):
+            return "DIM"
+        return None
+
+    def _normalize_object_type(self, value: Optional[str], entity_name: str, entity_desc: str = "") -> Optional[str]:
+        token = str(value or "").strip().upper()
+        if token in {"FACT", "DIM"}:
+            return token
+        return self._infer_object_type(entity_name, entity_desc)
+
+    @staticmethod
+    def _normalize_usage_list(value: Any) -> List[str]:
+        raw_items = value if isinstance(value, list) else [value] if value else []
+        normalized: List[str] = []
+        seen = set()
+        for item in raw_items:
+            token = str(item or "").strip().lower()
+            if token not in {"find", "fetch", "analyze"} or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        return normalized
+
+    @staticmethod
     def _build_verified_direct_relation_candidates(
         ontology_entities: List[Dict[str, Any]],
         ontology_relations: List[Dict[str, Any]],
@@ -531,6 +561,7 @@ class LLMService:
       "sourceEntityName": "源本体对象名称",
       "targetEntityName": "目标本体对象名称",
       "edgeTableName": "ONTO_EDGE_关系名",
+      "relationCardinality": "ONE_TO_MANY",
       "sourceTables": ["关系证据源表"],
       "joinCondition": "关系实现条件",
       "edgeSql": "SELECT ... AS EDGE_ID, ... AS SOURCE_ID, ... AS TARGET_ID ...",
@@ -754,6 +785,12 @@ class LLMService:
                     item.get("sourceTables") or item.get("source_tables") or
                     [item.get("source_table") for item in verified_candidates if item.get("source_table")]
                 ),
+                "relation_cardinality": self._normalize_relation_cardinality(
+                    item.get("relationCardinality")
+                    or item.get("relation_cardinality")
+                    or item.get("cardinality"),
+                    fallback=relation.get("relation_type"),
+                ),
                 "join_condition": join_condition,
                 "edge_sql": edge_sql,
                 "design_reason": str(item.get("designReason") or item.get("design_reason") or "").strip() or (
@@ -782,6 +819,10 @@ class LLMService:
                     value=None,
                 ),
                 "source_tables": self._normalize_source_table_names([candidate.get("source_table")]),
+                "relation_cardinality": self._normalize_relation_cardinality(
+                    candidate.get("relation_cardinality"),
+                    fallback=relation.get("relation_type"),
+                ),
                 "join_condition": candidate["join_condition"],
                 "edge_sql": "",
                 "design_reason": candidate.get("reason") or "",
@@ -903,6 +944,27 @@ class LLMService:
             if token and token not in result:
                 result.append(token)
         return result
+
+    def _normalize_relation_cardinality(self, value: Any, *, fallback: Any = None) -> str:
+        aliases = {
+            "ONE2ONE": "ONE_TO_ONE",
+            "ONE2MANY": "ONE_TO_MANY",
+            "MANY2ONE": "MANY_TO_ONE",
+            "MANY2MANY": "MANY_TO_MANY",
+            "1_TO_1": "ONE_TO_ONE",
+            "1_TO_N": "ONE_TO_MANY",
+            "N_TO_1": "MANY_TO_ONE",
+            "N_TO_N": "MANY_TO_MANY",
+        }
+        allowed = {"ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY"}
+        for candidate in (value, fallback):
+            token = re.sub(r"[^A-Z0-9]+", "_", str(candidate or "").strip().upper()).strip("_")
+            if not token:
+                continue
+            normalized = aliases.get(token, token)
+            if normalized in allowed:
+                return normalized
+        return ""
 
     async def select_relevant_tables_for_mapping(
         self,
@@ -2909,6 +2971,11 @@ class LLMService:
                         "dataType": (prop.get("dataType") or prop.get("data_type") or "VARCHAR2").strip().upper(),
                         "isPrimaryKey": "Y" if str(prop.get("isPrimaryKey") or prop.get("is_primary_key") or "N").upper() == "Y" else "N",
                         "isNullable": "N" if str(prop.get("isNullable") or prop.get("is_nullable") or "Y").upper() == "N" else "Y",
+                        "unit": str(prop.get("unit") or "").strip(),
+                        "valueConstraint": str(prop.get("valueConstraint") or prop.get("value_constraint") or "").strip(),
+                        "usage": self._normalize_usage_list(prop.get("usage") or prop.get("usageCodes") or prop.get("usage_codes")),
+                        "isRequiredFilter": "Y" if str(prop.get("isRequiredFilter") or prop.get("is_required_filter") or "N").upper() == "Y" else "N",
+                        "ref": prop.get("ref") or prop.get("refProperty") or prop.get("ref_property") or prop.get("refPropertyId") or prop.get("ref_property_id"),
                         "sourceTable": source_table,
                         "sourceColumn": str(prop.get("sourceColumn") or prop.get("source_column") or "").strip().upper(),
                         "sourceDataType": str(prop.get("sourceDataType") or prop.get("source_data_type") or "").strip().upper(),
@@ -2929,8 +2996,16 @@ class LLMService:
                 "entityName": entity_name,
                 "entityDisplayName": raw_display_name or entity_name,
                 "entityDesc": (item.get("entityDesc") or item.get("entity_desc") or "").strip(),
+                "objectType": self._normalize_object_type(
+                    item.get("objectType") or item.get("object_type"),
+                    entity_name,
+                    (item.get("entityDesc") or item.get("entity_desc") or "").strip(),
+                ),
                 "buildType": build_type,
                 "sourceHints": source_hints,
+                "governanceInfo": item.get("governanceInfo") if isinstance(item.get("governanceInfo"), dict) else (
+                    item.get("governance_info") if isinstance(item.get("governance_info"), dict) else {}
+                ),
                 "properties": properties,
             }
             entities.append(entity)

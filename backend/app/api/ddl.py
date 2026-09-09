@@ -265,10 +265,12 @@ def _relation_mapping_is_complete(mapping: Optional[SysRelationMapping]) -> bool
 def _effective_relation_mapping(db: Session, relation: SysOntologyRelation) -> dict:
     """Return persisted mapping, augmented with the latest verified task draft."""
     mapping = getattr(relation, "relation_mapping", None)
+    default_cardinality = (relation.relation_type or "").strip().upper() or None
     if _relation_mapping_is_complete(mapping):
         return {
             "mapping_id": mapping.mapping_id,
             "relation_id": mapping.relation_id,
+            "relation_cardinality": mapping.relation_cardinality or default_cardinality,
             "source_table": mapping.source_table,
             "target_table": mapping.target_table,
             "join_condition": mapping.join_condition,
@@ -282,9 +284,11 @@ def _effective_relation_mapping(db: Session, relation: SysOntologyRelation) -> d
         }
     recommendation = _find_latest_relation_task_recommendation(db, relation)
     if recommendation:
+        recommended_cardinality = recommendation.get("relation_cardinality") or (mapping.relation_cardinality if mapping else default_cardinality)
         return {
             "mapping_id": mapping.mapping_id if mapping else "",
             "relation_id": relation.relation_id,
+            "relation_cardinality": recommended_cardinality,
             "source_table": recommendation.get("source_table"),
             "target_table": recommendation.get("target_table"),
             "join_condition": recommendation.get("join_condition"),
@@ -299,6 +303,7 @@ def _effective_relation_mapping(db: Session, relation: SysOntologyRelation) -> d
     return {
         "mapping_id": mapping.mapping_id if mapping else "",
         "relation_id": relation.relation_id,
+        "relation_cardinality": (mapping.relation_cardinality if mapping else None) or default_cardinality,
         "source_table": mapping.source_table if mapping else "",
         "target_table": mapping.target_table if mapping else "",
         "join_condition": mapping.join_condition if mapping else "",
@@ -331,6 +336,7 @@ def _sync_verified_relation_recommendations(db: Session, relations: list[SysOnto
         mapping.join_condition = recommendation.get("join_condition") or None
         mapping.edge_sql = None
         mapping.mapping_mode = "DIRECT"
+        mapping.relation_cardinality = recommendation.get("relation_cardinality") or mapping.relation_cardinality
         mapping.relation_table = None
         mapping.relation_source_column = None
         mapping.relation_target_column = None

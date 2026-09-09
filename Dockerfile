@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx curl wget unzip vim-tiny \
+    && apt-get install -y --no-install-recommends nginx bash curl wget unzip vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -nc https://download.oracle.com/java/21/latest/jdk-21_linux-x64_bin.deb && \

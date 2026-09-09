@@ -118,7 +118,7 @@
                 />
                 <text x="80" y="22" text-anchor="middle" fill="#fff" font-size="13" font-weight="bold">{{ node.displayName || node.name }}</text>
                 <text x="80" y="40" text-anchor="middle" fill="rgba(255,255,255,0.9)" font-size="11">{{ node.name }}</text>
-                <text x="80" y="58" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="9">{{ node.buildType }} | 属性:{{ node.propertiesCount || 0 }}</text>
+                <text x="80" y="58" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="9">{{ formatObjectType(node.objectType) }} | {{ node.buildType }} | 属性:{{ node.propertiesCount || 0 }}</text>
                 <g
                   v-if="selectedNode?.id === node.id"
                   class="graph-connector"
@@ -142,9 +142,21 @@
           </h4>
           <div class="entity-info">
             <p><strong>实体名称:</strong> {{ selectedNode.name }}</p>
-            <p><strong>构建方式:</strong> TABLE/VIEW</p>
+            <p><strong>对象类型:</strong> {{ formatObjectType(selectedNode.objectType) }}</p>
+            <p><strong>构建方式:</strong> {{ selectedNode.buildType || '-' }}</p>
             <p><strong>状态:</strong>
               <el-tag :type="selectedNode.status === 'DEPLOYED' ? 'success' : 'info'" size="small">{{ selectedNode.status }}</el-tag>
+            </p>
+            <p v-if="selectedNode.governanceStatus"><strong>治理状态:</strong>
+              <el-tag size="small" effect="plain">{{ selectedNode.governanceStatus }}</el-tag>
+            </p>
+            <p v-if="selectedNode.dataOwner"><strong>数据负责人:</strong> {{ selectedNode.dataOwner }}</p>
+            <p v-if="selectedNode.securityLevel"><strong>安全级别:</strong> {{ selectedNode.securityLevel }}</p>
+            <p v-if="selectedNode.updateFrequency"><strong>更新频率:</strong> {{ selectedNode.updateFrequency }}</p>
+            <p v-if="selectedNode.governanceTags?.length"><strong>标签:</strong>
+              <span class="entity-tag-list">
+                <el-tag v-for="tag in selectedNode.governanceTags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+              </span>
             </p>
             <p v-if="selectedNode.dataSupportStatus"><strong>数据支撑:</strong>
               <el-tag :type="selectedNode.dataSupportStatus === 'DATA_SUPPORTED' ? 'success' : 'info'" size="small">
@@ -161,16 +173,29 @@
               <el-button type="primary" size="small" @click="showAddProperty">+ 添加属性</el-button>
             </div>
             <div v-for="prop in selectedNodeProperties" :key="prop.property_id" class="prop-item">
-              <span class="prop-name">{{ prop.property_name }}</span>
-              <span class="prop-type">{{ prop.data_type }}</span>
-              <el-tag v-if="prop.is_primary_key === 'Y'" type="danger" size="small">PK</el-tag>
-              <span class="prop-desc">{{ prop.property_display_name || prop.property_desc }}</span>
-              <el-button size="small" type="primary" link @click="showEditProperty(prop)">修改</el-button>
-              <el-popconfirm title="确定删除此属性?" @confirm="deleteProperty(prop.property_id)">
-                <template #reference>
-                  <el-button size="small" type="danger" :icon="Delete" circle />
-                </template>
-              </el-popconfirm>
+              <div class="prop-main">
+                <div class="prop-title-row">
+                  <span class="prop-name">{{ prop.property_name }}</span>
+                  <span class="prop-type">{{ prop.data_type }}</span>
+                  <el-tag v-if="prop.is_primary_key === 'Y'" type="danger" size="small">PK</el-tag>
+                  <el-tag v-if="prop.is_required_filter === 'Y'" type="warning" size="small">必带过滤</el-tag>
+                </div>
+                <div class="prop-chip-row">
+                  <el-tag v-if="prop.unit" size="small" effect="plain">单位 {{ prop.unit }}</el-tag>
+                  <el-tag v-for="usage in prop.usage_codes || []" :key="usage" size="small" effect="plain">{{ usage }}</el-tag>
+                  <el-tag v-if="prop.ref_display" size="small" effect="plain">ref {{ prop.ref_display }}</el-tag>
+                </div>
+                <div class="prop-desc">{{ prop.property_display_name || prop.property_desc || '无说明' }}</div>
+                <div v-if="prop.value_constraint" class="prop-meta">约束: {{ prop.value_constraint }}</div>
+              </div>
+              <div class="prop-actions">
+                <el-button size="small" type="primary" link @click="showEditProperty(prop)">修改</el-button>
+                <el-popconfirm title="确定删除此属性?" @confirm="deleteProperty(prop.property_id)">
+                  <template #reference>
+                    <el-button size="small" type="danger" :icon="Delete" circle />
+                  </template>
+                </el-popconfirm>
+              </div>
             </div>
           </div>
           <el-button type="primary" size="small" plain style="margin-top:12px;width:100%" @click="openEntityEditor(selectedNode)">编辑实体</el-button>
@@ -431,16 +456,41 @@
       </div>
     </div>
 
-    <el-dialog v-model="entityDialogVisible" :title="entityDialogMode === 'edit' ? '编辑本体实体' : '添加本体实体'" width="500px">
+    <el-dialog v-model="entityDialogVisible" :title="entityDialogMode === 'edit' ? '编辑本体实体' : '添加本体实体'" width="640px">
       <el-form :model="entityForm" label-width="100px">
         <el-form-item label="实体名称"><el-input v-model="entityForm.entity_name" placeholder="英文名称，如DefectRecord" /></el-form-item>
         <el-form-item label="显示名称"><el-input v-model="entityForm.entity_display_name" placeholder="中文名称，如缺陷记录" /></el-form-item>
         <el-form-item label="描述"><el-input v-model="entityForm.entity_desc" type="textarea" :rows="2" /></el-form-item>
+        <el-form-item label="对象类型" required>
+          <el-select v-model="entityForm.object_type" placeholder="选择对象类型" style="width: 100%">
+            <el-option v-for="item in objectTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="构建方式">
           <el-radio-group v-model="entityForm.build_type">
             <el-radio value="TABLE">Management Table</el-radio>
             <el-radio value="VIEW">Management View</el-radio>
           </el-radio-group>
+        </el-form-item>
+        <el-divider content-position="left">治理信息</el-divider>
+        <el-form-item label="治理状态">
+          <el-select v-model="entityForm.governance_status" clearable placeholder="例如 ACTIVE" style="width: 100%">
+            <el-option v-for="item in governanceStatusOptions" :key="item" :label="item" :value="item" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="数据负责人"><el-input v-model="entityForm.data_owner" placeholder="例如 交易数据组" /></el-form-item>
+        <el-form-item label="安全级别">
+          <el-select v-model="entityForm.security_level" clearable allow-create filterable placeholder="例如 L2" style="width: 100%">
+            <el-option v-for="item in securityLevelOptions" :key="item" :label="item" :value="item" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="更新频率">
+          <el-select v-model="entityForm.update_frequency" clearable allow-create filterable placeholder="例如 T+1" style="width: 100%">
+            <el-option v-for="item in updateFrequencyOptions" :key="item" :label="item" :value="item" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="标签">
+          <el-select v-model="entityForm.governance_tags" multiple clearable allow-create filterable default-first-option placeholder="输入后回车，例如 核心" style="width: 100%" />
         </el-form-item>
         <el-form-item label="图标颜色">
           <el-color-picker v-model="entityForm.color" />
@@ -494,12 +544,12 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="propertyDialogVisible" :title="propertyDialogMode === 'edit' ? '修改本体属性' : '添加本体属性'" width="500px">
+    <el-dialog v-model="propertyDialogVisible" :title="propertyDialogMode === 'edit' ? '修改本体属性' : '添加本体属性'" width="640px">
       <el-form :model="propertyForm" label-width="100px">
         <el-form-item label="属性名称"><el-input v-model="propertyForm.property_name" placeholder="英文名如defect_id" /></el-form-item>
         <el-form-item label="显示名称"><el-input v-model="propertyForm.property_display_name" placeholder="中文名如缺陷ID" /></el-form-item>
         <el-form-item label="数据类型">
-          <el-select v-model="propertyForm.data_type">
+          <el-select v-model="propertyForm.data_type" style="width: 100%">
             <el-option label="VARCHAR2" value="VARCHAR2" />
             <el-option label="NUMBER" value="NUMBER" />
             <el-option label="NUMBER(10)" value="NUMBER(10)" />
@@ -511,6 +561,19 @@
         </el-form-item>
         <el-form-item label="是否主键"><el-switch v-model="propertyForm.is_primary_key" active-value="Y" inactive-value="N" /></el-form-item>
         <el-form-item label="是否可空"><el-switch v-model="propertyForm.is_nullable" active-value="Y" inactive-value="N" /></el-form-item>
+        <el-form-item label="单位"><el-input v-model="propertyForm.unit" placeholder="例如 CNY / PCS / ms" /></el-form-item>
+        <el-form-item label="值域约束"><el-input v-model="propertyForm.value_constraint" placeholder="例如 >= 0" /></el-form-item>
+        <el-form-item label="用途">
+          <el-select v-model="propertyForm.usage_codes" multiple clearable placeholder="选择属性用途" style="width: 100%">
+            <el-option v-for="item in propertyUsageOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="必带过滤"><el-switch v-model="propertyForm.is_required_filter" active-value="Y" inactive-value="N" /></el-form-item>
+        <el-form-item label="引用属性">
+          <el-select v-model="propertyForm.ref_property_id" clearable filterable placeholder="例如 Store.storeId" style="width: 100%">
+            <el-option v-for="item in propertyRefOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="描述"><el-input v-model="propertyForm.property_desc" /></el-form-item>
       </el-form>
       <template #footer>
@@ -1410,6 +1473,19 @@ interface GuideModelOption {
   is_default?: string
 }
 
+const objectTypeOptions = [
+  { value: 'FACT', label: '事实 FACT' },
+  { value: 'DIM', label: '维度 DIM' }
+]
+const governanceStatusOptions = ['ACTIVE', 'INACTIVE', 'DEPRECATED']
+const securityLevelOptions = ['L1', 'L2', 'L3', 'L4']
+const updateFrequencyOptions = ['REALTIME', 'T+1', 'DAILY', 'WEEKLY', 'MONTHLY']
+const propertyUsageOptions = [
+  { value: 'find', label: 'find' },
+  { value: 'fetch', label: 'fetch' },
+  { value: 'analyze', label: 'analyze' }
+]
+
 const route = useRoute()
 const appStore = useAppStore()
 const loading = ref(false)
@@ -1424,6 +1500,7 @@ const currentBusinessTypeName = ref('')
 const currentBusinessTypeDesc = ref('')
 const graphNodes = ref<any[]>([])
 const graphEdges = ref<any[]>([])
+const domainEntityCatalog = ref<any[]>([])
 const dataSupportByEntityName = ref<Record<string, { status: string; reason: string }>>({})
 const hasDataSupportClassification = computed(() => Object.keys(dataSupportByEntityName.value).length > 0)
 const selectedNode = ref<any>(null)
@@ -1643,6 +1720,22 @@ const graphRenderedHeight = computed(() => Math.round(graphCanvasHeight.value * 
 const GRAPH_ZOOM_MIN = 0.2
 const GRAPH_ZOOM_MAX = 2
 const GRAPH_ZOOM_STEP = 0.1
+const formatObjectType = (value?: string) => {
+  const token = String(value || '').trim().toUpperCase()
+  if (token === 'FACT') return 'FACT'
+  if (token === 'DIM') return 'DIM'
+  return '未定义'
+}
+const propertyRefOptions = computed(() =>
+  domainEntityCatalog.value.flatMap((entity: any) =>
+    (entity.properties || [])
+      .filter((prop: any) => prop.property_id !== editingPropertyId.value)
+      .map((prop: any) => ({
+        value: prop.property_id,
+        label: `${entity.entity_name}.${prop.property_name}${prop.property_display_name ? ` | ${prop.property_display_name}` : ''}`
+      }))
+  )
+)
 // The canvas grows with the lowest entity.  The surrounding viewport remains
 // fixed and scrollable, so entities below the first screen are still reachable.
 const graphCanvasHeight = computed(() => {
@@ -2199,13 +2292,15 @@ const connectSelectedFlowNodes = () => {
 const loadGraphData = async () => {
   if (!currentDomainId.value) return
   try {
-    const [res, blueprintRes] = await Promise.all([
+    const [res, blueprintRes, entityRes] = await Promise.all([
       graphApi.getOntologyGraph(currentDomainId.value),
       // 数据补全结果可能不是当前“最新”蓝图；必须按生成阶段单独查询，
       // 否则后续的一体化/逻辑设计会覆盖图谱中的数据支撑着色依据。
       mappingApi.getLatestDataSupportBlueprint(currentDomainId.value).catch(() => ({ data: null })),
+      entityApi.list(currentDomainId.value).catch(() => ({ data: [] })),
     ])
     const latestBlueprint = blueprintRes.data || {}
+    domainEntityCatalog.value = entityRes.data || []
     const supportIndex: Record<string, { status: string; reason: string }> = {}
     for (const entity of latestBlueprint.entities || []) {
       const entityName = String(entity?.entity_name || entity?.entityName || '').trim().toLowerCase()
@@ -3020,6 +3115,7 @@ const resetDomainState = () => {
   selectedNodeProperties.value = []
   graphNodes.value = []
   graphEdges.value = []
+  domainEntityCatalog.value = []
   processes.value = []
   flowConfigNode.value = null
   guideDialogVisible.value = false
@@ -3038,9 +3134,33 @@ const resetDomainState = () => {
 }
 
 // ========== Dialogs ==========
-const createEmptyEntityForm = () => ({ entity_name: '', entity_display_name: '', entity_desc: '', build_type: 'TABLE', color: '#66bb6a' })
+const createEmptyEntityForm = () => ({
+  entity_name: '',
+  entity_display_name: '',
+  entity_desc: '',
+  object_type: 'DIM',
+  build_type: 'TABLE',
+  governance_status: 'ACTIVE',
+  data_owner: '',
+  security_level: 'L2',
+  update_frequency: 'T+1',
+  governance_tags: [] as string[],
+  color: '#66bb6a'
+})
 const createEmptyRelationForm = () => ({ source_entity_id: '', target_entity_id: '', relation_name: '', relation_type: 'ASSOCIATION', relation_desc: '', relation_table_name: '' })
-const createEmptyPropertyForm = () => ({ property_name: '', property_display_name: '', data_type: 'VARCHAR2', is_primary_key: 'N', is_nullable: 'Y', property_desc: '' })
+const createEmptyPropertyForm = () => ({
+  property_name: '',
+  property_display_name: '',
+  data_type: 'VARCHAR2',
+  is_primary_key: 'N',
+  is_nullable: 'Y',
+  unit: '',
+  value_constraint: '',
+  usage_codes: [] as string[],
+  is_required_filter: 'N',
+  ref_property_id: '',
+  property_desc: ''
+})
 
 const showAddEntity = () => {
   entityDialogMode.value = 'create'
@@ -3070,6 +3190,11 @@ const showEditProperty = (prop: any) => {
     data_type: prop.data_type || 'VARCHAR2',
     is_primary_key: prop.is_primary_key || 'N',
     is_nullable: prop.is_nullable || 'Y',
+    unit: prop.unit || '',
+    value_constraint: prop.value_constraint || '',
+    usage_codes: prop.usage_codes || [],
+    is_required_filter: prop.is_required_filter || 'N',
+    ref_property_id: prop.ref_property_id || '',
     property_desc: prop.property_desc || ''
   }
   propertyDialogVisible.value = true
@@ -3084,7 +3209,13 @@ const openEntityEditor = (node: any) => {
     entity_name: node.name || '',
     entity_display_name: node.displayName || '',
     entity_desc: node.desc || '',
+    object_type: node.objectType || 'DIM',
     build_type: node.buildType || 'TABLE',
+    governance_status: node.governanceStatus || 'ACTIVE',
+    data_owner: node.dataOwner || '',
+    security_level: node.securityLevel || '',
+    update_frequency: node.updateFrequency || '',
+    governance_tags: node.governanceTags || [],
     color: node.color || '#66bb6a'
   }
   entityDialogVisible.value = true
@@ -3108,6 +3239,7 @@ const openRelationEditor = (edge: any) => {
 
 const saveEntity = async () => {
   if (!currentDomainId.value) { ElMessage.warning('请先选择业务分析域'); return }
+  if (!entityForm.value.object_type) { ElMessage.warning('请选择对象类型'); return }
   loading.value = true
   try {
     if (entityDialogMode.value === 'edit' && editingEntityId.value) {
@@ -3542,12 +3674,17 @@ onBeforeUnmount(() => {
 .property-panel h4 { color: #1a3a5c; margin-bottom: 12px; }
 .entity-info { font-size: 13px; color: #666; margin-bottom: 16px; }
 .entity-info p { margin: 3px 0; }
+.entity-tag-list { display: inline-flex; flex-wrap: wrap; gap: 4px; vertical-align: middle; margin-left: 4px; }
 .property-list h5 { margin: 8px 0; font-size: 14px; }
 .property-list-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-.prop-item { display: flex; align-items: center; gap: 6px; padding: 5px 0; font-size: 12px; border-bottom: 1px solid #f0f0f0; }
+.prop-item { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 8px 0; font-size: 12px; border-bottom: 1px solid #f0f0f0; }
+.prop-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.prop-title-row, .prop-chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .prop-name { color: #333; font-weight: 500; }
 .prop-type { color: #999; font-family: monospace; font-size: 11px; }
-.prop-desc { color: #666; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop-desc { color: #666; line-height: 1.5; }
+.prop-meta { color: #8a6c2f; font-size: 11px; line-height: 1.4; }
+.prop-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
 
 .guide-dialog { display: flex; flex-direction: column; gap: 14px; }
 .guide-banner { display: flex; justify-content: space-between; gap: 16px; padding: 14px 16px; background: linear-gradient(135deg, #f7fbff 0%, #eef5ff 100%); border: 1px solid #d6e5ff; border-radius: 12px; }

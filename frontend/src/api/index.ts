@@ -260,6 +260,7 @@ export const agentApi = {
   testManagedSkill: (managedSkillId: string, data: any) => api.post(`/agent/managed-skills/${managedSkillId}/test`, data),
   listPropertyGraphs: (domainId: string, sourceId: string, schema?: string) =>
     api.get(`/agent/domains/${domainId}/property-graphs`, { params: { source_id: sourceId, schema } }),
+  getAnalysisSemantics: (domainId: string) => api.get(`/agent/domains/${domainId}/analysis-semantics`),
   getSkill: (skillId: string) => api.get(`/agent/skills/${skillId}`),
   createSkill: (domainId: string, data: any) => api.post(`/agent/domains/${domainId}/skills`, data),
   updateSkill: (skillId: string, data: any) => api.put(`/agent/skills/${skillId}`, data),
