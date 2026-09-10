@@ -26,10 +26,15 @@ from app.models.models import (
     SysProcessDef,
     generate_id,
 )
+from app.services.agent_runtime import ManagedSkillTestOrchestrator, extract_execution_events, replay_execution_events
 from app.services.llm_service import LLMService, normalize_model_name
 from app.services.source_data_service import SourceDataService
 
 MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX = 1000
+MANAGED_SKILL_TEST_PLAN_MAX_STEPS = 10
+MANAGED_SKILL_TEST_PLAN_MAX_TARGETS = 4
+MANAGED_SKILL_TEST_PLAN_MAX_PATH_DEPTH = 4
+MANAGED_SKILL_TEST_PLAN_MAX_PROPERTIES = 8
 DEFAULT_SKILL_ANALYSIS_MODES = ["DEFECT_ANALYSIS", "ROOT_CAUSE", "IMPACT_INFERENCE"]
 ALLOWED_SKILL_ANALYSIS_MODES = {
     "DEFECT_ANALYSIS",
@@ -45,6 +50,37 @@ SKILL_ANALYSIS_MODE_OPTIONS = [
     {"value": "TRACEBACK", "label": "追溯分析", "description": "根据码、批次或单据做上下游链路追溯。"},
     {"value": "MIXED", "label": "综合分析", "description": "允许 Agent 组合缺陷、根因和影响推断策略。"},
 ]
+REFERENCE_LABEL_ALIAS_LEXICON = {
+    "BOTTLECODE": ["瓶码", "瓶码记录", "瓶身码"],
+    "PACKCODE": ["包码", "中包码"],
+    "CASECODE": ["箱码", "外箱码"],
+    "PALLETCODE": ["托码", "托盘码"],
+    "STACKCODE": ["垛码"],
+    "OUTBOUNDORDER": ["出库单", "出库记录", "出库订单"],
+    "DISTRIBUTOR": ["经销商", "渠道商"],
+    "FACTORY": ["工厂", "生产工厂", "厂区"],
+    "QUALITYINSPECTION": ["质检", "质检记录", "检验", "检验记录"],
+    "PRODUCTIONBATCH": ["批次", "生产批次"],
+    "MATERIAL": ["物料", "原料"],
+    "DEVICE": ["设备", "机台"],
+    "PROCESS": ["工艺", "工序"],
+}
+REFERENCE_PROPERTY_ALIAS_LEXICON = {
+    "NAME": ["名称", "名字"],
+    "CODE": ["编码", "代码"],
+    "NO": ["编号", "单号", "号码"],
+    "ID": ["标识", "主键"],
+    "TIME": ["时间", "时刻"],
+    "DATE": ["日期", "时间"],
+    "RESULT": ["结果", "结论"],
+    "STATUS": ["状态"],
+    "COUNT": ["数量", "总数"],
+    "QTY": ["数量"],
+    "QUANTITY": ["数量"],
+    "RATE": ["比率", "比例", "占比"],
+    "RATIO": ["比率", "比例", "占比"],
+    "PERCENT": ["百分比", "占比", "比例"],
+}
 ANALYSIS_SCENARIO_TEMPLATES = [
     {
         "scenario_code": "QUALITY_DEFECT",
@@ -119,6 +155,7 @@ class AgentService:
         self.db = db
         self.source_service = SourceDataService(db)
         self.llm_service = LLMService(db)
+        self.managed_skill_test_orchestrator = ManagedSkillTestOrchestrator(self)
 
     def get_analysis_semantics(self, domain_id: str) -> Dict[str, Any]:
         entities = self.db.query(SysOntologyEntity).filter(
@@ -995,196 +1032,69 @@ class AgentService:
             raise ValueError("测试历史不存在")
         return self._serialize_managed_skill_test_session(session, include_result=True)
 
+    def start_managed_skill_test_session(
+        self,
+        managed_skill_id: str,
+        payload: Dict[str, Any],
+        created_by: str = "unknown",
+    ) -> Dict[str, Any]:
+        return self.managed_skill_test_orchestrator.start_session(
+            managed_skill_id,
+            payload,
+            created_by,
+        )
+
+    def get_managed_skill_test_session_owner_domain(self, session_id: str) -> Optional[str]:
+        session = self.db.query(SysManagedAgentSkillTestSession).filter(
+            SysManagedAgentSkillTestSession.session_id == session_id
+        ).first()
+        if not session:
+            raise ValueError("测试历史不存在")
+        managed_skill = self.db.query(SysManagedAgentSkill).filter(
+            SysManagedAgentSkill.managed_skill_id == session.managed_skill_id
+        ).first()
+        return managed_skill.domain_id if managed_skill else None
+
+    async def stream_managed_skill_test_events(
+        self,
+        session_id: str,
+        *,
+        turn_no: Optional[int] = None,
+        delay_ms: int = 0,
+    ):
+        session = self.db.query(SysManagedAgentSkillTestSession).filter(
+            SysManagedAgentSkillTestSession.session_id == session_id
+        ).first()
+        if not session:
+            raise ValueError("测试历史不存在")
+        result_payload = self._safe_json_loads(session.result_json, {})
+        events = extract_execution_events(result_payload, turn_no=turn_no)
+        return replay_execution_events(
+            events,
+            session_id=session_id,
+            turn_no=turn_no,
+            delay_ms=max(0, min(int(delay_ms or 0), 1000)),
+        )
+
+    async def stream_managed_skill_test_turn(
+        self,
+        managed_skill_id: str,
+        payload: Dict[str, Any],
+        created_by: str = "unknown",
+    ):
+        return self.managed_skill_test_orchestrator.stream_execute_turn(
+            managed_skill_id,
+            payload,
+            created_by,
+        )
+
     async def test_managed_skill(self, managed_skill_id: str, payload: Dict[str, Any], created_by: str = "unknown") -> Dict[str, Any]:
         """Use an uploaded Skill package with sampled, read-only source data for an agent test."""
-        managed_skill = self.db.query(SysManagedAgentSkill).filter(
-            SysManagedAgentSkill.managed_skill_id == managed_skill_id,
-            SysManagedAgentSkill.domain_id == payload.get("domain_id"),
-            SysManagedAgentSkill.status == "ACTIVE",
-        ).first()
-        if not managed_skill:
-            raise ValueError("托管 Skill 不存在或未启用")
-        llm_config = self._get_llm_config(payload.get("llm_config_id"), purpose="智能体测试")
-        skill_files = self._read_managed_skill_files(managed_skill)
-        skill_markdown = skill_files["SKILL.md"]
-        existing_session = None
-        requested_session_id = str(payload.get("session_id") or "").strip()
-        if requested_session_id:
-            existing_session = self.db.query(SysManagedAgentSkillTestSession).filter(
-                SysManagedAgentSkillTestSession.session_id == requested_session_id
-            ).first()
-            if not existing_session or existing_session.managed_skill_id != managed_skill_id:
-                raise ValueError("测试会话不存在，或不属于当前 Skill")
-        previous_response = self._safe_json_loads(existing_session.result_json, {}) if existing_session else {}
-        previous_turn_results = previous_response.get("turn_results", []) if isinstance(previous_response, dict) else []
-        if not isinstance(previous_turn_results, list):
-            previous_turn_results = []
-        raw_conversation_history = self._safe_json_loads(
-            existing_session.conversation_json, []
-        ) if existing_session else payload.get("conversation_history")
-        stored_conversation_history = self._normalize_conversation_history(raw_conversation_history, limit=None)
-        conversation_history = self._normalize_conversation_history(stored_conversation_history)
-        # 兼容本次升级前仅保存最后一轮结果的会话；更早轮次没有落库，无法可靠补建。
-        if existing_session and not previous_turn_results and isinstance(previous_response, dict) and previous_response.get("table_preview"):
-            previous_turn_results = [{
-                "turn_no": 1,
-                "user_message_no": len([item for item in stored_conversation_history if item.get("role") == "user"]) - 1,
-                "question": (previous_response.get("test_context") or {}).get("test_question", ""),
-                "table_preview": previous_response.get("table_preview", {}),
-                "agent_output": previous_response.get("agent_output", ""),
-                "execution_trace": previous_response.get("execution_trace", []),
-                "executed_queries": previous_response.get("executed_queries", []),
-                "warnings": previous_response.get("warnings", []),
-            }]
-        is_session_start = bool(payload.get("start_session"))
-        question = (payload.get("test_question") or "").strip()
-        if not question:
-            question = "请开始测试会话，说明你将如何依据已加载 Skill 对当前数据源进行分析，并等待我的问题。"
-        source = self.db.query(SysDataSource).filter(SysDataSource.source_id == payload["source_id"]).first()
-        if not source or source.business_domain_id != managed_skill.domain_id:
-            raise ValueError("所选对象数据库不属于当前 Skill 的业务分析域")
-        if not is_session_start and self._needs_question_clarification(question):
-            return self._save_managed_skill_clarification(
-                session=existing_session,
-                managed_skill=managed_skill,
-                source=source,
-                payload=payload,
-                question=question,
-                stored_conversation_history=stored_conversation_history,
-                previous_turn_results=previous_turn_results,
-                created_by=created_by,
-            )
-        topology = self.source_service.get_remote_property_graph_topology(
-            source_id=payload["source_id"], schema=payload.get("schema")
+        return await self.managed_skill_test_orchestrator.execute_turn(
+            managed_skill_id,
+            payload,
+            created_by,
         )
-        if not topology.get("graph_name") or not topology.get("nodes"):
-            raise ValueError("所选数据源没有可用 Oracle Property Graph，无法按本体属性执行图查询")
-        query_guidance = self._build_skill_query_guidance(skill_markdown, skill_files)
-        graph_plan = await self._plan_graph_query_from_topology(
-            question=question,
-            conversation_context=self._format_conversation_history(conversation_history),
-            topology=topology,
-            llm_config=llm_config,
-            skill_guidance=query_guidance,
-        )
-        if not graph_plan:
-            graph_plan = self._build_supply_chain_graph_plan(
-                question, topology, self._format_conversation_history(conversation_history)
-            )
-        if graph_plan:
-            selected_node = graph_plan["selection"]
-            graph_sql = graph_plan["sql"]
-        else:
-            selected_node = await self._select_managed_skill_graph_node(
-                skill_markdown=skill_markdown,
-                question=question,
-                llm_config=llm_config,
-                topology=topology,
-                skill_guidance=query_guidance,
-            )
-            graph_sql = self._build_graph_node_property_sql(
-                graph_name=topology["graph_name"],
-                node=selected_node,
-            )
-        graph_result = self.source_service.execute_remote_graph_query(
-            source_id=payload["source_id"],
-            graph_sql=graph_sql,
-            schema=payload.get("schema"),
-            row_limit=max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX)),
-        )
-        executed_sql = graph_sql
-        references = "\n\n".join(
-            f"## {path}\n{content}" for path, content in skill_files.items() if path != "SKILL.md"
-        )[:30000]
-        sample_rows = json.dumps(
-            graph_result.get("rows", [])[: max(1, min(int(payload.get("sample_limit") or 100), MANAGED_SKILL_TEST_SAMPLE_LIMIT_MAX))],
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
-        columns = json.dumps(graph_result.get("columns", [])[:30], ensure_ascii=False, indent=2, default=str)
-        system_prompt = """你是供应链数据分析智能体。严格遵守用户上传的 Skill：只依据给定 Skill、Oracle Property Graph 本体属性、只读查询结果和用户问题分析，不臆造字段、数据或查询结果。
-
-当前用户问题是本轮唯一需要回答的目标。历史对话仅用于解析“该瓶码”“继续”等指代，或寻找与当前问题直接相关的已知标识；不得复用历史问题的结论、SQL、字段或表格来代替当前问题的回答。若当前问题无法确定查询对象、关系或标识，直接提出简洁澄清问题，不能猜测或执行与上一轮相同的查询。
-
-平台会在你的文字回答前先以结构化表格展示本轮 SQL 返回数据。你的职责是在表格之后，严格按 Skill 要求解读数据、给出结论和可继续追问的问题；如果 Skill 未规定格式，则依次输出结论摘要、数据解读和建议追问。不要重复罗列整张原始数据表，也不要强制输出“风险与限制”章节。
-
-不得只罗列实例 ID；必须优先说明查询结果中实际返回的产品、批次、工厂、质检、码、仓储或渠道等本体业务属性。不要输出或建议任何写入、删除、DDL、权限或凭据操作。"""
-        user_prompt = f"""# 已加载 Skill
-{skill_markdown[:30000]}
-
-# Skill 参考文件
-{references or '无'}
-
-# 数据源上下文
-- 数据源：{source.source_name if source else payload['source_id']}
-- Oracle Property Graph：{topology.get('schema')}.{topology.get('graph_name')}
-- 本体查询对象：{selected_node.get('displayName')}（底层对象：{selected_node.get('tableName')}）
-- 当前用户问题：{question}
-
-# 历史对话（仅用于解析指代与寻找当前问题相关标识，不是本轮回答目标）
-{self._format_conversation_history(conversation_history) or '这是一次新会话，尚无历史消息。'}
-
-# 已执行的只读 SQL
-{executed_sql}
-
-# 可用字段
-{columns}
-
-# SQL 返回的数据样例
-{sample_rows}
-"""
-        agent_output = await self.llm_service.call_llm(
-            system_prompt, user_prompt, llm_config, timeout_override=max(llm_config.timeout, 120)
-        )
-        managed_skill.use_count = (managed_skill.use_count or 0) + 1
-        self.db.commit()
-        trace = [
-            {"step_no": 1, "stage": "SKILL_LOAD", "title": "加载上传 Skill", "status": "SUCCESS", "detail": f"已加载 SKILL.md 及 {len(skill_files) - 1} 个参考文件。"},
-            {"step_no": 2, "stage": "SEMANTIC_GUIDANCE_LOAD", "title": "加载指标规则活动语义", "status": "SUCCESS", "detail": "已向查询规划器和分析 Agent 提供 Skill 中的指标目录、规则目录、活动手册与分析策略。"},
-            {"step_no": 3, "stage": "ONTOLOGY_NODE_SELECTION", "title": "Agent 选择本体查询对象", "status": "SUCCESS", "detail": f"在属性图 {topology.get('graph_name')} 中选择 {selected_node.get('displayName')}。原因：{selected_node.get('reason')}"},
-            {"step_no": 4, "stage": "GRAPH_SCHEMA_INSPECTION", "title": "检查本体属性与关系", "status": "SUCCESS", "detail": f"底层对象为 {selected_node.get('tableName')}，本次 GRAPH_TABLE 返回 {len(graph_result.get('columns', []))} 个本体属性或汇总字段。"},
-            {"step_no": 5, "stage": "ORACLE_GRAPH_QUERY", "title": "执行 Oracle Graph SQL", "status": "SUCCESS", "detail": f"使用 GRAPH_TABLE 查询并返回 {len(graph_result.get('rows', []))} 条本体实例记录。", "sql": executed_sql},
-            {"step_no": 6, "stage": "AGENT_ANALYSIS", "title": "Agent 按 Skill 分析", "status": "SUCCESS", "detail": "已将 Skill 指令、指标规则活动语义、会话上下文、本体属性字段、Graph SQL 结果和当前问题发送给分析 Agent。"},
-        ]
-        conversation = stored_conversation_history + ([] if is_session_start else [{"role": "user", "content": question}])
-        conversation.append({"role": "assistant", "content": agent_output})
-        table_preview = {"columns": [{"column_name": column} for column in graph_result.get("columns", [])], "sample_rows": graph_result.get("rows", [])}
-        current_turn = {
-            "turn_no": len(previous_turn_results) + 1,
-            "user_message_no": len([item for item in conversation if item.get("role") == "user"]) - 1,
-            "question": "" if is_session_start else question,
-            "table_preview": table_preview,
-            "agent_output": agent_output,
-            "execution_trace": trace,
-            "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
-            "warnings": ["当前测试优先使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，Skill 可在图关系定位后继续建议只读事实表聚合。"],
-        }
-        turn_results = previous_turn_results + ([] if is_session_start else [current_turn])
-        response = {
-            "managed_skill": self._serialize_managed_skill(managed_skill),
-            "execution_model": {"llm_config_id": llm_config.config_id, "llm_config_name": llm_config.config_name, "llm_model_name": normalize_model_name(llm_config.model_name, llm_config.api_base_url)},
-            "test_context": {"source_id": payload["source_id"], "source_name": source.source_name if source else "", "schema": topology.get("schema"), "property_graph": topology.get("graph_name"), "ontology_node": selected_node.get("displayName"), "test_question": "" if is_session_start else question},
-            "conversation": conversation,
-            "agent_output": agent_output,
-            "execution_trace": trace,
-            "executed_queries": [{"purpose": "按 Skill 获取本体节点属性证据（Oracle Graph SQL）", "sql": executed_sql, "row_count": len(graph_result.get("rows", []))}],
-            "warnings": ["当前测试优先使用 Oracle GRAPH_TABLE 返回本体业务属性；涉及数量、金额等未建模为图属性的事实指标时，Skill 可在图关系定位后继续建议只读事实表聚合。"],
-            "table_preview": table_preview,
-            "turn_results": turn_results,
-        }
-        session = self._save_managed_skill_test_session(
-            session=existing_session,
-            managed_skill=managed_skill,
-            source=source,
-            payload=payload,
-            question=question,
-            conversation=conversation,
-            response=response,
-            created_by=created_by,
-        )
-        response["session_id"] = session.session_id
-        return response
 
     def _save_managed_skill_test_session(
         self,
@@ -1247,23 +1157,44 @@ class AgentService:
             "user_message_no": len([item for item in conversation if item.get("role") == "user"]) - 1,
             "question": question,
             "table_preview": table_preview,
+            "plan": {"plan_version": "1.0", "intent_type": "CLARIFICATION_REQUIRED", "selected_objects": [], "steps": []},
+            "evidence_tables": [],
+            "analysis_result": {"summary": clarification, "intent_type": "CLARIFICATION_REQUIRED", "selected_objects": [], "evidence_table_keys": [], "applied_metrics": [], "matched_rules": [], "suggested_activities": [], "trend_summaries": [], "analysis_flags": [], "period_comparisons": [], "top_findings": []},
+            "completion_assessment": {
+                "status": "PENDING",
+                "completed": False,
+                "deterministic": {"status": "SKIPPED", "reason": "当前为澄清轮，尚未执行数据查询。"},
+                "coverage_check": {"status": "SKIPPED", "reason": "当前为澄清轮，尚未执行数据查询。"},
+                "judge": {"required": False, "status": "SKIPPED", "reason": "当前为澄清轮，尚未执行数据查询。"},
+                "summary": "当前问题需要先澄清，尚未进入任务完成判定。",
+            },
             "agent_output": clarification,
             "execution_trace": trace,
+            "execution_events": [
+                {"event_type": "SKILL_LOAD", "step_id": "skill_load", "title": "加载上传 Skill", "runtime_state": "COMPLETED", "status": "SUCCESS", "detail": "已加载 Skill，准备识别当前问题。", "payload": {}},
+                {"event_type": "CLARIFICATION", "step_id": "clarify", "title": "请求澄清当前问题", "runtime_state": "COMPLETED", "status": "SUCCESS", "detail": "当前消息未明确查询目标，未执行 Oracle Graph SQL，也未复用历史查询。", "payload": {}},
+            ],
             "executed_queries": [],
             "warnings": [],
         }
         response = {
             "managed_skill": self._serialize_managed_skill(managed_skill),
             "execution_model": {"llm_config_id": payload["llm_config_id"]},
-            "test_context": {"source_id": payload["source_id"], "source_name": source.source_name if source else "", "schema": payload.get("schema"), "property_graph": "", "ontology_node": "", "test_question": question},
+            "test_context": {"source_id": payload["source_id"], "source_name": source.source_name if source else "", "schema": payload.get("schema"), "property_graph": "", "ontology_node": "", "intent_type": "CLARIFICATION_REQUIRED", "test_question": question},
             "conversation": conversation,
             "agent_output": clarification,
+            "plan": current_turn["plan"],
             "execution_trace": trace,
+            "execution_events": current_turn["execution_events"],
             "executed_queries": [],
             "warnings": [],
             "table_preview": table_preview,
+            "evidence_tables": [],
+            "analysis_result": current_turn["analysis_result"],
+            "completion_assessment": current_turn["completion_assessment"],
             "turn_results": previous_turn_results + [current_turn],
         }
+        response["planning_stats"] = self._build_managed_skill_planning_stats(response)
         saved_session = self._save_managed_skill_test_session(
             session=session, managed_skill=managed_skill, source=source, payload=payload,
             question=question, conversation=conversation, response=response, created_by=created_by,
@@ -1279,12 +1210,76 @@ class AgentService:
         ambiguous_messages = {"继续", "继续查询", "再查一下", "这个呢", "这个怎么样", "查一下", "查询一下", "分析一下"}
         return normalized in ambiguous_messages
 
+    def _build_managed_skill_planning_stats(self, result_payload: Dict[str, Any]) -> Dict[str, Any]:
+        turn_results = result_payload.get("turn_results") if isinstance(result_payload, dict) else None
+        if not isinstance(turn_results, list):
+            turn_results = []
+        total_turns = 0
+        reference_pattern_turns = 0
+        llm_plan_turns = 0
+        clarification_turns = 0
+        session_ready_turns = 0
+        pattern_counter: Dict[str, int] = {}
+        latest_planning_mode = ""
+        latest_reference_pattern_id = ""
+        for item in turn_results:
+            if not isinstance(item, dict):
+                continue
+            plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
+            intent_type = str(plan.get("intent_type") or "").upper()
+            if intent_type == "SESSION_READY":
+                session_ready_turns += 1
+                continue
+            total_turns += 1
+            planning_mode = str(plan.get("planning_mode") or "").upper()
+            reference_pattern_id = str(plan.get("reference_pattern_id") or "").strip()
+            latest_planning_mode = planning_mode or latest_planning_mode
+            latest_reference_pattern_id = reference_pattern_id or latest_reference_pattern_id
+            if intent_type == "CLARIFICATION_REQUIRED":
+                clarification_turns += 1
+                continue
+            if planning_mode == "REFERENCE_PATTERN":
+                reference_pattern_turns += 1
+                if reference_pattern_id:
+                    pattern_counter[reference_pattern_id] = pattern_counter.get(reference_pattern_id, 0) + 1
+            elif planning_mode == "LLM_PLAN":
+                llm_plan_turns += 1
+        actionable_turns = max(0, total_turns - clarification_turns)
+        reference_pattern_hit_rate = round((reference_pattern_turns / actionable_turns) * 100, 2) if actionable_turns else 0.0
+        top_patterns = [
+            {"reference_pattern_id": key, "count": value}
+            for key, value in sorted(pattern_counter.items(), key=lambda item: (-item[1], item[0]))[:5]
+        ]
+        return {
+            "total_turns": total_turns,
+            "actionable_turns": actionable_turns,
+            "reference_pattern_turns": reference_pattern_turns,
+            "llm_plan_turns": llm_plan_turns,
+            "clarification_turns": clarification_turns,
+            "session_ready_turns": session_ready_turns,
+            "reference_pattern_hit_rate": reference_pattern_hit_rate,
+            "llm_planner_saved_count": reference_pattern_turns,
+            "latest_planning_mode": latest_planning_mode,
+            "latest_reference_pattern_id": latest_reference_pattern_id,
+            "top_reference_patterns": top_patterns,
+        }
+
     def _serialize_managed_skill_test_session(
         self, session: SysManagedAgentSkillTestSession, *, include_result: bool
     ) -> Dict[str, Any]:
+        result_payload = self._safe_json_loads(session.result_json, {})
+        managed_skill = self.db.query(SysManagedAgentSkill).filter(
+            SysManagedAgentSkill.managed_skill_id == session.managed_skill_id
+        ).first()
+        domain_name = None
+        if managed_skill and managed_skill.domain_id:
+            domain = self.db.query(SysDomain).filter(SysDomain.domain_id == managed_skill.domain_id).first()
+            domain_name = domain.domain_name if domain else None
         data = {
             "session_id": session.session_id,
             "managed_skill_id": session.managed_skill_id,
+            "domain_id": managed_skill.domain_id if managed_skill else None,
+            "domain_name": domain_name,
             "skill_name": session.skill_name,
             "source_id": session.source_id,
             "source_name": session.source_name,
@@ -1297,10 +1292,11 @@ class AgentService:
             "created_by": session.created_by,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
+            "planning_stats": self._build_managed_skill_planning_stats(result_payload),
         }
         if include_result:
             data["conversation"] = self._safe_json_loads(session.conversation_json, [])
-            data["result"] = self._safe_json_loads(session.result_json, {})
+            data["result"] = result_payload
         return data
 
     @staticmethod
@@ -1309,6 +1305,7 @@ class AgentService:
         for path in [
             "references/ontology-model.json",
             "references/ontology-graph-binding.json",
+            "references/execution-contract.json",
             "references/analysis-strategy.md",
             "references/metric-catalog.json",
             "references/rule-catalog.json",
@@ -1318,6 +1315,3366 @@ class AgentService:
             if content:
                 sections.append(f"## {path}\n{content[:8000]}")
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _derive_managed_skill_intent_type(question: str) -> str:
+        text = (question or "").upper()
+        if any(token in text for token in ("追溯", "链路", "路径", "上游", "下游")):
+            return "TRACEBACK_ANALYSIS"
+        if any(token in text for token in ("影响", "波及", "召回", "覆盖范围")):
+            return "IMPACT_INFERENCE"
+        if any(token in text for token in ("根因", "原因", "为何", "为什么")):
+            return "ROOT_CAUSE_ANALYSIS"
+        if any(token in text for token in ("规则", "判定", "是否异常", "是否超规")):
+            return "RULE_JUDGEMENT"
+        if any(token in text for token in ("指标", "趋势", "波动", "统计")):
+            return "METRIC_EXPLANATION"
+        return "RELATION_PATH_LOOKUP"
+
+    def _load_execution_contract(self, skill_files: Dict[str, str]) -> Dict[str, Any]:
+        raw = skill_files.get("references/execution-contract.json")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        if not isinstance(data.get("reference_patterns"), list) or not data.get("reference_patterns"):
+            data["reference_patterns"] = self._default_managed_skill_reference_patterns(data)
+        return data
+
+    @staticmethod
+    def _normalize_label_name(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    def _build_topology_indexes(self, topology: Dict[str, Any]) -> Dict[str, Any]:
+        nodes = topology.get("nodes") or []
+        nodes_by_label = {
+            self._normalize_label_name(node.get("displayName") or node.get("name")): node
+            for node in nodes
+            if self._normalize_label_name(node.get("displayName") or node.get("name"))
+        }
+        node_id_to_label = {
+            str(node.get("id") or ""): self._normalize_label_name(node.get("displayName") or node.get("name"))
+            for node in nodes
+            if str(node.get("id") or "")
+        }
+        adjacency: Dict[str, List[Dict[str, str]]] = {}
+        for edge in topology.get("edges") or []:
+            source_label = node_id_to_label.get(str(edge.get("source") or "")) or self._normalize_label_name(edge.get("source"))
+            target_label = node_id_to_label.get(str(edge.get("target") or "")) or self._normalize_label_name(edge.get("target"))
+            edge_label = self._normalize_label_name(edge.get("name"))
+            if not source_label or not target_label or not edge_label:
+                continue
+            adjacency.setdefault(source_label, []).append({"target": target_label, "edge": edge_label, "direction": "OUT"})
+            adjacency.setdefault(target_label, []).append({"target": source_label, "edge": edge_label, "direction": "IN"})
+        return {
+            "nodes_by_label": nodes_by_label,
+            "adjacency": adjacency,
+        }
+
+    def _find_graph_path(
+        self,
+        topology: Dict[str, Any],
+        root_label: str,
+        target_label: str,
+        max_depth: int = MANAGED_SKILL_TEST_PLAN_MAX_PATH_DEPTH,
+    ) -> Optional[List[Dict[str, str]]]:
+        indexes = self._build_topology_indexes(topology)
+        adjacency = indexes["adjacency"]
+        root = self._normalize_label_name(root_label)
+        target = self._normalize_label_name(target_label)
+        if not root or not target:
+            return None
+        if root == target:
+            return []
+        queue = deque([(root, [])])
+        visited = {root}
+        while queue:
+            current, path = queue.popleft()
+            if len(path) >= max_depth:
+                continue
+            for item in adjacency.get(current, []):
+                next_label = item["target"]
+                if next_label in visited:
+                    continue
+                next_path = path + [item]
+                if next_label == target:
+                    return next_path
+                visited.add(next_label)
+                queue.append((next_label, next_path))
+        return None
+
+    @staticmethod
+    def _safe_graph_sql_literal(value: str) -> str:
+        return str(value or "").replace("'", "''")
+
+    @staticmethod
+    def _filter_queryable_properties(node: Dict[str, Any], requested: Optional[List[str]] = None) -> List[str]:
+        identifier_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
+        properties = []
+        property_map = {
+            str(prop.get("property_name") or "").upper(): prop
+            for prop in (node.get("properties") or [])
+        }
+        requested_names = [
+            str(name or "").upper() for name in (requested or [])
+            if str(name or "").upper() in property_map
+        ]
+        if not requested_names:
+            requested_names = list(property_map.keys())
+        for name in requested_names:
+            prop = property_map.get(name) or {}
+            data_type = str(prop.get("data_type") or "").upper()
+            if identifier_pattern.fullmatch(name) and not any(token in data_type for token in ("BLOB", "CLOB", "NCLOB", "BFILE", "LONG", "XMLTYPE")):
+                properties.append(name)
+        return properties[:MANAGED_SKILL_TEST_PLAN_MAX_PROPERTIES]
+
+    def _build_graph_root_query_sql(
+        self,
+        graph_name: str,
+        node: Dict[str, Any],
+        filter_property: Optional[str],
+        filter_value: Optional[str],
+        display_properties: Optional[List[str]] = None,
+    ) -> str:
+        label = self._normalize_label_name(node.get("displayName") or node.get("name"))
+        properties = self._filter_queryable_properties(node, display_properties)
+        if filter_property:
+            filter_name = self._normalize_label_name(filter_property)
+            if filter_name not in properties:
+                properties = [filter_name] + properties
+        properties = list(dict.fromkeys(properties))
+        if not properties:
+            raise ValueError(f"本体节点 {label} 没有可用于查询的属性")
+        projections = ",\n      ".join(f"n.{name} AS {name}" for name in properties)
+        sql = f"""SELECT *
+FROM GRAPH_TABLE(
+  {graph_name.upper()}
+  MATCH (n IS {label})
+  COLUMNS (
+      {projections}
+  )
+)"""
+        if filter_property and filter_value:
+            sql += f"\nWHERE {self._normalize_label_name(filter_property)} = '{self._safe_graph_sql_literal(filter_value)}'"
+        return sql
+
+    def _build_graph_relation_query_sql(
+        self,
+        graph_name: str,
+        root_node: Dict[str, Any],
+        target_node: Dict[str, Any],
+        path: List[Dict[str, str]],
+        filter_property: str,
+        filter_value: str,
+        root_properties: Optional[List[str]] = None,
+        target_properties: Optional[List[str]] = None,
+    ) -> str:
+        root_label = self._normalize_label_name(root_node.get("displayName") or root_node.get("name"))
+        target_label = self._normalize_label_name(target_node.get("displayName") or target_node.get("name"))
+        root_columns = self._filter_queryable_properties(root_node, root_properties)
+        target_columns = self._filter_queryable_properties(target_node, target_properties)
+        filter_name = self._normalize_label_name(filter_property)
+        if filter_name not in root_columns:
+            root_columns = [filter_name] + root_columns
+        root_columns = list(dict.fromkeys(root_columns))
+        target_columns = list(dict.fromkeys(target_columns))
+        if not target_columns:
+            raise ValueError(f"目标节点 {target_label} 没有可用于查询的属性")
+        aliases = ["r"]
+        match_parts = [f"(r IS {root_label})"]
+        current_label = root_label
+        for hop_index, hop in enumerate(path, start=1):
+            next_label = self._normalize_label_name(hop.get("target"))
+            direction = hop.get("direction")
+            edge_label = self._normalize_label_name(hop.get("edge"))
+            alias = "t" if hop_index == len(path) else f"n{hop_index}"
+            aliases.append(alias)
+            relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+            match_parts.append(f"{relation}({alias} IS {next_label})")
+            current_label = next_label
+        if current_label != target_label:
+            raise ValueError("关系路径终点与目标节点不一致")
+        projections = [f"r.{name} AS ROOT_{name}" for name in root_columns]
+        projections.extend(f"t.{name} AS {target_label}_{name}" for name in target_columns)
+        sql = f"""WITH relation_result AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name.upper()}
+    MATCH {''.join(match_parts)}
+    COLUMNS (
+      {', '.join(projections)}
+    )
+  )
+)
+SELECT *
+FROM relation_result
+WHERE ROOT_{filter_name} = '{self._safe_graph_sql_literal(filter_value)}'"""
+        return sql
+
+    def _derive_execution_contract_from_topology(
+        self,
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+    ) -> Dict[str, Any]:
+        nodes = topology.get("nodes") or []
+        metric_catalog = self._safe_json_loads(skill_files.get("references/metric-catalog.json"), {})
+        has_metrics = bool((metric_catalog.get("metrics") if isinstance(metric_catalog, dict) else None) or [])
+        node_labels = [
+            self._normalize_label_name(node.get("displayName") or node.get("name"))
+            for node in nodes[:20]
+            if self._normalize_label_name(node.get("displayName") or node.get("name"))
+        ]
+        object_aliases = self._build_reference_object_aliases(node_labels)
+        property_aliases = self._build_reference_property_aliases(
+            labels=node_labels,
+            topology=topology,
+            explicit_aliases={},
+        )
+        relation_aliases = self._build_reference_relation_aliases(
+            topology=topology,
+            object_aliases=object_aliases,
+            explicit_aliases={},
+        )
+        contract = {
+            "entry_objects": node_labels[:6],
+            "target_objects": node_labels[:12],
+            "query_modes": ["single_node", "path_expand"] + (["fact_aggregate", "group_by_object", "group_by_object_time_window", "group_by_time_window", "metric_formula", "filter_aggregate_result", "order_and_limit", "apply_rules"] if has_metrics else []),
+            "preferred_paths": [],
+            "required_display_properties": {},
+            "time_dimensions": {},
+            "object_aliases": object_aliases,
+            "property_aliases": property_aliases,
+            "relation_aliases": relation_aliases,
+            "forbidden_properties": ["RAW_JSON", "LARGE_CLOB"],
+        }
+        contract["reference_patterns"] = self._default_managed_skill_reference_patterns(contract)
+        return contract
+
+    def _default_managed_skill_reference_patterns(self, execution_contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+        entry_objects = [
+            self._normalize_label_name(item)
+            for item in (execution_contract.get("entry_objects") or [])
+            if self._normalize_label_name(item)
+        ]
+        target_objects = [
+            self._normalize_label_name(item)
+            for item in (execution_contract.get("target_objects") or [])
+            if self._normalize_label_name(item)
+        ]
+        query_modes = {
+            str(item or "").strip()
+            for item in (execution_contract.get("query_modes") or [])
+            if str(item or "").strip()
+        }
+        patterns: List[Dict[str, Any]] = []
+        if target_objects:
+            patterns.append({
+                "pattern_id": "reference_relation_lookup",
+                "question_pattern": "查询关联对象详情",
+                "plan_template": ["select_root", "expand_relations", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["关联", "关系", "详情", "明细", "信息", "记录", "链路", "追溯"],
+                "max_targets": 1,
+            })
+        if "group_by_object" in query_modes and target_objects:
+            patterns.append({
+                "pattern_id": "reference_group_by_object",
+                "question_pattern": "查询关联对象分别多少",
+                "plan_template": ["select_root", "expand_relations", "group_by_object", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "required_keywords": ["多少"],
+                "optional_keywords": ["哪些", "分别", "各", "每个", "按"],
+                "max_targets": 1,
+            })
+        if "group_by_time_window" in query_modes:
+            patterns.append({
+                "pattern_id": "reference_time_trend",
+                "question_pattern": "按时间统计趋势",
+                "plan_template": ["select_root", "expand_relations", "group_by_time_window", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["趋势", "按天", "按周", "按月", "每天", "每周", "每月", "最近", "近"],
+                "max_targets": 1,
+            })
+        if "group_by_object_time_window" in query_modes and target_objects:
+            patterns.append({
+                "pattern_id": "reference_object_time_trend",
+                "question_pattern": "按对象和时间统计趋势",
+                "plan_template": ["select_root", "expand_relations", "group_by_object_time_window", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["趋势", "分别", "每个", "按", "每天", "每周", "每月", "近"],
+                "max_targets": 1,
+            })
+        if "metric_formula" in query_modes:
+            patterns.append({
+                "pattern_id": "reference_metric_formula",
+                "question_pattern": "查询比率或占比",
+                "plan_template": ["select_root", "expand_relations", "metric_formula", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["率", "占比", "比例", "比率"],
+                "max_targets": 1,
+            })
+        if "filter_aggregate_result" in query_modes and target_objects:
+            patterns.append({
+                "pattern_id": "reference_filtered_group",
+                "question_pattern": "筛选统计结果",
+                "plan_template": ["select_root", "expand_relations", "group_by_object", "filter_aggregate_result", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["大于", "超过", "高于", "至少", "不少于", "小于", "低于"],
+                "max_targets": 1,
+            })
+        if "order_and_limit" in query_modes and target_objects:
+            patterns.append({
+                "pattern_id": "reference_ranked_group",
+                "question_pattern": "TopN 排名统计",
+                "plan_template": ["select_root", "expand_relations", "group_by_object", "order_and_limit", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["TOP", "前", "最多", "排名", "最高", "最低", "BOTTOM"],
+                "max_targets": 1,
+            })
+        if "apply_rules" in query_modes and target_objects:
+            patterns.append({
+                "pattern_id": "reference_rule_judgement",
+                "question_pattern": "规则判定",
+                "plan_template": ["select_root", "expand_relations", "group_by_object", "apply_rules", "summarize_evidence"],
+                "root_candidates": entry_objects[:3],
+                "target_candidates": target_objects[:4],
+                "optional_keywords": ["异常", "规则", "预警", "风险", "告警", "超规"],
+                "max_targets": 1,
+            })
+        return patterns
+
+    @staticmethod
+    def _split_label_tokens(label: str) -> List[str]:
+        text = str(label or "").strip()
+        if not text:
+            return []
+        if "_" in text:
+            return [item for item in text.upper().split("_") if item]
+        parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|\d+", text)
+        if parts:
+            return [item.upper() for item in parts if item]
+        return [text.upper()]
+
+    def _label_alias_candidates(self, label: str, aliases: Optional[List[str]] = None) -> List[str]:
+        normalized_label = self._normalize_label_name(label)
+        candidates: List[str] = []
+        for item in [normalized_label] + list(aliases or []) + REFERENCE_LABEL_ALIAS_LEXICON.get(normalized_label, []):
+            text = str(item or "").strip()
+            if text:
+                candidates.append(text)
+        tokens = self._split_label_tokens(normalized_label)
+        if tokens:
+            candidates.extend(tokens)
+            if len(tokens) > 1:
+                candidates.append(" ".join(tokens))
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            normalized = str(item or "").strip()
+            key = normalized.upper()
+            if normalized and key not in seen:
+                deduped.append(normalized)
+                seen.add(key)
+        return deduped
+
+    def _build_reference_object_aliases(
+        self,
+        labels: List[str],
+        explicit_aliases: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, List[str]]:
+        alias_map: Dict[str, List[str]] = {}
+        for label in labels or []:
+            normalized = self._normalize_label_name(label)
+            if not normalized:
+                continue
+            alias_map[normalized] = self._label_alias_candidates(
+                normalized,
+                aliases=(explicit_aliases or {}).get(normalized) or [],
+            )
+        return alias_map
+
+    def _property_alias_candidates(self, property_name: str, aliases: Optional[List[str]] = None) -> List[str]:
+        normalized_property = self._normalize_label_name(property_name)
+        candidates: List[str] = []
+        for item in [normalized_property] + list(aliases or []):
+            text = str(item or "").strip()
+            if text:
+                candidates.append(text)
+        tokens = self._split_label_tokens(normalized_property)
+        if tokens:
+            candidates.extend(tokens)
+            if len(tokens) > 1:
+                candidates.append(" ".join(tokens))
+        for token in tokens:
+            candidates.extend(REFERENCE_PROPERTY_ALIAS_LEXICON.get(token, []))
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            normalized = str(item or "").strip()
+            key = normalized.upper()
+            if normalized and key not in seen:
+                deduped.append(normalized)
+                seen.add(key)
+        return deduped
+
+    def _build_reference_property_aliases(
+        self,
+        *,
+        labels: List[str],
+        topology: Dict[str, Any],
+        explicit_aliases: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, List[str]]:
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+        alias_map: Dict[str, List[str]] = {}
+        for label in labels or []:
+            normalized = self._normalize_label_name(label)
+            if not normalized:
+                continue
+            node = nodes_by_label.get(normalized) or {}
+            candidates: List[str] = []
+            for item in (explicit_aliases or {}).get(normalized) or []:
+                if str(item or "").strip():
+                    candidates.append(str(item or "").strip())
+            for prop in (node.get("properties") or [])[:20]:
+                candidates.extend(
+                    self._property_alias_candidates(
+                        str(prop.get("property_name") or ""),
+                    )
+                )
+            alias_map[normalized] = self._normalize_string_list(candidates)
+        return alias_map
+
+    @staticmethod
+    def _reference_relation_key(source_label: str, target_label: str) -> str:
+        return f"{str(source_label or '').strip().upper()}->{str(target_label or '').strip().upper()}"
+
+    def _relation_alias_candidates(self, relation_name: str, aliases: Optional[List[str]] = None) -> List[str]:
+        normalized_relation = self._normalize_label_name(relation_name)
+        candidates: List[str] = []
+        for item in [normalized_relation] + list(aliases or []):
+            text = str(item or "").strip()
+            if text:
+                candidates.append(text)
+        tokens = self._split_label_tokens(normalized_relation)
+        if tokens:
+            candidates.extend(tokens)
+            if len(tokens) > 1:
+                candidates.append(" ".join(tokens))
+        if normalized_relation and normalized_relation != "GRAPH_LABEL":
+            candidates.append(f"关联{normalized_relation}")
+        candidates.extend(["关联", "关系", "链路"])
+        return self._normalize_string_list(candidates)
+
+    def _build_reference_relation_aliases(
+        self,
+        *,
+        topology: Dict[str, Any],
+        object_aliases: Dict[str, List[str]],
+        explicit_aliases: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, List[str]]:
+        aliases_by_relation: Dict[str, List[str]] = {}
+        for edge in topology.get("edges") or []:
+            source_label = self._normalize_label_name(edge.get("source"))
+            target_label = self._normalize_label_name(edge.get("target"))
+            if not source_label or not target_label:
+                continue
+            relation_key = self._reference_relation_key(source_label, target_label)
+            candidates: List[str] = []
+            if relation_key in (explicit_aliases or {}):
+                candidates.extend((explicit_aliases or {}).get(relation_key) or [])
+            edge_name = str(edge.get("name") or "").strip()
+            if edge_name:
+                candidates.extend(self._relation_alias_candidates(edge_name))
+            for target_alias in (object_aliases.get(target_label) or [])[:3]:
+                candidates.append(f"关联{target_alias}")
+                candidates.append(f"{target_alias}关系")
+            aliases_by_relation[relation_key] = self._normalize_string_list(candidates)
+        return aliases_by_relation
+
+    def _load_reference_patterns(self, execution_contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+        patterns = execution_contract.get("reference_patterns") if isinstance(execution_contract, dict) else None
+        if not isinstance(patterns, list) or not patterns:
+            return self._default_managed_skill_reference_patterns(execution_contract or {})
+        normalized: List[Dict[str, Any]] = []
+        for index, item in enumerate(patterns, start=1):
+            if not isinstance(item, dict):
+                continue
+            plan_template = [
+                str(action or "").strip()
+                for action in (item.get("plan_template") or [])
+                if str(action or "").strip()
+            ]
+            if not plan_template or plan_template[0] != "select_root":
+                continue
+            normalized.append({
+                "pattern_id": str(item.get("pattern_id") or f"reference_pattern_{index}").strip(),
+                "question_pattern": str(item.get("question_pattern") or "").strip(),
+                "plan_template": plan_template,
+                "required_keywords": [str(token or "").strip() for token in (item.get("required_keywords") or []) if str(token or "").strip()],
+                "optional_keywords": [str(token or "").strip() for token in (item.get("optional_keywords") or []) if str(token or "").strip()],
+                "root_candidates": [self._normalize_label_name(token) for token in (item.get("root_candidates") or []) if self._normalize_label_name(token)],
+                "target_candidates": [self._normalize_label_name(token) for token in (item.get("target_candidates") or []) if self._normalize_label_name(token)],
+                "max_targets": max(1, min(int(item.get("max_targets") or 1), MANAGED_SKILL_TEST_PLAN_MAX_TARGETS)),
+            })
+        return normalized or self._default_managed_skill_reference_patterns(execution_contract or {})
+
+    def _contract_object_aliases(self, execution_contract: Dict[str, Any]) -> Dict[str, List[str]]:
+        alias_payload = execution_contract.get("object_aliases") if isinstance(execution_contract, dict) else None
+        explicit_aliases: Dict[str, List[str]] = {}
+        if isinstance(alias_payload, dict):
+            for label, aliases in alias_payload.items():
+                normalized = self._normalize_label_name(label)
+                if not normalized or not isinstance(aliases, list):
+                    continue
+                explicit_aliases[normalized] = [str(item or "").strip() for item in aliases if str(item or "").strip()]
+        all_labels = [
+            self._normalize_label_name(item)
+            for item in ((execution_contract.get("entry_objects") or []) + (execution_contract.get("target_objects") or []))
+            if self._normalize_label_name(item)
+        ]
+        return self._build_reference_object_aliases(all_labels, explicit_aliases)
+
+    def _contract_property_aliases(self, execution_contract: Dict[str, Any], topology: Dict[str, Any]) -> Dict[str, List[str]]:
+        alias_payload = execution_contract.get("property_aliases") if isinstance(execution_contract, dict) else None
+        explicit_aliases: Dict[str, List[str]] = {}
+        if isinstance(alias_payload, dict):
+            for label, aliases in alias_payload.items():
+                normalized = self._normalize_label_name(label)
+                if not normalized or not isinstance(aliases, list):
+                    continue
+                explicit_aliases[normalized] = [str(item or "").strip() for item in aliases if str(item or "").strip()]
+        all_labels = [
+            self._normalize_label_name(item)
+            for item in ((execution_contract.get("entry_objects") or []) + (execution_contract.get("target_objects") or []))
+            if self._normalize_label_name(item)
+        ]
+        return self._build_reference_property_aliases(
+            labels=all_labels,
+            topology=topology,
+            explicit_aliases=explicit_aliases,
+        )
+
+    def _contract_relation_aliases(self, execution_contract: Dict[str, Any], topology: Dict[str, Any]) -> Dict[str, List[str]]:
+        alias_payload = execution_contract.get("relation_aliases") if isinstance(execution_contract, dict) else None
+        explicit_aliases: Dict[str, List[str]] = {}
+        if isinstance(alias_payload, dict):
+            for relation_key, aliases in alias_payload.items():
+                normalized = str(relation_key or "").strip().upper()
+                if not normalized or not isinstance(aliases, list):
+                    continue
+                explicit_aliases[normalized] = [str(item or "").strip() for item in aliases if str(item or "").strip()]
+        object_aliases = self._contract_object_aliases(execution_contract)
+        return self._build_reference_relation_aliases(
+            topology=topology,
+            object_aliases=object_aliases,
+            explicit_aliases=explicit_aliases,
+        )
+
+    def _label_alias_hits(self, question: str, label: str, object_aliases: Dict[str, List[str]]) -> int:
+        normalized = str(question or "").upper()
+        aliases = object_aliases.get(self._normalize_label_name(label), [])
+        return sum(1 for token in aliases if token and str(token).upper() in normalized)
+
+    def _property_alias_hits(self, question: str, label: str, property_aliases: Dict[str, List[str]]) -> int:
+        normalized = str(question or "").upper()
+        aliases = property_aliases.get(self._normalize_label_name(label), [])
+        return sum(1 for token in aliases if token and str(token).upper() in normalized)
+
+    def _relation_alias_hits(
+        self,
+        question: str,
+        source_label: str,
+        target_label: str,
+        relation_aliases: Dict[str, List[str]],
+    ) -> int:
+        normalized = str(question or "").upper()
+        aliases = relation_aliases.get(self._reference_relation_key(source_label, target_label), [])
+        return sum(1 for token in aliases if token and str(token).upper() in normalized)
+
+    def _reference_pattern_score(
+        self,
+        question: str,
+        pattern: Dict[str, Any],
+        object_aliases: Optional[Dict[str, List[str]]] = None,
+        property_aliases: Optional[Dict[str, List[str]]] = None,
+        relation_aliases: Optional[Dict[str, List[str]]] = None,
+    ) -> int:
+        normalized = str(question or "").upper()
+        plan_template = pattern.get("plan_template") or []
+        required_keywords = [str(token or "").upper() for token in (pattern.get("required_keywords") or []) if str(token or "").strip()]
+        optional_keywords = [str(token or "").upper() for token in (pattern.get("optional_keywords") or []) if str(token or "").strip()]
+        object_aliases = object_aliases or {}
+        property_aliases = property_aliases or {}
+        relation_aliases = relation_aliases or {}
+        if required_keywords and not all(token in normalized for token in required_keywords):
+            return -1
+        primary_action = next((action for action in reversed(plan_template) if action not in {"summarize_evidence", "order_and_limit", "filter_aggregate_result", "apply_rules"}), "")
+        if "metric_formula" in plan_template and not self._question_requests_metric_formula(question):
+            return -1
+        if "group_by_object_time_window" in plan_template and not self._question_requests_group_by_object_time_window(question):
+            return -1
+        if "group_by_time_window" in plan_template and "group_by_object_time_window" not in plan_template and not self._question_requests_group_by_time_window(question):
+            return -1
+        if primary_action == "group_by_object" and not self._question_requests_group_by_object(question):
+            return -1
+        if "filter_aggregate_result" in plan_template and not self._question_requests_filter_aggregate_result(question):
+            return -1
+        if "order_and_limit" in plan_template and not self._question_requests_order_and_limit(question):
+            return -1
+        if "apply_rules" in plan_template and not self._question_requests_apply_rules(question):
+            return -1
+        if primary_action == "expand_relations" and (
+            self._question_requests_group_by_object(question)
+            or self._question_requests_group_by_time_window(question)
+            or self._question_requests_metric_formula(question)
+        ):
+            return -1
+        score = len(required_keywords) * 10
+        score += sum(1 for token in optional_keywords if token in normalized)
+        score += sum(self._label_alias_hits(question, label, object_aliases) * 2 for label in (pattern.get("root_candidates") or [])[:2])
+        score += sum(self._label_alias_hits(question, label, object_aliases) * 3 for label in (pattern.get("target_candidates") or [])[:2])
+        score += sum(self._property_alias_hits(question, label, property_aliases) * 2 for label in (pattern.get("root_candidates") or [])[:2])
+        score += sum(self._property_alias_hits(question, label, property_aliases) * 2 for label in (pattern.get("target_candidates") or [])[:2])
+        if pattern.get("root_candidates") and pattern.get("target_candidates"):
+            score += max(
+                (
+                    self._relation_alias_hits(question, root_label, target_label, relation_aliases) * 4
+                    for root_label in (pattern.get("root_candidates") or [])[:2]
+                    for target_label in (pattern.get("target_candidates") or [])[:2]
+                ),
+                default=0,
+            )
+        score += len(plan_template)
+        if pattern.get("question_pattern"):
+            score += 1
+        return score
+
+    def _select_reference_pattern(self, question: str, execution_contract: Dict[str, Any], topology: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        best_pattern = None
+        best_score = -1
+        object_aliases = self._contract_object_aliases(execution_contract)
+        property_aliases = self._contract_property_aliases(execution_contract, topology)
+        relation_aliases = self._contract_relation_aliases(execution_contract, topology)
+        for pattern in self._load_reference_patterns(execution_contract):
+            score = self._reference_pattern_score(question, pattern, object_aliases, property_aliases, relation_aliases)
+            if score > best_score:
+                best_pattern = pattern
+                best_score = score
+        return best_pattern if best_pattern and best_score >= 0 else None
+
+    def _choose_reference_root_label(
+        self,
+        *,
+        pattern: Dict[str, Any],
+        contract: Dict[str, Any],
+        nodes_by_label: Dict[str, Any],
+        excluded_roots: set[str],
+        preferred_root: str,
+        question: str,
+        topology: Dict[str, Any],
+    ) -> str:
+        object_aliases = self._contract_object_aliases(contract)
+        property_aliases = self._contract_property_aliases(contract, topology)
+        candidate_lists = [pattern.get("root_candidates") or [], contract.get("entry_objects") or []]
+        if preferred_root and preferred_root in nodes_by_label and preferred_root not in excluded_roots:
+            return preferred_root
+        scored_candidates: List[tuple[int, str]] = []
+        for candidates in candidate_lists:
+            for item in candidates:
+                label = self._normalize_label_name(item)
+                if label and label in nodes_by_label and label not in excluded_roots:
+                    score = (
+                        self._label_alias_hits(question, label, object_aliases) * 3
+                        + self._property_alias_hits(question, label, property_aliases) * 2
+                    )
+                    scored_candidates.append((score, label))
+        if scored_candidates:
+            scored_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            if scored_candidates[0][0] > 0:
+                return scored_candidates[0][1]
+            return scored_candidates[0][1]
+        return ""
+
+    def _choose_reference_target_labels(
+        self,
+        *,
+        pattern: Dict[str, Any],
+        contract: Dict[str, Any],
+        topology: Dict[str, Any],
+        root_label: str,
+        excluded_targets: set[str],
+        question: str,
+    ) -> List[str]:
+        object_aliases = self._contract_object_aliases(contract)
+        property_aliases = self._contract_property_aliases(contract, topology)
+        relation_aliases = self._contract_relation_aliases(contract, topology)
+        candidates = [
+            self._normalize_label_name(item)
+            for item in ((pattern.get("target_candidates") or []) or (contract.get("target_objects") or []))
+            if self._normalize_label_name(item)
+        ]
+        scored_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                self._relation_alias_hits(question, root_label, item, relation_aliases) * 4
+                + self._label_alias_hits(question, item, object_aliases) * 3
+                + self._property_alias_hits(question, item, property_aliases) * 2,
+                item,
+            ),
+            reverse=True,
+        )
+        selected: List[str] = []
+        max_targets = max(1, min(int(pattern.get("max_targets") or 1), MANAGED_SKILL_TEST_PLAN_MAX_TARGETS))
+        for target_label in scored_candidates:
+            if target_label == root_label or target_label in excluded_targets or target_label in selected:
+                continue
+            if self._find_graph_path(topology, root_label, target_label):
+                selected.append(target_label)
+            if len(selected) >= max_targets:
+                break
+        return selected
+
+    def _build_seed_steps_for_managed_skill_plan(
+        self,
+        *,
+        topology: Dict[str, Any],
+        root_label: str,
+        filter_property: str,
+        filter_value: str,
+        root_properties: List[str],
+        target_labels: List[str],
+        target_properties: Dict[str, List[str]],
+    ) -> Dict[str, Any]:
+        indexes = self._build_topology_indexes(topology)
+        nodes_by_label = indexes["nodes_by_label"]
+        root_node = nodes_by_label.get(root_label)
+        if not root_node:
+            raise ValueError("Agent 未能为当前问题选择有效的本体起点对象")
+        root_display_properties = self._filter_queryable_properties(root_node, root_properties)
+        if filter_property and filter_property not in root_display_properties:
+            root_display_properties = [filter_property] + root_display_properties
+        steps = [{
+            "step_id": "s1",
+            "action": "select_root",
+            "label": root_label,
+            "filter": {"property": filter_property, "value": filter_value},
+            "display_properties": list(dict.fromkeys(root_display_properties))[:MANAGED_SKILL_TEST_PLAN_MAX_PROPERTIES],
+        }]
+        selected_objects = [root_label]
+        for index, target_label in enumerate(target_labels, start=2):
+            path = self._find_graph_path(topology, root_label, target_label)
+            if not path:
+                continue
+            target_node = nodes_by_label.get(target_label)
+            selected_props = self._filter_queryable_properties(target_node or {}, target_properties.get(target_label))
+            steps.append({
+                "step_id": f"s{index}",
+                "action": "expand_relations",
+                "from_step": "s1",
+                "label": target_label,
+                "path": path,
+                "display_properties": selected_props,
+            })
+            selected_objects.append(target_label)
+        return {
+            "steps": steps,
+            "selected_objects": selected_objects,
+        }
+
+    def _append_managed_skill_plan_actions(
+        self,
+        *,
+        plan_seed: Dict[str, Any],
+        forced_actions: Optional[List[str]],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+        execution_contract: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        steps = list(plan_seed.get("steps") or [])
+        additional_steps: List[Dict[str, Any]] = []
+
+        def current_plan() -> Dict[str, Any]:
+            return {
+                "steps": steps + additional_steps,
+                "selected_objects": plan_seed.get("selected_objects") or [],
+            }
+
+        def append_single(step: Optional[Dict[str, Any]]) -> None:
+            if step:
+                additional_steps.append(step)
+
+        if forced_actions is None:
+            metric_formula_steps = self._build_metric_formula_steps(
+                plan=current_plan(),
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+                execution_contract=execution_contract,
+            )
+            object_time_window_step = None if metric_formula_steps else self._build_group_by_object_time_window_step(
+                plan=current_plan(),
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+                execution_contract=execution_contract,
+            )
+            time_window_step = None if metric_formula_steps or object_time_window_step else self._build_group_by_time_window_step(
+                plan=current_plan(),
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+                execution_contract=execution_contract,
+            )
+            group_by_object_step = None if metric_formula_steps or object_time_window_step or time_window_step else self._build_group_by_object_step(
+                plan=current_plan(),
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+            )
+            fact_aggregate_step = None if metric_formula_steps or object_time_window_step or time_window_step or group_by_object_step else self._build_fact_aggregate_step(
+                plan=current_plan(),
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+            )
+            additional_steps.extend(metric_formula_steps)
+            for item in (object_time_window_step, time_window_step, group_by_object_step, fact_aggregate_step):
+                append_single(item)
+        else:
+            for action in [item for item in forced_actions if item not in {"select_root", "expand_relations"}]:
+                if action == "metric_formula":
+                    additional_steps.extend(self._build_metric_formula_steps(
+                        plan=current_plan(),
+                        topology=topology,
+                        skill_files=skill_files,
+                        question=question,
+                        execution_contract=execution_contract,
+                    ))
+                elif action == "group_by_object_time_window":
+                    append_single(self._build_group_by_object_time_window_step(
+                        plan=current_plan(),
+                        topology=topology,
+                        skill_files=skill_files,
+                        question=question,
+                        execution_contract=execution_contract,
+                    ))
+                elif action == "group_by_time_window":
+                    append_single(self._build_group_by_time_window_step(
+                        plan=current_plan(),
+                        topology=topology,
+                        skill_files=skill_files,
+                        question=question,
+                        execution_contract=execution_contract,
+                    ))
+                elif action == "group_by_object":
+                    append_single(self._build_group_by_object_step(
+                        plan=current_plan(),
+                        topology=topology,
+                        skill_files=skill_files,
+                        question=question,
+                    ))
+                elif action == "fact_aggregate":
+                    append_single(self._build_fact_aggregate_step(
+                        plan=current_plan(),
+                        topology=topology,
+                        skill_files=skill_files,
+                        question=question,
+                    ))
+                elif action == "filter_aggregate_result":
+                    append_single(self._build_filter_aggregate_result_step(
+                        plan=current_plan(),
+                        question=question,
+                    ))
+                elif action == "order_and_limit":
+                    append_single(self._build_order_and_limit_step(
+                        plan=current_plan(),
+                        question=question,
+                    ))
+                elif action == "apply_rules":
+                    append_single(self._build_apply_rules_step(
+                        plan=current_plan(),
+                        skill_files=skill_files,
+                        question=question,
+                    ))
+                elif action == "summarize_evidence":
+                    append_single(self._build_summarize_evidence_step(
+                        plan=current_plan(),
+                    ))
+        if forced_actions is None:
+            filter_step = self._build_filter_aggregate_result_step(
+                plan=current_plan(),
+                question=question,
+            )
+            append_single(filter_step)
+            order_step = self._build_order_and_limit_step(
+                plan=current_plan(),
+                question=question,
+            )
+            append_single(order_step)
+            apply_rules_step = self._build_apply_rules_step(
+                plan=current_plan(),
+                skill_files=skill_files,
+                question=question,
+            )
+            append_single(apply_rules_step)
+            append_single(self._build_summarize_evidence_step(plan=current_plan()))
+        return additional_steps
+
+    def _build_plan_from_reference_pattern(
+        self,
+        *,
+        pattern: Dict[str, Any],
+        intent_type: str,
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+        conversation_context: str,
+        contract: Dict[str, Any],
+        excluded_roots: set[str],
+        excluded_targets: set[str],
+        preferred_root: str,
+    ) -> Optional[Dict[str, Any]]:
+        indexes = self._build_topology_indexes(topology)
+        nodes_by_label = indexes["nodes_by_label"]
+        root_label = self._choose_reference_root_label(
+            pattern=pattern,
+            contract=contract,
+            nodes_by_label=nodes_by_label,
+            excluded_roots=excluded_roots,
+            preferred_root=preferred_root,
+            question=question,
+            topology=topology,
+        )
+        if root_label not in nodes_by_label:
+            return None
+        root_node = nodes_by_label[root_label]
+        target_labels = self._choose_reference_target_labels(
+            pattern=pattern,
+            contract=contract,
+            topology=topology,
+            root_label=root_label,
+            excluded_targets=excluded_targets,
+            question=question,
+        )
+        known_text = f"{question}\n{conversation_context}".upper()
+        filter_property = ""
+        filter_value = ""
+        root_properties = []
+        target_properties: Dict[str, List[str]] = {}
+        required_display_properties = contract.get("required_display_properties") if isinstance(contract.get("required_display_properties"), dict) else {}
+        root_properties = list(required_display_properties.get(root_label) or [])
+        root_properties_by_name = {
+            str(prop.get("property_name") or "").upper(): prop
+            for prop in (root_node.get("properties") or [])
+        }
+        identifier_match = re.search(r"\b(?:BOT|BATCH|CASE|PACK|PALLET|STACK|OUT|TRANS)-[A-Z0-9_.:/-]+\b", known_text)
+        if identifier_match:
+            filter_value = identifier_match.group(0)
+        for candidate_name in ("BOTTLE_CODE", "BATCH_NO", "CASE_CODE", "PACK_CODE", "PALLET_CODE", "STACK_CODE", "OUTBOUND_NO"):
+            if candidate_name in root_properties_by_name and candidate_name in known_text:
+                filter_property = candidate_name
+                break
+        if not filter_property:
+            filter_property = next(
+                (
+                    str(prop.get("property_name") or "").upper()
+                    for prop in (root_node.get("properties") or [])
+                    if prop.get("is_primary_key") == "Y"
+                ),
+                "",
+            )
+        if filter_property and not filter_value:
+            fallback_match = re.search(r"\b[A-Z0-9][A-Z0-9_.:/-]{3,}\b", question.upper())
+            if fallback_match:
+                filter_value = fallback_match.group(0)
+        for label in target_labels:
+            target_node = nodes_by_label.get(label) or {}
+            target_properties[label] = list(required_display_properties.get(label) or self._select_group_display_properties(target_node))
+        plan_seed = self._build_seed_steps_for_managed_skill_plan(
+            topology=topology,
+            root_label=root_label,
+            filter_property=filter_property,
+            filter_value=filter_value,
+            root_properties=root_properties,
+            target_labels=target_labels,
+            target_properties=target_properties,
+        )
+        additional_steps = self._append_managed_skill_plan_actions(
+            plan_seed=plan_seed,
+            forced_actions=pattern.get("plan_template") or [],
+            topology=topology,
+            skill_files=skill_files,
+            question=question,
+            execution_contract=contract,
+        )
+        return {
+            "plan_version": "1.0",
+            "intent_type": intent_type,
+            "reason": f"命中受控参考模式 {pattern.get('pattern_id')}",
+            "selected_objects": plan_seed.get("selected_objects") or [],
+            "planning_mode": "REFERENCE_PATTERN",
+            "reference_pattern_id": pattern.get("pattern_id"),
+            "steps": (list(plan_seed.get("steps") or []) + additional_steps)[:MANAGED_SKILL_TEST_PLAN_MAX_STEPS],
+        }
+
+    @staticmethod
+    def _load_metric_reference_items(skill_files: Dict[str, str]) -> List[Dict[str, Any]]:
+        try:
+            payload = json.loads(skill_files.get("references/metric-catalog.json") or "{}")
+        except (TypeError, ValueError):
+            return []
+        metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        return metrics if isinstance(metrics, list) else []
+
+    @staticmethod
+    def _question_requests_fact_aggregate(question: str) -> bool:
+        normalized = str(question or "").upper()
+        tokens = ("多少", "数量", "总数", "总量", "合计", "平均", "均值", "最大", "最小", "统计", "COUNT", "SUM", "AVG", "MIN", "MAX")
+        return any(token in normalized for token in tokens)
+
+    @staticmethod
+    def _question_requests_group_by_object(question: str) -> bool:
+        normalized = str(question or "").upper()
+        if not normalized:
+            return False
+        aggregate_tokens = ("多少", "数量", "总数", "总量", "合计", "统计", "趋势", "率", "占比", "比例", "COUNT", "SUM", "AVG", "MIN", "MAX", "RATE", "RATIO")
+        group_tokens = ("分别", "各", "每个", "按", "哪些", "哪几个", "TOP", "排名")
+        if not any(token in normalized for token in aggregate_tokens):
+            return False
+        if any(token in normalized for token in ("分别", "各自")):
+            return True
+        if any(token in normalized for token in ("每个", "TOP", "排名")):
+            return True
+        if "按" in normalized and "统计" in normalized:
+            return True
+        return bool(re.search(r"哪些.{0,12}(多少|数量|统计)", normalized))
+
+    @staticmethod
+    def _question_requests_apply_rules(question: str) -> bool:
+        normalized = str(question or "").upper()
+        tokens = ("异常", "超规", "规则", "预警", "风险", "告警", "是否正常", "是否异常", "RULE", "ALERT", "RISK")
+        return any(token in normalized for token in tokens)
+
+    @staticmethod
+    def _question_requests_metric_formula(question: str) -> bool:
+        normalized = str(question or "").upper()
+        tokens = ("率", "占比", "比例", "比率", "PERCENT", "RATIO", "RATE")
+        return any(token in normalized for token in tokens)
+
+    @staticmethod
+    def _question_requests_group_by_time_window(question: str) -> bool:
+        normalized = str(question or "").upper()
+        time_tokens = ("趋势", "按天", "按月", "按周", "每天", "每月", "每周", "近", "最近", "DAY", "WEEK", "MONTH", "TREND")
+        aggregate_tokens = ("多少", "数量", "统计", "趋势", "COUNT", "SUM", "AVG", "MIN", "MAX", "率", "占比")
+        return any(token in normalized for token in time_tokens) and any(token in normalized for token in aggregate_tokens)
+
+    def _question_requests_group_by_object_time_window(self, question: str) -> bool:
+        return self._question_requests_group_by_object(question) and self._question_requests_group_by_time_window(question)
+
+    @staticmethod
+    def _question_requests_order_and_limit(question: str) -> bool:
+        normalized = str(question or "").upper()
+        return any(token in normalized for token in ("TOP", "前", "最多", "排名", "最高", "最低", "BOTTOM"))
+
+    @staticmethod
+    def _question_requests_filter_aggregate_result(question: str) -> bool:
+        normalized = str(question or "").upper()
+        return any(token in normalized for token in ("大于", "超过", "高于", "至少", "不少于", "小于", "低于", "不高于", ">=", "<=", ">", "<"))
+
+    @staticmethod
+    def _extract_limit_value(question: str) -> int:
+        text = str(question or "").upper()
+        patterns = [
+            r"TOP\s*(\d+)",
+            r"前\s*(\d+)",
+            r"最多\s*(\d+)",
+            r"BOTTOM\s*(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return max(1, min(int(match.group(1)), 100))
+        return 10
+
+    @staticmethod
+    def _extract_numeric_threshold(question: str) -> Optional[Dict[str, Any]]:
+        text = str(question or "").upper()
+        patterns = [
+            (r"(?:不少于|至少|不低于)\s*(-?\d+(?:\.\d+)?)", ">="),
+            (r"(?:不高于|至多|最多)\s*(-?\d+(?:\.\d+)?)", "<="),
+            (r"(?:大于|高于|超过)\s*(-?\d+(?:\.\d+)?)", ">"),
+            (r"(?:小于|低于)\s*(-?\d+(?:\.\d+)?)", "<"),
+            (r">=\s*(-?\d+(?:\.\d+)?)", ">="),
+            (r"<=\s*(-?\d+(?:\.\d+)?)", "<="),
+            (r">\s*(-?\d+(?:\.\d+)?)", ">"),
+            (r"<\s*(-?\d+(?:\.\d+)?)", "<"),
+        ]
+        for pattern, operator in patterns:
+            match = re.search(pattern, text)
+            if match:
+                raw = match.group(1)
+                value = float(raw) if "." in raw else int(raw)
+                return {"operator": operator, "threshold": value}
+        return None
+
+    @staticmethod
+    def _load_rule_reference_items(skill_files: Dict[str, str]) -> List[Dict[str, Any]]:
+        try:
+            payload = json.loads(skill_files.get("references/rule-catalog.json") or "{}")
+        except (TypeError, ValueError):
+            return []
+        rules = payload.get("rules") if isinstance(payload, dict) else None
+        return rules if isinstance(rules, list) else []
+
+    @staticmethod
+    def _metric_reference_index(skill_files: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        metrics = AgentService._load_metric_reference_items(skill_files)
+        return {
+            str(item.get("metric_code") or item.get("metric_id") or "").strip().upper(): item
+            for item in metrics
+            if str(item.get("metric_code") or item.get("metric_id") or "").strip()
+        }
+
+    def _time_dimension_priority_score(self, property_name: str) -> int:
+        name = str(property_name or "").upper()
+        keywords = ("TIME", "DATE", "DATETIME", "DAY", "MONTH")
+        for index, keyword in enumerate(keywords):
+            if keyword in name:
+                return len(keywords) - index
+        return 0
+
+    def _time_dimension_candidates_for_label(
+        self,
+        *,
+        label: str,
+        node: Dict[str, Any],
+        execution_contract: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        contract_dimensions = ((execution_contract or {}).get("time_dimensions") or {}).get(label) or []
+        contract_candidates = [
+            str(item or "").upper()
+            for item in contract_dimensions
+            if str(item or "").upper()
+        ]
+        queryable = self._filter_queryable_properties(node)
+        queryable_set = set(queryable)
+        candidates = [item for item in contract_candidates if item in queryable_set]
+        inferred = [
+            item for item in queryable
+            if self._time_dimension_priority_score(item) > 0
+        ]
+        inferred.sort(key=lambda item: (self._time_dimension_priority_score(item), -queryable.index(item)), reverse=True)
+        for item in inferred:
+            if item not in candidates:
+                candidates.append(item)
+        return candidates[:3]
+
+    @staticmethod
+    def _extract_time_window(question: str) -> str:
+        normalized = str(question or "").upper()
+        direct = re.search(r"(近|最近)\s*(\d+)\s*(天|日|周|月)", normalized)
+        if direct:
+            value = int(direct.group(2))
+            unit = direct.group(3)
+            if unit in {"天", "日"}:
+                return f"{value}D"
+            if unit == "周":
+                return f"{value}W"
+            if unit == "月":
+                return f"{value}M"
+        if "本月" in normalized:
+            return "1M"
+        if "本周" in normalized:
+            return "1W"
+        if "今日" in normalized or "今天" in normalized:
+            return "1D"
+        return ""
+
+    @staticmethod
+    def _extract_time_granularity(question: str) -> str:
+        normalized = str(question or "").upper()
+        if any(token in normalized for token in ("按月", "每月", "MONTH")):
+            return "MONTH"
+        if any(token in normalized for token in ("按周", "每周", "WEEK")):
+            return "WEEK"
+        if any(token in normalized for token in ("按天", "每天", "每日", "DAY", "趋势", "近")):
+            return "DAY"
+        return "DAY"
+
+    def _graph_labels_for_metric(self, metric: Dict[str, Any], topology: Dict[str, Any]) -> List[str]:
+        labels = []
+        for value in (metric.get("entity_name"), metric.get("entity_display_name")):
+            token = str(value or "").strip()
+            if not token:
+                continue
+            labels.extend(self._graph_labels_for_entity(topology, token))
+        return list(dict.fromkeys(label for label in labels if label))
+
+    @staticmethod
+    def _first_queryable_primary_key(node: Dict[str, Any]) -> str:
+        for prop in node.get("properties") or []:
+            name = str(prop.get("property_name") or "").upper()
+            if prop.get("is_primary_key") == "Y" and re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", name):
+                return name
+        return ""
+
+    def _default_metric_column(self, node: Dict[str, Any]) -> str:
+        primary_key = self._first_queryable_primary_key(node)
+        if primary_key:
+            return primary_key
+        queryable = self._filter_queryable_properties(node)
+        return queryable[0] if queryable else ""
+
+    @staticmethod
+    def _property_priority_score(property_name: str) -> int:
+        name = str(property_name or "").upper()
+        if not name:
+            return 0
+        keywords = (
+            "NAME",
+            "CODE",
+            "NO",
+            "TYPE",
+            "STATUS",
+            "RESULT",
+            "CATEGORY",
+            "LEVEL",
+            "DATE",
+            "TIME",
+        )
+        for index, keyword in enumerate(keywords):
+            if keyword in name:
+                return len(keywords) - index
+        return 0
+
+    def _select_group_display_properties(
+        self,
+        node: Dict[str, Any],
+        requested: Optional[List[str]] = None,
+        max_count: int = 3,
+    ) -> List[str]:
+        queryable = self._filter_queryable_properties(node, requested)
+        if not queryable:
+            return []
+        primary_key = self._first_queryable_primary_key(node)
+        if requested:
+            requested_order = [name for name in queryable if name != primary_key]
+            preferred_requested = [
+                name for name in requested_order
+                if self._property_priority_score(name) > 0
+            ]
+            if preferred_requested:
+                return list(dict.fromkeys(preferred_requested))[:max_count]
+            if requested_order:
+                return list(dict.fromkeys(requested_order))[:max_count]
+        preferred = [
+            name for name in queryable
+            if name != primary_key and self._property_priority_score(name) > 0
+        ]
+        preferred.sort(key=lambda item: (self._property_priority_score(item), -queryable.index(item)), reverse=True)
+        selected = preferred[:max_count]
+        if not selected:
+            selected = [name for name in queryable if name != primary_key][:max_count]
+        if not selected and primary_key:
+            selected = [primary_key]
+        return list(dict.fromkeys(selected))[:max_count]
+
+    def _score_group_step_candidate(
+        self,
+        *,
+        question: str,
+        label: str,
+        display_properties: List[str],
+    ) -> int:
+        score = 30
+        upper_question = str(question or "").upper()
+        normalized_question = self._normalize_lookup_token(question)
+        for text in [label] + list(display_properties):
+            token = str(text or "").strip()
+            if not token:
+                continue
+            if token.upper() in upper_question:
+                score += 25
+            normalized_token = self._normalize_lookup_token(token)
+            if normalized_token and normalized_token in normalized_question:
+                score += 15
+        return score
+
+    def _score_fact_metric_candidate(
+        self,
+        *,
+        metric: Dict[str, Any],
+        question: str,
+        label: str,
+        step: Dict[str, Any],
+        step_index: int,
+        total_steps: int,
+    ) -> int:
+        score = 0
+        question_text = str(question or "")
+        upper_question = question_text.upper()
+        normalized_question = self._normalize_lookup_token(question_text)
+        if str(step.get("action") or "") == "expand_relations":
+            score += 20
+        score += max(0, total_steps - step_index)
+        for text in (
+            metric.get("metric_name"),
+            metric.get("metric_code"),
+            metric.get("metric_desc"),
+            metric.get("entity_name"),
+            metric.get("entity_display_name"),
+            label,
+        ):
+            token = str(text or "").strip()
+            if not token:
+                continue
+            if token.upper() in upper_question:
+                score += 30
+            normalized_token = self._normalize_lookup_token(token)
+            if normalized_token and normalized_token in normalized_question:
+                score += 20
+        return score
+
+    def _collect_metric_step_candidates(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+    ) -> List[Dict[str, Any]]:
+        steps = plan.get("steps") or []
+        metrics = self._load_metric_reference_items(skill_files)
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+        applicable = []
+        for step_index, step in enumerate(steps, start=1):
+            label = self._normalize_label_name(step.get("label"))
+            node = nodes_by_label.get(label)
+            if not node:
+                continue
+            for metric in metrics:
+                labels = self._graph_labels_for_metric(metric, topology)
+                if label not in labels:
+                    continue
+                method = str(metric.get("aggregation_method") or "").strip().upper()
+                if method not in {"COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"}:
+                    continue
+                expression = self._sanitize_metric_expression(metric, node)
+                if method in {"SUM", "AVG", "MIN", "MAX"} and not expression:
+                    continue
+                if method == "COUNT_DISTINCT" and not expression:
+                    expression = self._default_metric_column(node) or "*"
+                applicable.append({
+                    **metric,
+                    "_graph_label": label,
+                    "_expression": expression,
+                    "_step_id": step.get("step_id"),
+                    "_step_action": step.get("action"),
+                    "_path": step.get("path") or [],
+                    "_display_properties": step.get("display_properties") or [],
+                    "_score": self._score_fact_metric_candidate(
+                        metric=metric,
+                        question=question,
+                        label=label,
+                        step=step,
+                        step_index=step_index,
+                        total_steps=len(steps),
+                    ),
+                })
+        return applicable
+
+    @staticmethod
+    def _sanitize_metric_expression(metric: Dict[str, Any], node: Dict[str, Any]) -> Optional[str]:
+        property_names = {
+            str(prop.get("property_name") or "").upper()
+            for prop in (node.get("properties") or [])
+        }
+        expr = str(metric.get("calculation_expr") or "").strip().upper()
+        if not expr:
+            return None
+        if re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", expr) and expr in property_names:
+            return expr
+        if re.fullmatch(r"COUNT\s*\(\s*\*\s*\)", expr):
+            return "*"
+        return None
+
+    def _build_fact_aggregate_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._question_requests_fact_aggregate(question):
+            return None
+        steps = plan.get("steps") or []
+        if not steps:
+            return None
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        applicable = self._collect_metric_step_candidates(
+            plan=plan,
+            topology=topology,
+            skill_files=skill_files,
+            question=question,
+        )
+        if not applicable:
+            return None
+        applicable.sort(key=lambda item: item.get("_score") or 0, reverse=True)
+        metric = applicable[0]
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "fact_aggregate",
+            "label": metric.get("_graph_label") or root_label,
+            "root_label": root_label,
+            "scope": "related_object" if metric.get("_step_action") == "expand_relations" else "root_object",
+            "based_on_step": metric.get("_step_id") or root_step.get("step_id"),
+            "path": metric.get("_path") or [],
+            "metric_code": metric.get("metric_code") or metric.get("metric_id"),
+            "metric_name": metric.get("metric_name") or metric.get("metric_code"),
+            "aggregation_method": str(metric.get("aggregation_method") or "").strip().upper(),
+            "column_name": metric.get("_expression"),
+            "unit": metric.get("unit") or "",
+        }
+
+    def _build_group_by_object_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._question_requests_group_by_object(question):
+            return None
+        steps = plan.get("steps") or []
+        if len(steps) < 2:
+            return None
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+        metric_candidates = [
+            item for item in self._collect_metric_step_candidates(
+                plan=plan,
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+            )
+            if item.get("_step_action") == "expand_relations"
+        ]
+        metric_candidates.sort(key=lambda item: item.get("_score") or 0, reverse=True)
+        if metric_candidates:
+            metric = metric_candidates[0]
+            target_label = self._normalize_label_name(metric.get("_graph_label"))
+            target_node = nodes_by_label.get(target_label)
+            group_properties = self._select_group_display_properties(
+                target_node or {},
+                metric.get("_display_properties") or [],
+            )
+            if not target_node or not group_properties:
+                return None
+            return {
+                "step_id": f"s{len(steps) + 1}",
+                "action": "group_by_object",
+                "label": target_label,
+                "root_label": root_label,
+                "scope": "related_object",
+                "based_on_step": metric.get("_step_id"),
+                "path": metric.get("_path") or [],
+                "group_properties": group_properties,
+                "metric_code": metric.get("metric_code") or metric.get("metric_id"),
+                "metric_name": metric.get("metric_name") or metric.get("metric_code"),
+                "aggregation_method": str(metric.get("aggregation_method") or "").strip().upper(),
+                "column_name": metric.get("_expression"),
+                "unit": metric.get("unit") or "",
+            }
+
+        synthetic_candidates = []
+        for step in steps[1:]:
+            if str(step.get("action") or "") != "expand_relations":
+                continue
+            label = self._normalize_label_name(step.get("label"))
+            node = nodes_by_label.get(label)
+            if not node:
+                continue
+            group_properties = self._select_group_display_properties(node, step.get("display_properties") or [])
+            if not group_properties:
+                continue
+            synthetic_candidates.append({
+                "step": step,
+                "label": label,
+                "group_properties": group_properties,
+                "score": self._score_group_step_candidate(
+                    question=question,
+                    label=label,
+                    display_properties=group_properties,
+                ),
+            })
+        if not synthetic_candidates:
+            return None
+        synthetic_candidates.sort(key=lambda item: item.get("score") or 0, reverse=True)
+        selected = synthetic_candidates[0]
+        step = selected["step"]
+        target_node = nodes_by_label.get(selected["label"]) or {}
+        fallback_column = self._default_metric_column(target_node)
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "group_by_object",
+            "label": selected["label"],
+            "root_label": root_label,
+            "scope": "related_object",
+            "based_on_step": step.get("step_id"),
+            "path": step.get("path") or [],
+            "group_properties": selected["group_properties"],
+            "metric_code": f"{selected['label']}_COUNT",
+            "metric_name": f"{selected['label']}分组数量",
+            "aggregation_method": "COUNT_DISTINCT" if fallback_column else "COUNT",
+            "column_name": fallback_column,
+            "unit": "",
+        }
+
+    def _build_metric_aggregate_step_from_definition(
+        self,
+        *,
+        metric: Dict[str, Any],
+        label: str,
+        root_label: str,
+        base_step: Dict[str, Any],
+        node: Dict[str, Any],
+        step_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        method = str(metric.get("aggregation_method") or "").strip().upper()
+        if method not in {"COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"}:
+            return None
+        expression = self._sanitize_metric_expression(metric, node)
+        if method in {"SUM", "AVG", "MIN", "MAX"} and not expression:
+            return None
+        if method == "COUNT_DISTINCT" and not expression:
+            expression = self._default_metric_column(node) or "*"
+        return {
+            "step_id": step_id,
+            "action": "fact_aggregate",
+            "label": label,
+            "root_label": root_label,
+            "scope": "related_object" if str(base_step.get("action") or "") == "expand_relations" else "root_object",
+            "based_on_step": base_step.get("step_id"),
+            "path": base_step.get("path") or [],
+            "metric_code": metric.get("metric_code") or metric.get("metric_id"),
+            "metric_name": metric.get("metric_name") or metric.get("metric_code"),
+            "aggregation_method": method,
+            "column_name": expression,
+            "unit": metric.get("unit") or "",
+        }
+
+    def _build_group_by_time_window_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+        execution_contract: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._question_requests_group_by_time_window(question):
+            return None
+        steps = plan.get("steps") or []
+        if not steps:
+            return None
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+        metric_candidates = self._collect_metric_step_candidates(
+            plan=plan,
+            topology=topology,
+            skill_files=skill_files,
+            question=question,
+        )
+        metric_candidates.sort(key=lambda item: item.get("_score") or 0, reverse=True)
+        selected_metric = metric_candidates[0] if metric_candidates else None
+        selected_step = None
+        selected_label = ""
+        selected_node = None
+        if selected_metric:
+            selected_label = self._normalize_label_name(selected_metric.get("_graph_label"))
+            selected_node = nodes_by_label.get(selected_label)
+            selected_step = next((item for item in steps if item.get("step_id") == selected_metric.get("_step_id")), root_step)
+        else:
+            selected_step = next((item for item in reversed(steps) if str(item.get("action") or "") in {"expand_relations", "select_root"}), root_step)
+            selected_label = self._normalize_label_name(selected_step.get("label"))
+            selected_node = nodes_by_label.get(selected_label)
+        if not selected_node or not selected_step:
+            return None
+        time_dimensions = self._time_dimension_candidates_for_label(
+            label=selected_label,
+            node=selected_node,
+            execution_contract=execution_contract,
+        )
+        if not time_dimensions:
+            return None
+        metric_code = ""
+        metric_name = ""
+        aggregation_method = "COUNT"
+        column_name = ""
+        unit = ""
+        if selected_metric:
+            metric_code = selected_metric.get("metric_code") or selected_metric.get("metric_id")
+            metric_name = selected_metric.get("metric_name") or metric_code
+            aggregation_method = str(selected_metric.get("aggregation_method") or "").strip().upper() or "COUNT"
+            column_name = selected_metric.get("_expression")
+            unit = selected_metric.get("unit") or ""
+        else:
+            column_name = self._default_metric_column(selected_node)
+            aggregation_method = "COUNT_DISTINCT" if column_name else "COUNT"
+            metric_code = f"{selected_label}_TREND"
+            metric_name = f"{selected_label}趋势统计"
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "group_by_time_window",
+            "label": selected_label,
+            "root_label": root_label,
+            "scope": "related_object" if str(selected_step.get("action") or "") == "expand_relations" else "root_object",
+            "based_on_step": selected_step.get("step_id"),
+            "path": selected_step.get("path") or [],
+            "metric_code": metric_code,
+            "metric_name": metric_name,
+            "aggregation_method": aggregation_method,
+            "column_name": column_name,
+            "unit": unit,
+            "time_dimension": time_dimensions[0],
+            "time_granularity": self._extract_time_granularity(question),
+            "time_window": self._extract_time_window(question),
+        }
+
+    def _build_group_by_object_time_window_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+        execution_contract: Optional[Dict[str, Any]],
+        metric_override: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not metric_override and not self._question_requests_group_by_object_time_window(question):
+            return None
+        steps = plan.get("steps") or []
+        if len(steps) < 1:
+            return None
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+
+        selected_metric = metric_override
+        selected_step = None
+        selected_label = ""
+        selected_node = None
+
+        if selected_metric:
+            metric_step_id = str(selected_metric.get("_step_id") or "")
+            selected_step = next((item for item in steps if str(item.get("step_id") or "") == metric_step_id), None)
+            selected_label = self._normalize_label_name(selected_metric.get("_graph_label"))
+            selected_node = nodes_by_label.get(selected_label)
+        else:
+            metric_candidates = [
+                item for item in self._collect_metric_step_candidates(
+                    plan=plan,
+                    topology=topology,
+                    skill_files=skill_files,
+                    question=question,
+                )
+                if item.get("_step_action") == "expand_relations"
+            ]
+            metric_candidates.sort(key=lambda item: item.get("_score") or 0, reverse=True)
+            if metric_candidates:
+                selected_metric = metric_candidates[0]
+                selected_step = next((item for item in steps if item.get("step_id") == selected_metric.get("_step_id")), None)
+                selected_label = self._normalize_label_name(selected_metric.get("_graph_label"))
+                selected_node = nodes_by_label.get(selected_label)
+            else:
+                selected_step = next((item for item in steps[1:] if str(item.get("action") or "") == "expand_relations"), None)
+                if selected_step:
+                    selected_label = self._normalize_label_name(selected_step.get("label"))
+                    selected_node = nodes_by_label.get(selected_label)
+        if not selected_step or not selected_node or not selected_label:
+            return None
+        time_dimensions = self._time_dimension_candidates_for_label(
+            label=selected_label,
+            node=selected_node,
+            execution_contract=execution_contract,
+        )
+        group_properties = self._select_group_display_properties(
+            selected_node,
+            selected_step.get("display_properties") or [],
+        )
+        group_properties = [
+            item for item in group_properties
+            if item not in set(time_dimensions)
+        ]
+        if not group_properties:
+            group_properties = [
+                item for item in self._select_group_display_properties(selected_node)
+                if item not in set(time_dimensions)
+            ]
+        if not time_dimensions or not group_properties:
+            return None
+
+        metric_code = ""
+        metric_name = ""
+        aggregation_method = "COUNT"
+        column_name = ""
+        unit = ""
+        if selected_metric:
+            metric_code = selected_metric.get("metric_code") or selected_metric.get("metric_id")
+            metric_name = selected_metric.get("metric_name") or metric_code
+            aggregation_method = str(selected_metric.get("aggregation_method") or "").strip().upper() or "COUNT"
+            column_name = selected_metric.get("_expression")
+            unit = selected_metric.get("unit") or ""
+        else:
+            column_name = self._default_metric_column(selected_node)
+            aggregation_method = "COUNT_DISTINCT" if column_name else "COUNT"
+            metric_code = f"{selected_label}_OBJECT_TIME_COUNT"
+            metric_name = f"{selected_label}对象时间趋势统计"
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "group_by_object_time_window",
+            "label": selected_label,
+            "root_label": root_label,
+            "scope": "related_object" if str(selected_step.get("action") or "") == "expand_relations" else "root_object",
+            "based_on_step": selected_step.get("step_id"),
+            "path": selected_step.get("path") or [],
+            "group_properties": group_properties,
+            "metric_code": metric_code,
+            "metric_name": metric_name,
+            "aggregation_method": aggregation_method,
+            "column_name": column_name,
+            "unit": unit,
+            "time_dimension": time_dimensions[0],
+            "time_granularity": self._extract_time_granularity(question),
+            "time_window": self._extract_time_window(question),
+        }
+
+    def _build_metric_formula_steps(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+        execution_contract: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not self._question_requests_metric_formula(question):
+            return []
+        steps = plan.get("steps") or []
+        if not steps:
+            return []
+        metric_index = self._metric_reference_index(skill_files)
+        if not metric_index:
+            return []
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        nodes_by_label = self._build_topology_indexes(topology)["nodes_by_label"]
+        formula_metrics = []
+        normalized_question = self._normalize_lookup_token(question)
+        for metric in metric_index.values():
+            formula_type = str(metric.get("formula_type") or metric.get("aggregation_method") or "").strip().upper()
+            if formula_type not in {"RATIO", "RATE", "PERCENT"}:
+                continue
+            numerator_code = str(metric.get("numerator_metric_code") or "").strip().upper()
+            denominator_code = str(metric.get("denominator_metric_code") or "").strip().upper()
+            if not numerator_code or not denominator_code:
+                continue
+            name_tokens = [
+                self._normalize_lookup_token(metric.get("metric_name")),
+                self._normalize_lookup_token(metric.get("metric_code")),
+            ]
+            score = 0
+            for token in name_tokens:
+                if token and token in normalized_question:
+                    score += 40
+            formula_metrics.append((score, metric))
+        if not formula_metrics:
+            return []
+        formula_metrics.sort(key=lambda item: item[0], reverse=True)
+        formula_metric = formula_metrics[0][1]
+        candidate_steps = [
+            step for step in steps
+            if str(step.get("action") or "") in {"select_root", "expand_relations"}
+        ]
+        selected_base_step = None
+        selected_label = ""
+        selected_node = None
+        for base_step in candidate_steps:
+            label = self._normalize_label_name(base_step.get("label"))
+            node = nodes_by_label.get(label)
+            if not node:
+                continue
+            labels = self._graph_labels_for_metric(formula_metric, topology)
+            if labels and label not in labels:
+                continue
+            selected_base_step = base_step
+            selected_label = label
+            selected_node = node
+            break
+        if not selected_base_step or not selected_node:
+            return []
+        numerator_metric = metric_index.get(str(formula_metric.get("numerator_metric_code") or "").strip().upper())
+        denominator_metric = metric_index.get(str(formula_metric.get("denominator_metric_code") or "").strip().upper())
+        if not numerator_metric or not denominator_metric:
+            return []
+        object_time_mode = self._question_requests_group_by_object_time_window(question)
+        time_mode = self._question_requests_group_by_time_window(question)
+        time_dimension = self._time_dimension_candidates_for_label(
+            label=selected_label,
+            node=selected_node,
+            execution_contract=execution_contract,
+        )
+        if time_mode and not time_dimension:
+            time_mode = False
+            object_time_mode = False
+        next_step_no = len(steps) + 1
+        if object_time_mode:
+            numerator_step = self._build_group_by_object_time_window_step(
+                plan=plan,
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+                execution_contract=execution_contract,
+                metric_override={
+                    **numerator_metric,
+                    "_graph_label": selected_label,
+                    "_step_id": selected_base_step.get("step_id"),
+                    "_step_action": selected_base_step.get("action"),
+                    "_path": selected_base_step.get("path") or [],
+                    "_expression": self._sanitize_metric_expression(numerator_metric, selected_node) or self._default_metric_column(selected_node),
+                },
+            )
+            denominator_step = self._build_group_by_object_time_window_step(
+                plan=plan,
+                topology=topology,
+                skill_files=skill_files,
+                question=question,
+                execution_contract=execution_contract,
+                metric_override={
+                    **denominator_metric,
+                    "_graph_label": selected_label,
+                    "_step_id": selected_base_step.get("step_id"),
+                    "_step_action": selected_base_step.get("action"),
+                    "_path": selected_base_step.get("path") or [],
+                    "_expression": self._sanitize_metric_expression(denominator_metric, selected_node) or self._default_metric_column(selected_node),
+                },
+            )
+            if numerator_step:
+                numerator_step["step_id"] = f"s{next_step_no}"
+            if denominator_step:
+                denominator_step["step_id"] = f"s{next_step_no + 1}"
+        elif time_mode:
+            numerator_step = {
+                **(self._build_group_by_time_window_step(
+                    plan=plan,
+                    topology=topology,
+                    skill_files=skill_files,
+                    question=question,
+                    execution_contract=execution_contract,
+                ) or {}),
+                "step_id": f"s{next_step_no}",
+                "label": selected_label,
+                "root_label": root_label,
+                "scope": "related_object" if str(selected_base_step.get("action") or "") == "expand_relations" else "root_object",
+                "based_on_step": selected_base_step.get("step_id"),
+                "path": selected_base_step.get("path") or [],
+                "metric_code": numerator_metric.get("metric_code") or numerator_metric.get("metric_id"),
+                "metric_name": numerator_metric.get("metric_name") or numerator_metric.get("metric_code"),
+                "aggregation_method": str(numerator_metric.get("aggregation_method") or "").strip().upper(),
+                "column_name": self._sanitize_metric_expression(numerator_metric, selected_node) or self._default_metric_column(selected_node),
+                "unit": numerator_metric.get("unit") or "",
+                "time_dimension": time_dimension[0],
+                "time_granularity": self._extract_time_granularity(question),
+                "time_window": self._extract_time_window(question),
+            }
+            denominator_step = {
+                **numerator_step,
+                "step_id": f"s{next_step_no + 1}",
+                "metric_code": denominator_metric.get("metric_code") or denominator_metric.get("metric_id"),
+                "metric_name": denominator_metric.get("metric_name") or denominator_metric.get("metric_code"),
+                "aggregation_method": str(denominator_metric.get("aggregation_method") or "").strip().upper(),
+                "column_name": self._sanitize_metric_expression(denominator_metric, selected_node) or self._default_metric_column(selected_node),
+                "unit": denominator_metric.get("unit") or "",
+            }
+        else:
+            numerator_step = self._build_metric_aggregate_step_from_definition(
+                metric=numerator_metric,
+                label=selected_label,
+                root_label=root_label,
+                base_step=selected_base_step,
+                node=selected_node,
+                step_id=f"s{next_step_no}",
+            )
+            denominator_step = self._build_metric_aggregate_step_from_definition(
+                metric=denominator_metric,
+                label=selected_label,
+                root_label=root_label,
+                base_step=selected_base_step,
+                node=selected_node,
+                step_id=f"s{next_step_no + 1}",
+            )
+        if not numerator_step or not denominator_step:
+            return []
+        formula_step = {
+            "step_id": f"s{next_step_no + 2}",
+            "action": "metric_formula",
+            "label": selected_label,
+            "root_label": root_label,
+            "metric_code": formula_metric.get("metric_code") or formula_metric.get("metric_id"),
+            "metric_name": formula_metric.get("metric_name") or formula_metric.get("metric_code"),
+            "formula_type": str(formula_metric.get("formula_type") or formula_metric.get("aggregation_method") or "RATIO").strip().upper(),
+            "numerator_metric_code": numerator_step.get("metric_code"),
+            "denominator_metric_code": denominator_step.get("metric_code"),
+            "numerator_step_id": numerator_step.get("step_id"),
+            "denominator_step_id": denominator_step.get("step_id"),
+            "time_granularity": numerator_step.get("time_granularity", ""),
+            "group_properties": numerator_step.get("group_properties") or [],
+            "unit": formula_metric.get("unit") or "%",
+        }
+        return [numerator_step, denominator_step, formula_step]
+
+    def _build_filter_aggregate_result_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._question_requests_filter_aggregate_result(question):
+            return None
+        threshold = self._extract_numeric_threshold(question)
+        if not threshold:
+            return None
+        steps = plan.get("steps") or []
+        based_on = next(
+            (
+                item for item in reversed(steps)
+                if str(item.get("action") or "") in {"group_by_object", "group_by_object_time_window", "fact_aggregate", "group_by_time_window", "metric_formula"}
+            ),
+            None,
+        )
+        if not based_on:
+            return None
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "filter_aggregate_result",
+            "label": self._normalize_label_name(based_on.get("label")),
+            "based_on_step": based_on.get("step_id"),
+            "metric_code": based_on.get("metric_code"),
+            "metric_name": based_on.get("metric_name"),
+            "operator": threshold["operator"],
+            "threshold": threshold["threshold"],
+        }
+
+    def _build_order_and_limit_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._question_requests_order_and_limit(question):
+            return None
+        steps = plan.get("steps") or []
+        based_on = next(
+            (
+                item for item in reversed(steps)
+                if str(item.get("action") or "") in {"group_by_object", "group_by_object_time_window", "group_by_time_window", "metric_formula", "filter_aggregate_result"}
+            ),
+            None,
+        )
+        if not based_on:
+            return None
+        normalized = str(question or "").upper()
+        direction = "ASC" if any(token in normalized for token in ("最低", "最少", "BOTTOM")) else "DESC"
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "order_and_limit",
+            "label": self._normalize_label_name(based_on.get("label")),
+            "based_on_step": based_on.get("step_id"),
+            "metric_code": based_on.get("metric_code"),
+            "metric_name": based_on.get("metric_name"),
+            "order_by": "METRIC_VALUE",
+            "direction": direction,
+            "limit": self._extract_limit_value(question),
+        }
+
+    def _build_apply_rules_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+        skill_files: Dict[str, str],
+        question: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._load_rule_reference_items(skill_files):
+            return None
+        if not self._question_requests_apply_rules(question):
+            return None
+        steps = plan.get("steps") or []
+        based_on = next(
+            (
+                item for item in reversed(steps)
+                if str(item.get("action") or "") in {"group_by_object", "group_by_object_time_window", "fact_aggregate", "group_by_time_window", "metric_formula", "filter_aggregate_result", "order_and_limit"}
+            ),
+            None,
+        )
+        if not based_on:
+            return None
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "apply_rules",
+            "label": self._normalize_label_name(based_on.get("label")),
+            "based_on_step": based_on.get("step_id"),
+            "metric_code": based_on.get("metric_code"),
+        }
+
+    def _build_summarize_evidence_step(
+        self,
+        *,
+        plan: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        steps = plan.get("steps") or []
+        if not steps:
+            return None
+        if any(str(step.get("action") or "") == "summarize_evidence" for step in steps):
+            return None
+        return {
+            "step_id": f"s{len(steps) + 1}",
+            "action": "summarize_evidence",
+            "label": self._normalize_label_name((steps[-1] or {}).get("label")),
+            "based_on_step": (steps[-1] or {}).get("step_id"),
+        }
+
+    @staticmethod
+    def _build_fact_aggregate_expression(
+        aggregation_method: str,
+        column_name: str,
+        *,
+        fallback_column: str = "*",
+    ) -> str:
+        method = str(aggregation_method or "").upper()
+        column = str(column_name or "").upper()
+        fallback = str(fallback_column or "*").upper()
+        if method == "COUNT":
+            return "COUNT(*)"
+        if method == "COUNT_DISTINCT":
+            target = column or fallback or "*"
+            if target == "*":
+                return "COUNT(*)"
+            if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", target):
+                raise ValueError("事实聚合步骤缺少合法的去重列")
+            return f"COUNT(DISTINCT {target})"
+        if not column or not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", column):
+            raise ValueError("事实聚合步骤缺少合法的指标列")
+        return f"{method}({column})"
+
+    def _build_fact_aggregate_sql(
+        self,
+        *,
+        metric_step: Dict[str, Any],
+        root_node: Dict[str, Any],
+        graph_name: str = "",
+        root_step: Optional[Dict[str, Any]] = None,
+        based_on_step: Optional[Dict[str, Any]] = None,
+        target_node: Optional[Dict[str, Any]] = None,
+        filter_property: str,
+        filter_value: str,
+    ) -> str:
+        aggregation_method = str(metric_step.get("aggregation_method") or "").upper()
+        metric_code = str(metric_step.get("metric_code") or "METRIC_VALUE").upper()
+        column_name = str(metric_step.get("column_name") or "").upper()
+        based_on = based_on_step or root_step or {}
+        if str(based_on.get("action") or "") == "expand_relations":
+            if not graph_name:
+                raise ValueError("目标对象聚合缺少属性图名称")
+            related_node = target_node or root_node
+            path = based_on.get("path") or metric_step.get("path") or []
+            if not path:
+                raise ValueError("目标对象聚合缺少图路径")
+            root_label = self._normalize_label_name(root_node.get("displayName") or root_node.get("name"))
+            target_label = self._normalize_label_name(related_node.get("displayName") or related_node.get("name"))
+            filter_name = self._normalize_label_name(filter_property)
+            match_parts = [f"(r IS {root_label})"]
+            current_label = root_label
+            for hop_index, hop in enumerate(path, start=1):
+                next_label = self._normalize_label_name(hop.get("target"))
+                direction = hop.get("direction")
+                edge_label = self._normalize_label_name(hop.get("edge"))
+                alias = "t" if hop_index == len(path) else f"n{hop_index}"
+                relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+                match_parts.append(f"{relation}({alias} IS {next_label})")
+                current_label = next_label
+            if current_label != target_label:
+                raise ValueError("目标对象聚合路径终点与聚合对象不一致")
+            aggregate_alias = f"AGG_{column_name}" if column_name and column_name != "*" else ""
+            projections = []
+            if filter_name:
+                projections.append(f"r.{filter_name} AS ROOT_{filter_name}")
+            if aggregate_alias:
+                projections.append(f"t.{column_name} AS {aggregate_alias}")
+            elif not projections:
+                anchor_column = self._default_metric_column(related_node)
+                if not anchor_column:
+                    raise ValueError("目标对象聚合没有可用的锚点属性")
+                projections.append(f"t.{anchor_column} AS ROW_ANCHOR")
+            expression = self._build_fact_aggregate_expression(
+                aggregation_method,
+                aggregate_alias,
+                fallback_column=aggregate_alias or "*",
+            )
+            sql = f"""WITH related_rows AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name.upper()}
+    MATCH {''.join(match_parts)}
+    COLUMNS (
+      {', '.join(projections)}
+    )
+  )
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE, {expression} AS METRIC_VALUE
+FROM related_rows"""
+            if filter_name and filter_value:
+                sql += f"\nWHERE ROOT_{filter_name} = '{self._safe_graph_sql_literal(filter_value)}'"
+            return sql
+        table_name = SourceDataService._safe_graph_object_name(root_node.get("tableName") or "")
+        fallback_column = column_name or self._default_metric_column(root_node) or filter_property or "*"
+        expression = self._build_fact_aggregate_expression(
+            aggregation_method,
+            column_name,
+            fallback_column=fallback_column,
+        )
+        where_sql = ""
+        if filter_property and filter_value:
+            where_sql = f" WHERE {filter_property} = '{self._safe_graph_sql_literal(filter_value)}'"
+        return f"SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE, {expression} AS METRIC_VALUE FROM {table_name}{where_sql}"
+
+    def _build_group_by_object_sql(
+        self,
+        *,
+        group_step: Dict[str, Any],
+        root_node: Dict[str, Any],
+        graph_name: str,
+        based_on_step: Dict[str, Any],
+        target_node: Dict[str, Any],
+        filter_property: str,
+        filter_value: str,
+    ) -> str:
+        if str(based_on_step.get("action") or "") != "expand_relations":
+            raise ValueError("对象分组统计必须基于关系扩展步骤")
+        if not graph_name:
+            raise ValueError("对象分组统计缺少属性图名称")
+        path = based_on_step.get("path") or group_step.get("path") or []
+        if not path:
+            raise ValueError("对象分组统计缺少图路径")
+        root_label = self._normalize_label_name(root_node.get("displayName") or root_node.get("name"))
+        target_label = self._normalize_label_name(target_node.get("displayName") or target_node.get("name"))
+        filter_name = self._normalize_label_name(filter_property)
+        group_properties = self._select_group_display_properties(
+            target_node,
+            group_step.get("group_properties") or [],
+        )
+        if not group_properties:
+            raise ValueError("对象分组统计缺少可用分组字段")
+        column_name = str(group_step.get("column_name") or "").upper()
+        aggregate_alias = f"AGG_{column_name}" if column_name and column_name != "*" else ""
+        match_parts = [f"(r IS {root_label})"]
+        current_label = root_label
+        for hop_index, hop in enumerate(path, start=1):
+            next_label = self._normalize_label_name(hop.get("target"))
+            direction = hop.get("direction")
+            edge_label = self._normalize_label_name(hop.get("edge"))
+            alias = "t" if hop_index == len(path) else f"n{hop_index}"
+            relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+            match_parts.append(f"{relation}({alias} IS {next_label})")
+            current_label = next_label
+        if current_label != target_label:
+            raise ValueError("对象分组统计路径终点与目标对象不一致")
+        projections = []
+        if filter_name:
+            projections.append(f"r.{filter_name} AS ROOT_{filter_name}")
+        outer_group_columns = []
+        for property_name in group_properties:
+            alias = f"GROUP_{property_name}"
+            projections.append(f"t.{property_name} AS {alias}")
+            outer_group_columns.append((alias, property_name))
+        if aggregate_alias:
+            projections.append(f"t.{column_name} AS {aggregate_alias}")
+        elif not projections:
+            anchor_column = self._default_metric_column(target_node)
+            if anchor_column:
+                projections.append(f"t.{anchor_column} AS ROW_ANCHOR")
+        expression = self._build_fact_aggregate_expression(
+            str(group_step.get("aggregation_method") or ""),
+            aggregate_alias,
+            fallback_column=aggregate_alias or column_name or self._default_metric_column(target_node) or "*",
+        )
+        group_projection_sql = ", ".join(f"{alias} AS {property_name}" for alias, property_name in outer_group_columns)
+        group_by_sql = ", ".join(alias for alias, _property_name in outer_group_columns)
+        sql = f"""WITH related_rows AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name.upper()}
+    MATCH {''.join(match_parts)}
+    COLUMNS (
+      {', '.join(projections)}
+    )
+  )
+)
+SELECT '{self._safe_graph_sql_literal(str(group_step.get("metric_code") or "").upper())}' AS METRIC_CODE,
+       {group_projection_sql},
+       {expression} AS METRIC_VALUE
+FROM related_rows"""
+        if filter_name and filter_value:
+            sql += f"\nWHERE ROOT_{filter_name} = '{self._safe_graph_sql_literal(filter_value)}'"
+        sql += f"\nGROUP BY {group_by_sql}\nORDER BY METRIC_VALUE DESC"
+        return sql
+
+    def _build_filter_aggregate_result_sql(
+        self,
+        *,
+        base_sql: str,
+        filter_step: Dict[str, Any],
+    ) -> str:
+        operator = str(filter_step.get("operator") or "").strip()
+        if operator not in {">", ">=", "<", "<=", "=", "=="}:
+            raise ValueError("统计结果筛选步骤缺少合法的比较运算符")
+        threshold = filter_step.get("threshold")
+        if not isinstance(threshold, (int, float)):
+            raise ValueError("统计结果筛选步骤缺少合法阈值")
+        normalized_operator = "=" if operator == "==" else operator
+        return (
+            "SELECT * FROM (\n"
+            f"{base_sql}\n"
+            f") WHERE METRIC_VALUE {normalized_operator} {threshold}"
+        )
+
+    def _build_order_and_limit_sql(
+        self,
+        *,
+        base_sql: str,
+        order_step: Dict[str, Any],
+    ) -> str:
+        direction = str(order_step.get("direction") or "DESC").upper()
+        if direction not in {"ASC", "DESC"}:
+            raise ValueError("排序步骤方向不合法")
+        limit = max(1, min(int(order_step.get("limit") or 10), 100))
+        order_by = str(order_step.get("order_by") or "METRIC_VALUE").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", order_by):
+            raise ValueError("排序步骤字段不合法")
+        return (
+            "SELECT * FROM (\n"
+            f"{base_sql}\n"
+            f") ORDER BY {order_by} {direction} FETCH FIRST {limit} ROWS ONLY"
+        )
+
+    @staticmethod
+    def _time_bucket_expression(column_expr: str, granularity: str) -> str:
+        if granularity == "MONTH":
+            return f"TO_CHAR(TRUNC({column_expr}, 'MM'), 'YYYY-MM')"
+        if granularity == "WEEK":
+            return f"TO_CHAR(TRUNC({column_expr}, 'IW'), 'YYYY-MM-DD')"
+        return f"TO_CHAR(TRUNC({column_expr}), 'YYYY-MM-DD')"
+
+    @staticmethod
+    def _time_window_predicate(column_expr: str, time_window: str) -> str:
+        token = str(time_window or "").strip().upper()
+        if not token:
+            return ""
+        match = re.fullmatch(r"(\d+)([DWM])", token)
+        if not match:
+            return ""
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit == "D":
+            return f"{column_expr} >= TRUNC(SYSDATE) - {value}"
+        if unit == "W":
+            return f"{column_expr} >= TRUNC(SYSDATE, 'IW') - {value * 7}"
+        if unit == "M":
+            return f"{column_expr} >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -{value})"
+        return ""
+
+    def _build_group_by_time_window_sql(
+        self,
+        *,
+        time_step: Dict[str, Any],
+        root_node: Dict[str, Any],
+        graph_name: str,
+        root_step: Optional[Dict[str, Any]] = None,
+        based_on_step: Optional[Dict[str, Any]] = None,
+        target_node: Optional[Dict[str, Any]] = None,
+        filter_property: str,
+        filter_value: str,
+    ) -> str:
+        granularity = str(time_step.get("time_granularity") or "DAY").upper()
+        time_dimension = str(time_step.get("time_dimension") or "").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", time_dimension):
+            raise ValueError("时间分组步骤缺少合法时间维度")
+        aggregation_method = str(time_step.get("aggregation_method") or "").upper()
+        column_name = str(time_step.get("column_name") or "").upper()
+        metric_code = str(time_step.get("metric_code") or "").upper()
+        based_on = based_on_step or root_step or {}
+        time_window = str(time_step.get("time_window") or "").upper()
+        if str(based_on.get("action") or "") == "expand_relations":
+            if not graph_name:
+                raise ValueError("时间分组统计缺少属性图名称")
+            related_node = target_node or root_node
+            path = based_on.get("path") or time_step.get("path") or []
+            if not path:
+                raise ValueError("时间分组统计缺少图路径")
+            root_label = self._normalize_label_name(root_node.get("displayName") or root_node.get("name"))
+            target_label = self._normalize_label_name(related_node.get("displayName") or related_node.get("name"))
+            filter_name = self._normalize_label_name(filter_property)
+            match_parts = [f"(r IS {root_label})"]
+            current_label = root_label
+            for hop_index, hop in enumerate(path, start=1):
+                next_label = self._normalize_label_name(hop.get("target"))
+                direction = hop.get("direction")
+                edge_label = self._normalize_label_name(hop.get("edge"))
+                alias = "t" if hop_index == len(path) else f"n{hop_index}"
+                relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+                match_parts.append(f"{relation}({alias} IS {next_label})")
+                current_label = next_label
+            if current_label != target_label:
+                raise ValueError("时间分组路径终点与目标对象不一致")
+            aggregate_alias = f"AGG_{column_name}" if column_name and column_name != "*" else ""
+            projections = [f"t.{time_dimension} AS RAW_TIME"]
+            if filter_name:
+                projections.append(f"r.{filter_name} AS ROOT_{filter_name}")
+            if aggregate_alias:
+                projections.append(f"t.{column_name} AS {aggregate_alias}")
+            expression = self._build_fact_aggregate_expression(
+                aggregation_method,
+                aggregate_alias,
+                fallback_column=aggregate_alias or self._default_metric_column(related_node) or "*",
+            )
+            time_bucket = self._time_bucket_expression("RAW_TIME", granularity)
+            sql = f"""WITH time_rows AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name.upper()}
+    MATCH {''.join(match_parts)}
+    COLUMNS (
+      {', '.join(projections)}
+    )
+  )
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE,
+       {time_bucket} AS TIME_BUCKET,
+       {expression} AS METRIC_VALUE
+FROM time_rows"""
+            predicates = []
+            if filter_name and filter_value:
+                predicates.append(f"ROOT_{filter_name} = '{self._safe_graph_sql_literal(filter_value)}'")
+            time_window_predicate = self._time_window_predicate("RAW_TIME", time_window)
+            if time_window_predicate:
+                predicates.append(time_window_predicate)
+            if predicates:
+                sql += "\nWHERE " + " AND ".join(predicates)
+            sql += "\nGROUP BY " + time_bucket + "\nORDER BY TIME_BUCKET ASC"
+            return sql
+        table_name = SourceDataService._safe_graph_object_name(root_node.get("tableName") or "")
+        time_bucket = self._time_bucket_expression(time_dimension, granularity)
+        expression = self._build_fact_aggregate_expression(
+            aggregation_method,
+            column_name,
+            fallback_column=column_name or self._default_metric_column(root_node) or "*",
+        )
+        predicates = []
+        if filter_property and filter_value:
+            predicates.append(f"{filter_property} = '{self._safe_graph_sql_literal(filter_value)}'")
+        time_window_predicate = self._time_window_predicate(time_dimension, time_window)
+        if time_window_predicate:
+            predicates.append(time_window_predicate)
+        where_sql = f"\nWHERE {' AND '.join(predicates)}" if predicates else ""
+        return (
+            f"SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE, "
+            f"{time_bucket} AS TIME_BUCKET, {expression} AS METRIC_VALUE "
+            f"FROM {table_name}{where_sql} GROUP BY {time_bucket} ORDER BY TIME_BUCKET ASC"
+        )
+
+    def _build_metric_formula_sql(
+        self,
+        *,
+        formula_step: Dict[str, Any],
+        numerator_sql: str,
+        denominator_sql: str,
+    ) -> str:
+        formula_type = str(formula_step.get("formula_type") or "RATIO").upper()
+        metric_code = str(formula_step.get("metric_code") or "").upper()
+        if formula_type not in {"RATIO", "RATE", "PERCENT"}:
+            raise ValueError("当前仅支持 ratio/rate/percent 公式指标")
+        numerator_cte = "numerator_result"
+        denominator_cte = "denominator_result"
+        numerator_step_kind = str(formula_step.get("numerator_step_kind") or "").upper()
+        denominator_step_kind = str(formula_step.get("denominator_step_kind") or "").upper()
+        grouped = numerator_step_kind == "TIME_WINDOW_GROUP_BY" and denominator_step_kind == "TIME_WINDOW_GROUP_BY"
+        object_time_grouped = (
+            numerator_step_kind == "OBJECT_TIME_WINDOW_GROUP_BY"
+            and denominator_step_kind == "OBJECT_TIME_WINDOW_GROUP_BY"
+        )
+        if object_time_grouped:
+            group_properties = [
+                str(item or "").upper()
+                for item in (formula_step.get("group_properties") or [])
+                if str(item or "").upper()
+            ]
+            join_clauses = ["n.TIME_BUCKET = d.TIME_BUCKET"] + [f"n.{name} = d.{name}" for name in group_properties]
+            projection = ",\n       ".join(["n.TIME_BUCKET AS TIME_BUCKET"] + [f"n.{name} AS {name}" for name in group_properties])
+            return f"""WITH {numerator_cte} AS (
+{numerator_sql}
+),
+{denominator_cte} AS (
+{denominator_sql}
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE,
+       {projection},
+       CASE
+         WHEN d.METRIC_VALUE IS NULL OR d.METRIC_VALUE = 0 THEN NULL
+         ELSE ROUND((n.METRIC_VALUE / d.METRIC_VALUE) * 100, 4)
+       END AS METRIC_VALUE
+FROM {numerator_cte} n
+LEFT JOIN {denominator_cte} d
+  ON {' AND '.join(join_clauses)}
+ORDER BY n.TIME_BUCKET ASC"""
+        if grouped:
+            return f"""WITH {numerator_cte} AS (
+{numerator_sql}
+),
+{denominator_cte} AS (
+{denominator_sql}
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE,
+       n.TIME_BUCKET AS TIME_BUCKET,
+       CASE
+         WHEN d.METRIC_VALUE IS NULL OR d.METRIC_VALUE = 0 THEN NULL
+         ELSE ROUND((n.METRIC_VALUE / d.METRIC_VALUE) * 100, 4)
+       END AS METRIC_VALUE
+FROM {numerator_cte} n
+LEFT JOIN {denominator_cte} d
+  ON n.TIME_BUCKET = d.TIME_BUCKET
+ORDER BY n.TIME_BUCKET ASC"""
+        return f"""WITH {numerator_cte} AS (
+{numerator_sql}
+),
+{denominator_cte} AS (
+{denominator_sql}
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE,
+       CASE
+         WHEN d.METRIC_VALUE IS NULL OR d.METRIC_VALUE = 0 THEN NULL
+         ELSE ROUND((n.METRIC_VALUE / d.METRIC_VALUE) * 100, 4)
+       END AS METRIC_VALUE
+FROM {numerator_cte} n
+CROSS JOIN {denominator_cte} d"""
+
+    def _build_group_by_object_time_window_sql(
+        self,
+        *,
+        step: Dict[str, Any],
+        root_node: Dict[str, Any],
+        graph_name: str,
+        root_step: Optional[Dict[str, Any]] = None,
+        based_on_step: Optional[Dict[str, Any]] = None,
+        target_node: Optional[Dict[str, Any]] = None,
+        filter_property: str,
+        filter_value: str,
+    ) -> str:
+        granularity = str(step.get("time_granularity") or "DAY").upper()
+        time_dimension = str(step.get("time_dimension") or "").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", time_dimension):
+            raise ValueError("对象时间分组步骤缺少合法时间维度")
+        aggregation_method = str(step.get("aggregation_method") or "").upper()
+        column_name = str(step.get("column_name") or "").upper()
+        metric_code = str(step.get("metric_code") or "").upper()
+        group_properties = [str(item or "").upper() for item in (step.get("group_properties") or []) if str(item or "").upper()]
+        if not group_properties:
+            raise ValueError("对象时间分组步骤缺少对象分组字段")
+        based_on = based_on_step or root_step or {}
+        time_window = str(step.get("time_window") or "").upper()
+        if str(based_on.get("action") or "") == "expand_relations":
+            if not graph_name:
+                raise ValueError("对象时间分组统计缺少属性图名称")
+            related_node = target_node or root_node
+            path = based_on.get("path") or step.get("path") or []
+            if not path:
+                raise ValueError("对象时间分组统计缺少图路径")
+            root_label = self._normalize_label_name(root_node.get("displayName") or root_node.get("name"))
+            target_label = self._normalize_label_name(related_node.get("displayName") or related_node.get("name"))
+            filter_name = self._normalize_label_name(filter_property)
+            match_parts = [f"(r IS {root_label})"]
+            current_label = root_label
+            for hop_index, hop in enumerate(path, start=1):
+                next_label = self._normalize_label_name(hop.get("target"))
+                direction = hop.get("direction")
+                edge_label = self._normalize_label_name(hop.get("edge"))
+                alias = "t" if hop_index == len(path) else f"n{hop_index}"
+                relation = f"-[e{hop_index} IS {edge_label}]->" if direction == "OUT" else f"<-[e{hop_index} IS {edge_label}]-"
+                match_parts.append(f"{relation}({alias} IS {next_label})")
+                current_label = next_label
+            if current_label != target_label:
+                raise ValueError("对象时间分组路径终点与目标对象不一致")
+            aggregate_alias = f"AGG_{column_name}" if column_name and column_name != "*" else ""
+            projections = [f"t.{time_dimension} AS RAW_TIME"]
+            if filter_name:
+                projections.append(f"r.{filter_name} AS ROOT_{filter_name}")
+            outer_group_columns = []
+            for property_name in group_properties:
+                alias = f"GROUP_{property_name}"
+                projections.append(f"t.{property_name} AS {alias}")
+                outer_group_columns.append((alias, property_name))
+            if aggregate_alias:
+                projections.append(f"t.{column_name} AS {aggregate_alias}")
+            expression = self._build_fact_aggregate_expression(
+                aggregation_method,
+                aggregate_alias,
+                fallback_column=aggregate_alias or self._default_metric_column(related_node) or "*",
+            )
+            time_bucket = self._time_bucket_expression("RAW_TIME", granularity)
+            group_projection_sql = ", ".join(f"{alias} AS {property_name}" for alias, property_name in outer_group_columns)
+            group_by_sql = ", ".join(["TIME_BUCKET"] + [alias for alias, _ in outer_group_columns])
+            sql = f"""WITH object_time_rows AS (
+  SELECT *
+  FROM GRAPH_TABLE(
+    {graph_name.upper()}
+    MATCH {''.join(match_parts)}
+    COLUMNS (
+      {', '.join(projections)}
+    )
+  )
+)
+SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE,
+       {time_bucket} AS TIME_BUCKET,
+       {group_projection_sql},
+       {expression} AS METRIC_VALUE
+FROM object_time_rows"""
+            predicates = []
+            if filter_name and filter_value:
+                predicates.append(f"ROOT_{filter_name} = '{self._safe_graph_sql_literal(filter_value)}'")
+            time_window_predicate = self._time_window_predicate("RAW_TIME", time_window)
+            if time_window_predicate:
+                predicates.append(time_window_predicate)
+            if predicates:
+                sql += "\nWHERE " + " AND ".join(predicates)
+            sql += f"\nGROUP BY {group_by_sql}\nORDER BY TIME_BUCKET ASC"
+            return sql
+        table_name = SourceDataService._safe_graph_object_name(root_node.get("tableName") or "")
+        time_bucket = self._time_bucket_expression(time_dimension, granularity)
+        expression = self._build_fact_aggregate_expression(
+            aggregation_method,
+            column_name,
+            fallback_column=column_name or self._default_metric_column(root_node) or "*",
+        )
+        predicates = []
+        if filter_property and filter_value:
+            predicates.append(f"{filter_property} = '{self._safe_graph_sql_literal(filter_value)}'")
+        time_window_predicate = self._time_window_predicate(time_dimension, time_window)
+        if time_window_predicate:
+            predicates.append(time_window_predicate)
+        where_sql = f"\nWHERE {' AND '.join(predicates)}" if predicates else ""
+        group_projection_sql = ", ".join(group_properties)
+        group_by_sql = ", ".join([time_bucket] + group_properties)
+        return (
+            f"SELECT '{self._safe_graph_sql_literal(metric_code)}' AS METRIC_CODE, "
+            f"{time_bucket} AS TIME_BUCKET, {group_projection_sql}, {expression} AS METRIC_VALUE "
+            f"FROM {table_name}{where_sql} GROUP BY {group_by_sql} ORDER BY TIME_BUCKET ASC"
+        )
+
+    async def _resolve_managed_skill_plan(
+        self,
+        *,
+        skill_markdown: str,
+        skill_files: Optional[Dict[str, str]] = None,
+        question: str,
+        conversation_context: str,
+        topology: Dict[str, Any],
+        llm_config: SysLLMConfig,
+        skill_guidance: str = "",
+        execution_contract: Optional[Dict[str, Any]] = None,
+        planning_feedback: str = "",
+        excluded_root_labels: Optional[List[str]] = None,
+        excluded_target_labels: Optional[List[str]] = None,
+        preferred_root_label: str = "",
+    ) -> Dict[str, Any]:
+        intent_type = self._derive_managed_skill_intent_type(question)
+        nodes = topology.get("nodes") or []
+        indexes = self._build_topology_indexes(topology)
+        nodes_by_label = indexes["nodes_by_label"]
+        contract = execution_contract or {}
+        excluded_roots = {
+            self._normalize_label_name(item)
+            for item in (excluded_root_labels or [])
+            if self._normalize_label_name(item)
+        }
+        excluded_targets = {
+            self._normalize_label_name(item)
+            for item in (excluded_target_labels or [])
+            if self._normalize_label_name(item)
+        }
+        preferred_root = self._normalize_label_name(preferred_root_label)
+        matched_reference_pattern = self._select_reference_pattern(question, contract, topology)
+        if matched_reference_pattern:
+            reference_plan = self._build_plan_from_reference_pattern(
+                pattern=matched_reference_pattern,
+                intent_type=intent_type,
+                topology=topology,
+                skill_files=skill_files or {},
+                question=question,
+                conversation_context=conversation_context,
+                contract=contract,
+                excluded_roots=excluded_roots,
+                excluded_targets=excluded_targets,
+                preferred_root=preferred_root,
+            )
+            if reference_plan:
+                return reference_plan
+        candidate_catalog = [
+            {
+                "label": self._normalize_label_name(node.get("displayName") or node.get("name")),
+                "properties": [str(prop.get("property_name") or "").upper() for prop in (node.get("properties") or [])[:20]],
+            }
+            for node in nodes[:80]
+        ]
+        planner_prompt = f"""根据用户问题、Skill 语义和 Oracle Property Graph 拓扑，生成一个受控的查询计划。
+只返回 JSON，格式：
+{{
+  "root_label":"起点节点标签",
+  "filter_property":"过滤属性",
+  "filter_value":"过滤值",
+  "root_properties":["起点展示属性"],
+  "target_labels":["目标节点标签"],
+  "target_properties":{{"目标节点标签":["展示属性"]}},
+  "reason":"不超过80字"
+}}
+
+规则：
+1. root_label、filter_property、target_labels 和属性名必须来自候选节点。
+2. filter_value 必须来自当前问题；只有当前问题没有精确编码时才可从会话上下文继承。
+3. 若问题只需单对象回答，可返回空的 target_labels。
+4. 若问题明确要求多个对象或关系链路，优先返回多个 target_labels。
+5. target_labels 最多 {MANAGED_SKILL_TEST_PLAN_MAX_TARGETS} 个；每个对象展示属性最多 {MANAGED_SKILL_TEST_PLAN_MAX_PROPERTIES} 个。
+6. 不返回 SQL，不编造对象、属性、关系和过滤值。
+
+Skill 语义与策略：
+{skill_guidance[:12000] or '无'}
+
+执行契约：
+{json.dumps(contract, ensure_ascii=False)}
+
+规划反馈：
+{planning_feedback or '无'}
+
+避免重复选择的起点对象：
+{json.dumps(list(excluded_roots), ensure_ascii=False)}
+
+避免重复选择的目标对象：
+{json.dumps(list(excluded_targets), ensure_ascii=False)}
+
+优先保留的起点对象：
+{preferred_root or '无'}
+
+当前问题：{question}
+会话上下文：{conversation_context or '无'}
+候选节点：{json.dumps(candidate_catalog, ensure_ascii=False)}"""
+        raw = await self.llm_service.call_llm(
+            "你是 Oracle Property Graph 受控计划生成器，只返回合法 JSON 计划。",
+            planner_prompt,
+            llm_config,
+            timeout_override=max(llm_config.timeout, 60),
+        )
+        plan_data = self.llm_service._extract_json_object(raw or "") or {}
+        if not isinstance(plan_data, dict):
+            plan_data = {}
+        root_label = self._normalize_label_name(plan_data.get("root_label"))
+        filter_property = self._normalize_label_name(plan_data.get("filter_property"))
+        filter_value = str(plan_data.get("filter_value") or "").strip()
+        root_properties = [
+            str(name or "").upper() for name in (plan_data.get("root_properties") or [])
+            if isinstance(plan_data.get("root_properties"), list)
+        ]
+        target_labels = []
+        for item in plan_data.get("target_labels") or []:
+            label = self._normalize_label_name(item)
+            if label and label != root_label and label in nodes_by_label and label not in target_labels and label not in excluded_targets:
+                target_labels.append(label)
+        target_labels = target_labels[:MANAGED_SKILL_TEST_PLAN_MAX_TARGETS]
+        raw_target_properties = plan_data.get("target_properties") if isinstance(plan_data.get("target_properties"), dict) else {}
+        target_properties = {
+            self._normalize_label_name(label): [str(name or "").upper() for name in values][:MANAGED_SKILL_TEST_PLAN_MAX_PROPERTIES]
+            for label, values in raw_target_properties.items()
+            if isinstance(values, list) and self._normalize_label_name(label) in target_labels
+        }
+        known_text = f"{question}\n{conversation_context}".upper()
+        identifier_match = re.search(r"\b(?:BOT|BATCH|CASE|PACK|PALLET|STACK|OUT|TRANS)-[A-Z0-9_.:/-]+\b", known_text)
+        if not filter_value and identifier_match:
+            filter_value = identifier_match.group(0)
+        if root_label in excluded_roots:
+            root_label = ""
+        if not root_label and preferred_root and preferred_root in nodes_by_label and preferred_root not in excluded_roots:
+            root_label = preferred_root
+        if root_label not in nodes_by_label:
+            contract_entry = next(
+                (
+                    self._normalize_label_name(item)
+                    for item in (contract.get("entry_objects") or [])
+                    if self._normalize_label_name(item) and self._normalize_label_name(item) not in excluded_roots
+                ),
+                "",
+            )
+            root_label = contract_entry
+        if root_label not in nodes_by_label and len(nodes) == 1:
+            root_label = self._normalize_label_name(nodes[0].get("displayName") or nodes[0].get("name"))
+        if root_label not in nodes_by_label:
+            selected_node = await self._select_managed_skill_graph_node(
+                skill_markdown=skill_markdown,
+                question=question,
+                llm_config=llm_config,
+                topology=topology,
+                skill_guidance=skill_guidance,
+            )
+            root_label = self._normalize_label_name(selected_node.get("displayName") or selected_node.get("name"))
+            if root_label in excluded_roots:
+                root_label = next(
+                    (
+                        self._normalize_label_name(node.get("displayName") or node.get("name"))
+                        for node in nodes
+                        if self._normalize_label_name(node.get("displayName") or node.get("name")) not in excluded_roots
+                    ),
+                    root_label,
+                )
+        if preferred_root and preferred_root in nodes_by_label and preferred_root not in excluded_roots:
+            root_label = preferred_root
+        root_node = nodes_by_label.get(root_label)
+        if not root_node:
+            raise ValueError("Agent 未能为当前问题选择有效的本体起点对象")
+        if not filter_property:
+            root_properties_by_name = {
+                str(prop.get("property_name") or "").upper(): prop
+                for prop in (root_node.get("properties") or [])
+            }
+            for candidate_name in ("BOTTLE_CODE", "BATCH_NO", "CASE_CODE", "PACK_CODE", "PALLET_CODE", "STACK_CODE", "OUTBOUND_NO"):
+                if candidate_name in root_properties_by_name and candidate_name in known_text:
+                    filter_property = candidate_name
+                    break
+            if not filter_property:
+                filter_property = next(
+                    (
+                        str(prop.get("property_name") or "").upper()
+                        for prop in (root_node.get("properties") or [])
+                        if prop.get("is_primary_key") == "Y"
+                    ),
+                    "",
+                )
+        if filter_value and filter_value.upper() not in known_text:
+            filter_value = ""
+        if filter_property and not filter_value:
+            fallback_match = re.search(r"\b[A-Z0-9][A-Z0-9_.:/-]{3,}\b", question.upper())
+            if fallback_match:
+                filter_value = fallback_match.group(0)
+        plan_seed = self._build_seed_steps_for_managed_skill_plan(
+            topology=topology,
+            root_label=root_label,
+            filter_property=filter_property,
+            filter_value=filter_value,
+            root_properties=root_properties,
+            target_labels=target_labels,
+            target_properties=target_properties,
+        )
+        additional_steps = self._append_managed_skill_plan_actions(
+            plan_seed=plan_seed,
+            forced_actions=None,
+            topology=topology,
+            skill_files=skill_files or {},
+            question=question,
+            execution_contract=contract,
+        )
+        return {
+            "plan_version": "1.0",
+            "intent_type": intent_type,
+            "reason": str(plan_data.get("reason") or "根据当前问题选择本体对象并扩展相关关系。").strip()[:200],
+            "selected_objects": plan_seed.get("selected_objects") or [],
+            "planning_mode": "LLM_PLAN",
+            "reference_pattern_id": "",
+            "steps": (list(plan_seed.get("steps") or []) + additional_steps)[:MANAGED_SKILL_TEST_PLAN_MAX_STEPS],
+        }
+
+    def _plan_step_title(self, step: Dict[str, Any]) -> str:
+        action = str(step.get("action") or "")
+        label = self._normalize_label_name(step.get("label"))
+        if action == "select_root":
+            return f"选择起点对象 {label}"
+        if action == "expand_relations":
+            return f"扩展关联对象 {label}"
+        if action == "group_by_object":
+            return f"按对象分组统计 {label}"
+        if action == "group_by_object_time_window":
+            return f"按对象与时间统计 {label}"
+        if action == "filter_aggregate_result":
+            return f"筛选统计结果 {label}"
+        if action == "order_and_limit":
+            return f"排序截取结果 {label}"
+        if action == "apply_rules":
+            return f"规则判定 {label}"
+        if action == "summarize_evidence":
+            return f"总结证据 {label}"
+        if action == "group_by_time_window":
+            return f"按时间窗口统计 {label}"
+        if action == "metric_formula":
+            return f"计算公式指标 {step.get('metric_name') or step.get('metric_code') or label}"
+        if action == "fact_aggregate":
+            return f"聚合指标 {step.get('metric_name') or step.get('metric_code') or label}"
+        return label or "执行步骤"
+
+    def _plan_step_detail(self, step: Dict[str, Any]) -> str:
+        action = str(step.get("action") or "")
+        label = self._normalize_label_name(step.get("label"))
+        if action == "select_root":
+            filter_config = step.get("filter") or {}
+            return f"以 {label} 作为起点对象，使用 {filter_config.get('property') or '主键'} = {filter_config.get('value') or '未指定'} 做受限检索。"
+        if action == "expand_relations":
+            path = step.get("path") or []
+            route = " -> ".join([self._normalize_label_name(label)] + [self._normalize_label_name(item.get("target")) for item in path])
+            return f"沿图关系路径扩展关联对象，路径为 {route}。"
+        if action == "group_by_object":
+            route = " -> ".join(
+                [self._normalize_label_name(step.get("root_label"))]
+                + [self._normalize_label_name(item.get("target")) for item in (step.get("path") or [])]
+            )
+            group_properties = ", ".join(step.get("group_properties") or []) or "对象标识字段"
+            return f"先沿 {route} 定位到 {label}，再按 {group_properties} 分组执行 {step.get('aggregation_method') or '聚合'} 统计。"
+        if action == "group_by_object_time_window":
+            route = " -> ".join(
+                [self._normalize_label_name(step.get("root_label"))]
+                + [self._normalize_label_name(item.get("target")) for item in (step.get("path") or [])]
+            )
+            group_properties = ", ".join(step.get("group_properties") or []) or "对象标识字段"
+            return (
+                f"先沿 {route} 定位到 {label}，再按 {group_properties} 和 {step.get('time_dimension') or '时间字段'} "
+                f"执行 {step.get('time_granularity') or 'DAY'} 粒度统计。"
+            )
+        if action == "filter_aggregate_result":
+            return f"对统计结果执行阈值筛选，仅保留 METRIC_VALUE {step.get('operator') or ''} {step.get('threshold')} 的记录。"
+        if action == "order_and_limit":
+            return f"按 {step.get('order_by') or 'METRIC_VALUE'} {step.get('direction') or 'DESC'} 排序，并截取前 {step.get('limit') or 10} 条记录。"
+        if action == "apply_rules":
+            return "基于 Skill 规则目录对当前统计结果执行异常判定与规则命中识别。"
+        if action == "summarize_evidence":
+            return "汇总本轮证据表，生成结构化证据摘要。"
+        if action == "group_by_time_window":
+            return (
+                f"基于 {step.get('time_dimension') or '时间字段'} 按 {step.get('time_granularity') or 'DAY'} 聚合，"
+                f"统计指标 {step.get('metric_name') or step.get('metric_code')}，时间窗口 {step.get('time_window') or '未指定'}。"
+            )
+        if action == "metric_formula":
+            return (
+                f"使用公式 {step.get('formula_type') or 'RATIO'}，"
+                f"基于 {step.get('numerator_metric_code')} / {step.get('denominator_metric_code')} 计算指标 "
+                f"{step.get('metric_name') or step.get('metric_code')}。"
+            )
+        if action == "fact_aggregate":
+            if step.get("path"):
+                route = " -> ".join(
+                    [self._normalize_label_name(step.get("root_label"))]
+                    + [self._normalize_label_name(item.get("target")) for item in (step.get("path") or [])]
+                )
+                return f"先沿 {route} 定位到 {label}，再对指标 {step.get('metric_name') or step.get('metric_code')} 执行 {step.get('aggregation_method') or '聚合'} 统计。"
+            return f"基于 {label} 对指标 {step.get('metric_name') or step.get('metric_code')} 执行 {step.get('aggregation_method') or '聚合'} 统计。"
+        return "执行受控查询。"
+
+    def _build_managed_skill_evidence_tables(
+        self,
+        *,
+        plan: Dict[str, Any],
+        topology: Dict[str, Any],
+        source_id: str,
+        schema: Optional[str],
+        sample_limit: int,
+        event_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        graph_name = str(topology.get("graph_name") or "").upper()
+        indexes = self._build_topology_indexes(topology)
+        nodes_by_label = indexes["nodes_by_label"]
+        steps = plan.get("steps") or []
+        if not steps:
+            raise ValueError("当前执行计划没有可执行步骤")
+        root_step = steps[0]
+        root_label = self._normalize_label_name(root_step.get("label"))
+        root_node = nodes_by_label.get(root_label)
+        if not root_node:
+            raise ValueError("起点对象不存在于当前属性图")
+        step_lookup = {
+            str(item.get("step_id") or ""): item
+            for item in steps
+            if str(item.get("step_id") or "")
+        }
+        filter_config = root_step.get("filter") or {}
+        filter_property = self._normalize_label_name(filter_config.get("property"))
+        filter_value = str(filter_config.get("value") or "").strip()
+        evidence_tables: List[Dict[str, Any]] = []
+        executed_queries: List[Dict[str, Any]] = []
+        execution_events: List[Dict[str, Any]] = []
+        for step_index, step in enumerate(steps, start=1):
+            action = str(step.get("action") or "")
+            label = self._normalize_label_name(step.get("label"))
+            if action == "select_root":
+                sql = self._build_graph_root_query_sql(
+                    graph_name,
+                    root_node,
+                    filter_property,
+                    filter_value,
+                    step.get("display_properties") or [],
+                )
+                title = f"{label} 本体对象属性"
+                kind = "GRAPH_ROOT"
+                related_objects = [label]
+            elif action == "expand_relations":
+                target_node = nodes_by_label.get(label)
+                path = step.get("path") or []
+                if not target_node or not path:
+                    continue
+                sql = self._build_graph_relation_query_sql(
+                    graph_name,
+                    root_node,
+                    target_node,
+                    path,
+                    filter_property,
+                    filter_value,
+                    root_step.get("display_properties") or [],
+                    step.get("display_properties") or [],
+                )
+                title = f"{root_label} 关联 {label}"
+                kind = "GRAPH_RELATION"
+                related_objects = [root_label, label]
+            elif action == "fact_aggregate":
+                based_on_step = step_lookup.get(str(step.get("based_on_step") or "")) or root_step
+                target_node = nodes_by_label.get(label)
+                sql = self._build_fact_aggregate_sql(
+                    metric_step=step,
+                    root_node=root_node,
+                    graph_name=graph_name,
+                    root_step=root_step,
+                    based_on_step=based_on_step,
+                    target_node=target_node,
+                    filter_property=filter_property,
+                    filter_value=filter_value,
+                )
+                title = f"{label} 指标聚合：{step.get('metric_name') or step.get('metric_code')}"
+                kind = "FACT_AGGREGATE"
+                related_objects = [root_label, label] if str(step.get("scope") or "") == "related_object" and label != root_label else [label]
+            elif action == "group_by_object":
+                based_on_step = step_lookup.get(str(step.get("based_on_step") or "")) or {}
+                target_node = nodes_by_label.get(label)
+                if not target_node:
+                    continue
+                sql = self._build_group_by_object_sql(
+                    group_step=step,
+                    root_node=root_node,
+                    graph_name=graph_name,
+                    based_on_step=based_on_step,
+                    target_node=target_node,
+                    filter_property=filter_property,
+                    filter_value=filter_value,
+                )
+                title = f"{label} 分组统计：{step.get('metric_name') or step.get('metric_code')}"
+                kind = "OBJECT_GROUP_BY"
+                related_objects = [root_label, label]
+            else:
+                continue
+            execution_events.append({
+                "event_type": "STEP_SQL_COMPILED",
+                "step_id": step.get("step_id"),
+                "title": self._plan_step_title(step),
+                "status": "READY",
+                "detail": self._plan_step_detail(step),
+                "payload": {"sql": sql},
+            })
+            if event_callback:
+                event_callback(execution_events[-1])
+            if kind in {"FACT_AGGREGATE", "OBJECT_GROUP_BY"}:
+                result = self.source_service.execute_remote_readonly_sql(
+                    source_id=source_id,
+                    query_sql=sql,
+                    schema=schema,
+                    row_limit=sample_limit,
+                )
+            else:
+                result = self.source_service.execute_remote_graph_query(
+                    source_id=source_id,
+                    graph_sql=sql,
+                    schema=schema,
+                    row_limit=sample_limit,
+                )
+            evidence = {
+                "key": f"evidence_{step.get('step_id')}",
+                "step_id": step.get("step_id"),
+                "title": title,
+                "kind": kind,
+                "related_objects": related_objects,
+                "sql": sql,
+                "row_count": len(result.get("rows", [])),
+                "columns": [{"column_name": column} for column in (result.get("columns") or [])],
+                "sample_rows": result.get("rows", []),
+            }
+            evidence_tables.append(evidence)
+            executed_queries.append({
+                "purpose": title,
+                "sql": sql,
+                "row_count": evidence["row_count"],
+            })
+            execution_events.append({
+                "event_type": "STEP_EXECUTED",
+                "step_id": step.get("step_id"),
+                "title": self._plan_step_title(step),
+                "status": "SUCCESS",
+                "detail": f"{title} 查询完成，返回 {evidence['row_count']} 条记录。",
+                "payload": {"row_count": evidence["row_count"], "evidence_key": evidence["key"]},
+            })
+            if event_callback:
+                event_callback(execution_events[-1])
+            if step_index == 1 and evidence["row_count"] == 0:
+                execution_events.append({
+                    "event_type": "TURN_WARNING",
+                    "step_id": step.get("step_id"),
+                    "title": self._plan_step_title(step),
+                    "status": "WARNING",
+                    "detail": "起点对象未命中任何记录，后续关系扩展可能为空。",
+                    "payload": {},
+                })
+                if event_callback:
+                    event_callback(execution_events[-1])
+        return {
+            "evidence_tables": evidence_tables,
+            "executed_queries": executed_queries,
+            "execution_events": execution_events,
+        }
+
+    @staticmethod
+    def _build_table_preview_from_evidence(evidence_tables: List[Dict[str, Any]]) -> Dict[str, Any]:
+        first = next((item for item in evidence_tables if item.get("sample_rows")), evidence_tables[0] if evidence_tables else None)
+        if not first:
+            return {"columns": [], "sample_rows": []}
+        return {
+            "columns": first.get("columns") or [],
+            "sample_rows": first.get("sample_rows") or [],
+        }
+
+    @staticmethod
+    def _extract_analysis_reference_codes(reference_text: str, key: str) -> List[str]:
+        try:
+            payload = json.loads(reference_text or "{}")
+        except (TypeError, ValueError):
+            return []
+        values = payload.get(key) if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            return []
+        codes = []
+        for item in values[:12]:
+            if not isinstance(item, dict):
+                continue
+            for field in ("metric_code", "metric_name", "rule_name", "activity_name"):
+                value = str(item.get(field) or "").strip()
+                if value:
+                    codes.append(value)
+                    break
+        return codes
+
+    @staticmethod
+    def _to_numeric_metric_value(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _trend_group_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+        excluded = {"METRIC_CODE", "METRIC_VALUE", "TIME_BUCKET", "RULE_NAME", "RULE_CATEGORY", "RULE_DESC", "ACTIVITY_NAME", "OPERATOR", "THRESHOLD"}
+        return {
+            str(key).upper(): value
+            for key, value in (row or {}).items()
+            if str(key).upper() not in excluded
+        }
+
+    @staticmethod
+    def _infer_time_bucket_granularity(time_buckets: List[str]) -> str:
+        buckets = [str(item or "").strip() for item in time_buckets if str(item or "").strip()]
+        if not buckets:
+            return "UNKNOWN"
+        if all(re.fullmatch(r"\d{4}-\d{2}", item) for item in buckets):
+            return "MONTH"
+        if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", item) for item in buckets):
+            if len(buckets) >= 2:
+                try:
+                    dates = [datetime.strptime(item, "%Y-%m-%d") for item in buckets]
+                    deltas = [
+                        abs((dates[index + 1] - dates[index]).days)
+                        for index in range(len(dates) - 1)
+                    ]
+                    if deltas and all(delta == 7 for delta in deltas):
+                        return "WEEK"
+                except ValueError:
+                    pass
+            return "DAY"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _period_comparison_label(granularity: str) -> str:
+        return {
+            "DAY": "DOD",
+            "WEEK": "WOW",
+            "MONTH": "MOM",
+        }.get(granularity, "PERIOD")
+
+    def _build_trend_summaries(self, evidence_tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        summaries: List[Dict[str, Any]] = []
+        trend_kinds = {"TIME_WINDOW_GROUP_BY", "OBJECT_TIME_WINDOW_GROUP_BY", "METRIC_FORMULA"}
+        for evidence in evidence_tables:
+            if str(evidence.get("kind") or "") not in trend_kinds:
+                continue
+            rows = [item for item in (evidence.get("sample_rows") or []) if isinstance(item, dict) and item.get("TIME_BUCKET")]
+            if len(rows) < 2:
+                continue
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                group_fields = self._trend_group_fields(row)
+                key = json.dumps(group_fields, ensure_ascii=False, sort_keys=True)
+                grouped.setdefault(key, []).append(row)
+            for key, points in grouped.items():
+                parsed_group = self._safe_json_loads(key, {}) if key else {}
+                ordered_points = sorted(points, key=lambda item: str(item.get("TIME_BUCKET") or ""))
+                granularity = self._infer_time_bucket_granularity(
+                    [item.get("TIME_BUCKET") for item in ordered_points]
+                )
+                numeric_points = [
+                    {
+                        "time_bucket": item.get("TIME_BUCKET"),
+                        "metric_value": self._to_numeric_metric_value(item.get("METRIC_VALUE")),
+                    }
+                    for item in ordered_points
+                ]
+                numeric_points = [item for item in numeric_points if item.get("metric_value") is not None]
+                if len(numeric_points) < 2:
+                    continue
+                peak_point = max(numeric_points, key=lambda item: item["metric_value"])
+                trough_point = min(numeric_points, key=lambda item: item["metric_value"])
+                deltas = [
+                    numeric_points[index + 1]["metric_value"] - numeric_points[index]["metric_value"]
+                    for index in range(len(numeric_points) - 1)
+                ]
+                direction = "FLAT"
+                if deltas and all(delta > 0 for delta in deltas):
+                    direction = "RISING"
+                elif deltas and all(delta < 0 for delta in deltas):
+                    direction = "FALLING"
+                elif deltas and any(delta > 0 for delta in deltas) and any(delta < 0 for delta in deltas):
+                    direction = "VOLATILE"
+                change_value = numeric_points[-1]["metric_value"] - numeric_points[0]["metric_value"]
+                change_rate = None
+                if numeric_points[0]["metric_value"] not in (None, 0):
+                    change_rate = round((change_value / numeric_points[0]["metric_value"]) * 100, 4)
+                previous_bucket = numeric_points[-2]["time_bucket"]
+                previous_value = numeric_points[-2]["metric_value"]
+                period_change_value = numeric_points[-1]["metric_value"] - previous_value
+                period_change_rate = None
+                if previous_value not in (None, 0):
+                    period_change_rate = round((period_change_value / previous_value) * 100, 4)
+                comparison_label = self._period_comparison_label(granularity)
+                max_rise_bucket = None
+                max_drop_bucket = None
+                max_rise_value = None
+                max_drop_value = None
+                if deltas:
+                    max_rise_index, max_rise = max(enumerate(deltas), key=lambda item: item[1])
+                    max_drop_index, max_drop = min(enumerate(deltas), key=lambda item: item[1])
+                    max_rise_bucket = numeric_points[max_rise_index + 1]["time_bucket"]
+                    max_drop_bucket = numeric_points[max_drop_index + 1]["time_bucket"]
+                    max_rise_value = round(max_rise, 4)
+                    max_drop_value = round(max_drop, 4)
+                avg_abs_delta = (sum(abs(delta) for delta in deltas) / len(deltas)) if deltas else 0
+                spike_buckets = []
+                for delta_index, delta in enumerate(deltas):
+                    if avg_abs_delta > 0 and abs(delta) >= max(5, avg_abs_delta * 1.4):
+                        spike_buckets.append(numeric_points[delta_index + 1]["time_bucket"])
+                summaries.append({
+                    "evidence_key": evidence.get("key"),
+                    "title": evidence.get("title"),
+                    "metric_code": evidence.get("metric_code") or (ordered_points[0].get("METRIC_CODE") if ordered_points else ""),
+                    "group": parsed_group,
+                    "time_granularity": granularity,
+                    "point_count": len(numeric_points),
+                    "start_bucket": numeric_points[0]["time_bucket"],
+                    "start_value": numeric_points[0]["metric_value"],
+                    "end_bucket": numeric_points[-1]["time_bucket"],
+                    "end_value": numeric_points[-1]["metric_value"],
+                    "change_value": round(change_value, 4),
+                    "comparison_type": comparison_label,
+                    "previous_bucket": previous_bucket,
+                    "previous_value": previous_value,
+                    "period_change_value": round(period_change_value, 4),
+                    "period_change_rate": period_change_rate,
+                    "peak_bucket": peak_point["time_bucket"],
+                    "peak_value": peak_point["metric_value"],
+                    "trough_bucket": trough_point["time_bucket"],
+                    "trough_value": trough_point["metric_value"],
+                    "direction": direction,
+                    "change_rate": change_rate,
+                    "max_rise_bucket": max_rise_bucket,
+                    "max_rise_value": max_rise_value,
+                    "max_drop_bucket": max_drop_bucket,
+                    "max_drop_value": max_drop_value,
+                    "spike_buckets": spike_buckets,
+                })
+        return summaries[:20]
+
+    def _build_analysis_flags(self, evidence_tables: List[Dict[str, Any]], trend_summaries: List[Dict[str, Any]]) -> List[str]:
+        flags = []
+        if any(str(item.get("kind") or "") == "RULE_APPLICATION" and (item.get("row_count") or 0) > 0 for item in evidence_tables):
+            flags.append("RULE_HIT")
+        directions = {str(item.get("direction") or "") for item in trend_summaries}
+        if "RISING" in directions:
+            flags.append("RISING_TREND")
+        if "FALLING" in directions:
+            flags.append("FALLING_TREND")
+        if "VOLATILE" in directions:
+            flags.append("VOLATILE_TREND")
+        if any((item.get("peak_value") or 0) == (item.get("trough_value") or 0) for item in trend_summaries):
+            flags.append("FLAT_SEGMENT")
+        if any(item.get("spike_buckets") for item in trend_summaries):
+            flags.append("ANOMALOUS_SPIKE")
+        if any(item.get("comparison_type") == "MOM" for item in trend_summaries):
+            flags.append("MOM_AVAILABLE")
+        if any(item.get("comparison_type") == "WOW" for item in trend_summaries):
+            flags.append("WOW_AVAILABLE")
+        if any(item.get("comparison_type") == "DOD" for item in trend_summaries):
+            flags.append("DOD_AVAILABLE")
+        return self._normalize_string_list(flags)
+
+    def _build_period_comparisons(self, trend_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        comparisons = []
+        for item in trend_summaries:
+            comparisons.append({
+                "evidence_key": item.get("evidence_key"),
+                "metric_code": item.get("metric_code"),
+                "group": item.get("group") or {},
+                "comparison_type": item.get("comparison_type"),
+                "previous_bucket": item.get("previous_bucket"),
+                "previous_value": item.get("previous_value"),
+                "period_change_value": item.get("period_change_value"),
+                "period_change_rate": item.get("period_change_rate"),
+                "start_bucket": item.get("start_bucket"),
+                "end_bucket": item.get("end_bucket"),
+                "change_value": item.get("change_value"),
+                "change_rate": item.get("change_rate"),
+                "max_rise_bucket": item.get("max_rise_bucket"),
+                "max_rise_value": item.get("max_rise_value"),
+                "max_drop_bucket": item.get("max_drop_bucket"),
+                "max_drop_value": item.get("max_drop_value"),
+                "spike_buckets": item.get("spike_buckets") or [],
+            })
+        return comparisons[:20]
+
+    def _build_top_findings(self, trend_summaries: List[Dict[str, Any]], evidence_tables: List[Dict[str, Any]]) -> List[str]:
+        findings: List[str] = []
+        sorted_trends = sorted(
+            trend_summaries,
+            key=lambda item: abs(float(item.get("change_value") or 0)),
+            reverse=True,
+        )
+        for item in sorted_trends[:3]:
+            group_text = ", ".join(f"{key}={value}" for key, value in (item.get("group") or {}).items()) or "整体"
+            findings.append(
+                f"{group_text} 在 {item.get('start_bucket')} 到 {item.get('end_bucket')} 间"
+                f"{'上升' if item.get('direction') == 'RISING' else '下降' if item.get('direction') == 'FALLING' else '波动'} "
+                f"{item.get('change_value')}"
+            )
+            if item.get("period_change_rate") is not None:
+                findings.append(
+                    f"{group_text} 最新一期较 {item.get('previous_bucket')} 的 {item.get('comparison_type')} 变化率为 {item.get('period_change_rate')}%"
+                )
+            if item.get("change_rate") is not None:
+                findings.append(
+                    f"{group_text} 变化率为 {item.get('change_rate')}%，峰值出现在 {item.get('peak_bucket')}"
+                )
+            if item.get("spike_buckets"):
+                findings.append(
+                    f"{group_text} 在 {', '.join(item.get('spike_buckets') or [])} 出现异常波动"
+                )
+        rule_hits = [
+            row for evidence in evidence_tables
+            if str(evidence.get("kind") or "") == "RULE_APPLICATION"
+            for row in (evidence.get("sample_rows") or [])
+            if isinstance(row, dict)
+        ]
+        for row in rule_hits[:2]:
+            findings.append(
+                f"规则命中：{row.get('RULE_NAME') or '未命名规则'}，"
+                f"METRIC_VALUE={row.get('METRIC_VALUE')}"
+            )
+        return findings[:5]
+
+    def _build_managed_skill_analysis_result(
+        self,
+        *,
+        agent_output: str,
+        plan: Dict[str, Any],
+        evidence_tables: List[Dict[str, Any]],
+        skill_files: Dict[str, str],
+    ) -> Dict[str, Any]:
+        applied_metrics = self._normalize_string_list([
+            item.get("metric_code")
+            for item in evidence_tables
+            if item.get("metric_code")
+        ]) or self._extract_analysis_reference_codes(skill_files.get("references/metric-catalog.json", ""), "metrics")
+        matched_rules = self._normalize_string_list([
+            row.get("RULE_NAME")
+            for item in evidence_tables
+            if item.get("kind") == "RULE_APPLICATION"
+            for row in (item.get("sample_rows") or [])
+            if isinstance(row, dict)
+        ]) or self._extract_analysis_reference_codes(skill_files.get("references/rule-catalog.json", ""), "rules")
+        suggested_activities = self._normalize_string_list([
+            row.get("ACTIVITY_NAME")
+            for item in evidence_tables
+            if item.get("kind") == "RULE_APPLICATION"
+            for row in (item.get("sample_rows") or [])
+            if isinstance(row, dict)
+        ]) or self._extract_analysis_reference_codes(skill_files.get("references/activity-playbook.json", ""), "activities")
+        trend_summaries = self._build_trend_summaries(evidence_tables)
+        analysis_flags = self._build_analysis_flags(evidence_tables, trend_summaries)
+        period_comparisons = self._build_period_comparisons(trend_summaries)
+        top_findings = self._build_top_findings(trend_summaries, evidence_tables)
+        return {
+            "summary": agent_output,
+            "intent_type": plan.get("intent_type"),
+            "selected_objects": plan.get("selected_objects") or [],
+            "evidence_table_keys": [item.get("key") for item in evidence_tables],
+            "applied_metrics": applied_metrics,
+            "matched_rules": matched_rules,
+            "suggested_activities": suggested_activities,
+            "trend_summaries": trend_summaries,
+            "analysis_flags": analysis_flags,
+            "period_comparisons": period_comparisons,
+            "top_findings": top_findings,
+        }
 
     async def _select_managed_skill_graph_node(
         self,
@@ -2036,6 +5393,7 @@ Skill：
         ontology_model_reference = self._build_ontology_model_reference(ontology_model)
         ontology_graph_binding_reference = self._build_ontology_graph_binding_reference(ontology_graph_binding)
         strategy_reference = self._build_analysis_strategy_reference(skill, skill_context, topology)
+        execution_contract_reference = self._build_execution_contract_reference(skill_context, topology)
         fallback = {
             "SKILL.md": self._build_skill_markdown(domain, process, entity, skill, topology, skill_context),
             "references/property-graph.md": graph_reference,
@@ -2046,6 +5404,7 @@ Skill：
             "references/rule-catalog.json": rule_reference,
             "references/activity-playbook.json": activity_reference,
             "references/analysis-strategy.md": strategy_reference,
+            "references/execution-contract.json": execution_contract_reference,
         }
         system_prompt = """你是 Agent Skill 打包专家。根据用户给出的技能配置、业务流程和 Oracle Property Graph 实时拓扑，生成可直接被 Agent 加载的技能包文件。
 
@@ -2106,6 +5465,7 @@ Skill：
                 files.setdefault("references/rule-catalog.json", rule_reference)
                 files.setdefault("references/activity-playbook.json", activity_reference)
                 files.setdefault("references/analysis-strategy.md", strategy_reference)
+                files.setdefault("references/execution-contract.json", execution_contract_reference)
                 return files
         except Exception:
             pass
@@ -2221,6 +5581,141 @@ Skill：
             "usage": "Agent 只能从这里的活动中选择建议动作；默认只建议，不直接执行。",
         }, ensure_ascii=False, indent=2)
 
+    def _build_execution_contract_reference(self, skill_context: Dict[str, Any], topology: Dict[str, Any]) -> str:
+        analysis_semantics = (skill_context or {}).get("analysis_semantics") or {}
+        ontology_graph_binding = (skill_context or {}).get("ontology_graph_binding") or {}
+        ontology_model = (skill_context or {}).get("ontology_model") or {}
+        matched_labels = [
+            self._normalize_label_name(item.get("graph_labels", [None])[0] if isinstance(item.get("graph_labels"), list) else None)
+            for item in (ontology_graph_binding.get("entity_bindings") or [])
+            if item.get("matched")
+        ]
+        matched_labels = [item for item in matched_labels if item]
+        entry_entity_ids = analysis_semantics.get("analysis_profile", {}).get("entry_entity_ids") or []
+        entity_bindings_by_id = {
+            item.get("entity_id"): item for item in (ontology_graph_binding.get("entity_bindings") or [])
+        }
+        entry_objects = []
+        for entity_id in entry_entity_ids:
+            binding = entity_bindings_by_id.get(entity_id) or {}
+            for label in binding.get("graph_labels") or []:
+                normalized = self._normalize_label_name(label)
+                if normalized and normalized not in entry_objects:
+                    entry_objects.append(normalized)
+        if not entry_objects:
+            entry_objects = matched_labels[:6]
+        target_objects = matched_labels[:12]
+        entity_aliases_by_label: Dict[str, List[str]] = {}
+        property_aliases_by_label: Dict[str, List[str]] = {}
+        entities_by_id = {
+            item.get("entity_id"): item
+            for item in (ontology_model.get("entities") or [])
+            if item.get("entity_id")
+        }
+        for binding in (ontology_graph_binding.get("entity_bindings") or []):
+            if not binding.get("matched"):
+                continue
+            aliases = [
+                str(binding.get("entity_display_name") or "").strip(),
+                str(binding.get("entity_name") or "").strip(),
+            ]
+            entity_meta = entities_by_id.get(binding.get("entity_id")) or {}
+            aliases.extend([
+                str(entity_meta.get("entity_display_name") or "").strip(),
+                str(entity_meta.get("entity_name") or "").strip(),
+            ])
+            for label in binding.get("graph_labels") or []:
+                normalized = self._normalize_label_name(label)
+                if normalized:
+                    entity_aliases_by_label.setdefault(normalized, [])
+                    entity_aliases_by_label[normalized].extend([item for item in aliases if item])
+        for binding in (ontology_graph_binding.get("property_bindings") or []):
+            aliases = [
+                str(binding.get("property_display_name") or "").strip(),
+                str(binding.get("property_name") or "").strip(),
+            ]
+            for matched in (binding.get("matched_columns") or []):
+                label = self._normalize_label_name(matched.get("graph_label"))
+                if label:
+                    property_aliases_by_label.setdefault(label, [])
+                    property_aliases_by_label[label].extend([item for item in aliases if item])
+        required_display_properties: Dict[str, List[str]] = {}
+        time_dimensions: Dict[str, List[str]] = {}
+        for metric in analysis_semantics.get("metrics") or []:
+            entity_id = metric.get("entity_id")
+            binding = entity_bindings_by_id.get(entity_id) or {}
+            for label in binding.get("graph_labels") or []:
+                normalized = self._normalize_label_name(label)
+                if normalized:
+                    required_display_properties.setdefault(normalized, [])
+        nodes_by_label = {
+            self._normalize_label_name(node.get("displayName") or node.get("name")): node
+            for node in (topology.get("nodes") or [])
+        }
+        for label in target_objects or entry_objects:
+            node = nodes_by_label.get(self._normalize_label_name(label)) or {}
+            candidates = self._time_dimension_candidates_for_label(
+                label=self._normalize_label_name(label),
+                node=node,
+                execution_contract={},
+            )
+            if candidates:
+                time_dimensions[self._normalize_label_name(label)] = candidates
+        query_modes = ["single_node", "path_expand"]
+        if analysis_semantics.get("metrics"):
+            query_modes.append("fact_aggregate")
+            query_modes.append("group_by_object")
+            query_modes.append("group_by_object_time_window")
+            query_modes.append("group_by_time_window")
+            query_modes.append("metric_formula")
+            query_modes.append("filter_aggregate_result")
+            query_modes.append("order_and_limit")
+        if analysis_semantics.get("rules"):
+            query_modes.append("apply_rules")
+        all_labels = list(dict.fromkeys(entry_objects + (target_objects or [])))
+        object_aliases = self._build_reference_object_aliases(all_labels, entity_aliases_by_label)
+        property_aliases = self._build_reference_property_aliases(
+            labels=all_labels,
+            topology=topology,
+            explicit_aliases=property_aliases_by_label,
+        )
+        explicit_relation_aliases: Dict[str, List[str]] = {}
+        for binding in (ontology_graph_binding.get("relation_bindings") or []):
+            aliases = [
+                str(binding.get("relation_name") or "").strip(),
+                str(binding.get("source_entity_name") or "").strip(),
+                str(binding.get("target_entity_name") or "").strip(),
+            ]
+            for edge in (binding.get("matched_edges") or []):
+                relation_key = self._reference_relation_key(
+                    self._normalize_label_name(edge.get("graph_source_label")),
+                    self._normalize_label_name(edge.get("graph_target_label")),
+                )
+                if relation_key != "->":
+                    explicit_relation_aliases.setdefault(relation_key, [])
+                    explicit_relation_aliases[relation_key].extend([item for item in aliases if item])
+        contract_payload = {
+            "entry_objects": entry_objects,
+            "target_objects": target_objects or [
+                self._normalize_label_name(node.get("displayName") or node.get("name"))
+                for node in (topology.get("nodes") or [])[:12]
+            ],
+            "query_modes": query_modes,
+            "preferred_paths": [],
+            "required_display_properties": required_display_properties,
+            "time_dimensions": time_dimensions,
+            "object_aliases": object_aliases,
+            "property_aliases": property_aliases,
+            "relation_aliases": self._build_reference_relation_aliases(
+                topology=topology,
+                object_aliases=object_aliases,
+                explicit_aliases=explicit_relation_aliases,
+            ),
+            "forbidden_properties": ["RAW_JSON", "LARGE_CLOB"],
+        }
+        contract_payload["reference_patterns"] = self._default_managed_skill_reference_patterns(contract_payload)
+        return json.dumps(contract_payload, ensure_ascii=False, indent=2)
+
     def _build_analysis_strategy_reference(self, skill: SysAgentSkill, skill_context: Dict[str, Any], topology: Dict[str, Any]) -> str:
         analysis_profile = (skill_context or {}).get("analysis_semantics", {}).get("analysis_profile", {})
         graph_map = (skill_context or {}).get("analysis_semantics", {}).get("graph_semantic_map", {})
@@ -2316,6 +5811,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 - 先参考 `references/ontology-model.json` 理解平台定义的本体对象、属性、关系语义。
 - 再参考 `references/ontology-graph-binding.json` 确认本体定义如何映射到当前已部署 Property Graph。
 - 只使用 `references/property-graph.md` 中存在的图标签、关系和属性；不要臆造对象。
+- 参考 `references/execution-contract.json` 中的入口对象、目标对象、查询模式和字段约束生成受控查询计划。
 - 只使用 `references/metric-catalog.json` 中的指标口径做聚合或趋势解释。
 - 只使用 `references/rule-catalog.json` 中的规则做异常判定、风险分级和派生结论。
 - 只使用 `references/activity-playbook.json` 中的活动输出建议动作；默认不直接执行活动。
@@ -2346,6 +5842,7 @@ description: {skill.skill_desc or f'面向{domain.domain_name}的{skill.skill_na
 - `references/rule-catalog.json`：当前技能允许使用的业务规则。
 - `references/activity-playbook.json`：当前技能允许输出的业务活动建议。
 - `references/analysis-strategy.md`：当前技能的分析策略、限制和图语义绑定摘要。
+- `references/execution-contract.json`：当前技能的入口对象、目标对象、查询模式和受控字段约束。
 """
 
     async def test_skill(self, skill_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:

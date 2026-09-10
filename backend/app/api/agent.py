@@ -138,6 +138,45 @@ async def get_managed_skill_test_session(
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@router.get("/managed-skill-test-sessions/{session_id}/events")
+async def stream_managed_skill_test_events(
+    session_id: str,
+    turn_no: Optional[int] = Query(default=None),
+    delay_ms: int = Query(default=0, ge=0, le=1000),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    service = AgentService(db)
+    try:
+        domain_id = service.get_managed_skill_test_session_owner_domain(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if domain_id:
+        ensure_domain_access(db, current_user, domain_id)
+    try:
+        event_stream = await service.stream_managed_skill_test_events(session_id, turn_no=turn_no, delay_ms=delay_ms)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return StreamingResponse(event_stream, media_type="text/event-stream")
+
+
+@router.post("/managed-skills/{managed_skill_id}/test-session/start", response_model=ApiResponse)
+async def start_managed_skill_test_session(
+    managed_skill_id: str,
+    req: AgentSkillTestRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_domain_access(db, current_user, req.domain_id)
+    try:
+        data = AgentService(db).start_managed_skill_test_session(managed_skill_id, req.model_dump(), current_user.get("username", "unknown"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"初始化托管 Skill 测试会话失败: {str(exc)}")
+    return ApiResponse(data=data)
+
+
 @router.post("/managed-skills/{managed_skill_id}/test", response_model=ApiResponse)
 async def test_managed_agent_skill(
     managed_skill_id: str,
@@ -153,6 +192,28 @@ async def test_managed_agent_skill(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"托管 Skill 测试失败: {str(exc)}")
     return ApiResponse(data=data)
+
+
+@router.post("/managed-skills/{managed_skill_id}/test/stream")
+async def stream_test_managed_agent_skill(
+    managed_skill_id: str,
+    req: AgentSkillTestRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_domain_access(db, current_user, req.domain_id)
+    service = AgentService(db)
+    try:
+        event_stream = await service.stream_managed_skill_test_turn(
+            managed_skill_id,
+            req.model_dump(),
+            current_user.get("username", "unknown"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"托管 Skill 流式测试失败: {str(exc)}")
+    return StreamingResponse(event_stream, media_type="text/event-stream")
 
 
 @router.get("/skills/{skill_id}", response_model=ApiResponse)

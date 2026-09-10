@@ -1183,6 +1183,96 @@ class SourceDataService:
 
         return self._run_with_remote_retry(source, f"execute_remote_graph_query:{source_id}", action)
 
+    def execute_remote_readonly_sql(
+        self,
+        source_id: str,
+        query_sql: str,
+        schema: Optional[str] = None,
+        row_limit: int = 200,
+    ) -> Dict[str, Any]:
+        """Execute a read-only SELECT / WITH query with a bounded result set."""
+        source = self._get_data_source(source_id)
+        normalized_sql = (query_sql or "").strip().rstrip(";")
+        upper_sql = normalized_sql.upper()
+        if not normalized_sql:
+            raise ValueError("只读 SQL 不能为空")
+        if not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")):
+            raise ValueError("只允许执行 SELECT / WITH 只读 SQL")
+        blocked_tokens = [" INSERT ", " UPDATE ", " DELETE ", " MERGE ", " DROP ", " ALTER ", " TRUNCATE ", " GRANT ", " REVOKE ", " COMMENT ", " EXECUTE ", " BEGIN ", " DECLARE "]
+        if any(token in f" {upper_sql} " for token in blocked_tokens):
+            raise ValueError("只读 SQL 仅允许查询语句")
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "readonly_sql_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            limited_sql = f"SELECT * FROM (\n{normalized_sql}\n) FETCH FIRST {max(1, min(row_limit, 1000))} ROWS ONLY"
+            self._execute_remote_sql(cursor, source, limited_sql)
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = [
+                {columns[index]: self._normalize_cell_value(value) for index, value in enumerate(row)}
+                for row in self._fetchall_logged(cursor, source, "readonly_sql")
+            ]
+            return {
+                "source_id": source_id,
+                "source_name": source.source_name,
+                "schema": owner,
+                "columns": columns,
+                "rows": rows,
+            }
+
+        return self._run_with_remote_retry(source, f"execute_remote_readonly_sql:{source_id}", action)
+
+    def validate_remote_readonly_sql(
+        self,
+        source_id: str,
+        query_sql: str,
+        schema: Optional[str] = None,
+    ) -> None:
+        """Ask Oracle to parse a read-only SQL statement without retrieving data."""
+        source = self._get_data_source(source_id)
+        normalized_sql = (query_sql or "").strip().rstrip(";")
+        upper_sql = normalized_sql.upper()
+        if not normalized_sql or not (upper_sql.startswith("SELECT") or upper_sql.startswith("WITH")):
+            raise ValueError("待校验 SQL 必须是只读 SELECT / WITH 查询")
+        blocked_tokens = [" INSERT ", " UPDATE ", " DELETE ", " MERGE ", " DROP ", " ALTER ", " TRUNCATE ", " GRANT ", " REVOKE ", " COMMENT ", " EXECUTE ", " BEGIN ", " DECLARE "]
+        if any(token in f" {upper_sql} " for token in blocked_tokens):
+            raise ValueError("待校验 SQL 仅允许查询语句")
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "readonly_sql_validate_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            self._execute_remote_sql(cursor, source, f"SELECT * FROM (\n{normalized_sql}\n) WHERE 1 = 0")
+            return None
+
+        self._run_with_remote_retry(source, f"validate_remote_readonly_sql:{source_id}", action)
+
+    def probe_remote_readonly_sql(
+        self,
+        source_id: str,
+        query_sql: str,
+        schema: Optional[str] = None,
+    ) -> bool:
+        """Return whether an already validated read-only SQL has at least one row."""
+        source = self._get_data_source(source_id)
+        normalized_sql = (query_sql or "").strip().rstrip(";")
+
+        def action(_connection, cursor):
+            self._execute_remote_sql(cursor, source, "SELECT USER FROM DUAL")
+            connected_user = self._fetchone_logged(cursor, source, "readonly_sql_probe_connected_user")[0]
+            owner = (schema or source.schema_name or connected_user or source.username).upper()
+            if owner:
+                self._execute_remote_sql(cursor, source, f'ALTER SESSION SET CURRENT_SCHEMA = "{owner}"')
+            self._execute_remote_sql(cursor, source, f"SELECT 1 FROM (\n{normalized_sql}\n) WHERE ROWNUM = 1")
+            return bool(self._fetchone_logged(cursor, source, "readonly_sql_probe"))
+
+        return bool(self._run_with_remote_retry(source, f"probe_remote_readonly_sql:{source_id}", action))
+
     def validate_remote_graph_query(
         self,
         source_id: str,

@@ -257,6 +257,113 @@ export const agentApi = {
   deleteManagedSkill: (managedSkillId: string, domainId: string) => api.delete(`/agent/managed-skills/${managedSkillId}`, { params: { domain_id: domainId } }),
   listManagedSkillTestSessions: () => api.get('/agent/managed-skill-test-sessions'),
   getManagedSkillTestSession: (sessionId: string) => api.get(`/agent/managed-skill-test-sessions/${sessionId}`),
+  streamManagedSkillTestEvents: async (
+    sessionId: string,
+    options: {
+      turnNo?: number
+      delayMs?: number
+      signal?: AbortSignal
+      onEvent: (eventName: string, payload: any) => void
+    }
+  ) => {
+    const params = new URLSearchParams()
+    if (options.turnNo != null) params.set('turn_no', String(options.turnNo))
+    if (options.delayMs != null) params.set('delay_ms', String(options.delayMs))
+    const token = localStorage.getItem('token')
+    const response = await fetch(`/api/v1/agent/managed-skill-test-sessions/${sessionId}/events?${params.toString()}`, {
+      method: 'GET',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: options.signal
+    })
+    if (!response.ok) {
+      let message = '事件流读取失败'
+      try {
+        const data = await response.json()
+        message = data?.detail || data?.message || message
+      } catch (_error) {}
+      throw new Error(message)
+    }
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder('utf-8')
+    if (!reader) return
+    let buffer = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() || ''
+      for (const block of parts) {
+        const lines = block.split('\n')
+        let eventName = 'message'
+        const dataLines: string[] = []
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim()
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+        }
+        if (!dataLines.length) continue
+        try {
+          options.onEvent(eventName, JSON.parse(dataLines.join('\n')))
+        } catch (_error) {
+          options.onEvent(eventName, dataLines.join('\n'))
+        }
+      }
+    }
+  },
+  streamManagedSkillTestTurn: async (
+    managedSkillId: string,
+    data: any,
+    options: {
+      signal?: AbortSignal
+      onEvent: (eventName: string, payload: any) => void
+    }
+  ) => {
+    const token = localStorage.getItem('token')
+    const response = await fetch(`/api/v1/agent/managed-skills/${managedSkillId}/test/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      body: JSON.stringify(data),
+      signal: options.signal
+    })
+    if (!response.ok) {
+      let message = '流式测试失败'
+      try {
+        const data = await response.json()
+        message = data?.detail || data?.message || message
+      } catch (_error) {}
+      throw new Error(message)
+    }
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder('utf-8')
+    if (!reader) return
+    let buffer = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() || ''
+      for (const block of parts) {
+        const lines = block.split('\n')
+        let eventName = 'message'
+        const dataLines: string[] = []
+        for (const line of lines) {
+          if (line.startsWith('event:')) eventName = line.slice(6).trim()
+          if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+        }
+        if (!dataLines.length) continue
+        try {
+          options.onEvent(eventName, JSON.parse(dataLines.join('\n')))
+        } catch (_error) {
+          options.onEvent(eventName, dataLines.join('\n'))
+        }
+      }
+    }
+  },
+  startManagedSkillTestSession: (managedSkillId: string, data: any) => api.post(`/agent/managed-skills/${managedSkillId}/test-session/start`, data),
   testManagedSkill: (managedSkillId: string, data: any) => api.post(`/agent/managed-skills/${managedSkillId}/test`, data),
   listPropertyGraphs: (domainId: string, sourceId: string, schema?: string) =>
     api.get(`/agent/domains/${domainId}/property-graphs`, { params: { source_id: sourceId, schema } }),
