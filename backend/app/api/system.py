@@ -1,8 +1,15 @@
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from pathlib import Path
+import platform
+import socket
+import subprocess
+import sys
+from typing import Any, Optional
+from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.auth import get_current_user, normalize_role, require_admin
 from app.core.security import get_password_hash, verify_password, create_access_token
 from app.schemas.schemas import (
@@ -10,10 +17,120 @@ from app.schemas.schemas import (
     UserCreate, UserUpdate, UserResponse,
     LLMConfigCreate, LLMConfigUpdate, LLMConfigResponse
 )
-from app.models.models import SysUser, SysUserDomainPermission, SysDomain, SysLLMConfig, SysOperationLog, generate_id
+from app.models.models import SysUser, SysUserDomainPermission, SysDomain, SysLLMConfig, SysOperationLog, SysDataSource, generate_id
 from app.services.llm_service import normalize_model_name
 
 router = APIRouter(prefix="/system", tags=["系统管理"])
+SYSTEM_INFO_STARTED_AT = datetime.now(timezone.utc)
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _run_git_command(*args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except Exception:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def _sanitize_database_url(database_url: str) -> dict[str, Optional[str]]:
+    raw = (database_url or "").strip()
+    if not raw:
+        return {"dialect": None, "driver": None, "host": None, "database": None, "masked_url": None}
+    scheme, _, remainder = raw.partition("://")
+    dialect = scheme.split("+", 1)[0] if scheme else None
+    driver = scheme.split("+", 1)[1] if "+" in scheme else None
+    host = None
+    database = None
+    masked_url = raw
+    if remainder:
+        try:
+            parsed = urlsplit(f"scheme://{remainder}")
+            host = parsed.hostname
+            database = parsed.path.lstrip("/") or None
+            netloc = parsed.netloc or ""
+            at_index = netloc.rfind("@")
+            if at_index >= 0:
+                credentials = netloc[:at_index]
+                address = netloc[at_index + 1:]
+                user = credentials.split(":", 1)[0] if credentials else ""
+                masked_credentials = f"{user}:***" if user else "***"
+                masked_url = f"{scheme}://{masked_credentials}@{address}{parsed.path or ''}"
+            else:
+                masked_url = raw
+        except Exception:
+            masked_url = raw
+    return {
+        "dialect": dialect,
+        "driver": driver,
+        "host": host,
+        "database": database,
+        "masked_url": masked_url,
+    }
+
+
+def _load_git_metadata() -> dict[str, Any]:
+    commit_hash = _run_git_command("rev-parse", "HEAD")
+    short_commit_hash = _run_git_command("rev-parse", "--short", "HEAD")
+    branch = _run_git_command("branch", "--show-current")
+    commit_time = _run_git_command("log", "-1", "--format=%cI")
+    commit_subject = _run_git_command("log", "-1", "--format=%s")
+    tag_at_head = _run_git_command("tag", "--points-at", "HEAD").splitlines()
+    nearest_tag = _run_git_command("describe", "--tags", "--abbrev=0")
+    dirty = bool(_run_git_command("status", "--short"))
+    return {
+        "branch": branch or None,
+        "commit_hash": commit_hash or None,
+        "short_commit_hash": short_commit_hash or None,
+        "commit_subject": commit_subject or None,
+        "commit_time": commit_time or None,
+        "tag": tag_at_head[0].strip() if tag_at_head else None,
+        "nearest_tag": nearest_tag or None,
+        "worktree_dirty": dirty,
+    }
+
+
+def _build_system_info(db: Session) -> dict[str, Any]:
+    git = _load_git_metadata()
+    db_info = _sanitize_database_url(settings.DATABASE_URL)
+    current_time = datetime.now(timezone.utc)
+    uptime_seconds = max(0, int((current_time - SYSTEM_INFO_STARTED_AT).total_seconds()))
+    return {
+        "application": {
+            "name": settings.APP_NAME,
+            "version": settings.APP_VERSION,
+            "api_prefix": settings.API_PREFIX,
+            "debug": settings.DEBUG,
+            "log_level": settings.LOG_LEVEL,
+            "sql_echo": settings.SQL_ECHO,
+            "started_at": SYSTEM_INFO_STARTED_AT.isoformat(),
+            "current_time": current_time.isoformat(),
+            "uptime_seconds": uptime_seconds,
+        },
+        "git": git,
+        "runtime": {
+            "python_version": sys.version.split(" ", 1)[0],
+            "platform": platform.platform(),
+            "hostname": socket.gethostname(),
+        },
+        "database": db_info,
+        "resources": {
+            "user_count": db.query(SysUser).count(),
+            "active_user_count": db.query(SysUser).filter(SysUser.status == "ACTIVE").count(),
+            "domain_count": db.query(SysDomain).count(),
+            "llm_config_count": db.query(SysLLMConfig).count(),
+            "active_llm_config_count": db.query(SysLLMConfig).filter(SysLLMConfig.is_active == "Y").count(),
+            "data_source_count": db.query(SysDataSource).count(),
+            "operation_log_count": db.query(SysOperationLog).count(),
+        },
+    }
 
 
 def _validate_user_domain_ids(db: Session, domain_ids: list[str]) -> list[str]:
@@ -325,6 +442,14 @@ async def test_llm_connection(
 
 
 # ====== 操作日志 ======
+
+@router.get("/info", response_model=ApiResponse)
+async def get_system_info(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    return ApiResponse(data=_build_system_info(db))
+
 
 @router.get("/operation-logs", response_model=ApiResponse)
 async def list_operation_logs(

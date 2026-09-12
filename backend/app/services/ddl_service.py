@@ -7,6 +7,14 @@ from app.models.models import SysDataSource, SysOntologyBlueprint, SysOntologyEn
 from app.services.llm_service import LLMService
 from app.services.source_data_service import SourceDataService
 
+MANAGED_ONTOLOGY_ANNOTATION_NAMES = [
+    "ONTOLOGY_UNIT",
+    "ONTOLOGY_VALUE_CONSTRAINT",
+    "ONTOLOGY_USAGE",
+    "ONTOLOGY_REQUIRED_FILTER",
+    "ONTOLOGY_REF",
+]
+
 
 class DDLPreflightValidationError(ValueError):
     """DDL generation is blocked by fixable ontology or mapping issues."""
@@ -528,27 +536,44 @@ class DDLService:
             column_name = (prop.property_name or "").strip().upper()
             if not column_name or (projected_columns and column_name not in projected_columns):
                 continue
-            annotations = self._build_property_annotation_items(prop, property_path_by_id)
-            if not annotations:
+            drop_annotations, add_annotations = self._build_property_annotation_operations(prop, property_path_by_id)
+            if not drop_annotations and not add_annotations:
                 continue
+            statement_specs: List[tuple[str, str]] = []
+            if drop_annotations:
+                drop_clause = ", ".join(f"DROP IF EXISTS {name}" for name in drop_annotations)
+                statement_specs.append(("drop", drop_clause))
+            if add_annotations:
+                add_clause = ", ".join(
+                    f"ADD {name} '{self._escape_oracle_comment(value)}'"
+                    for name, value in add_annotations
+                )
+                statement_specs.append(("add", add_clause))
             if (entity.build_type or "").upper() == "VIEW":
-                sql = f"ALTER VIEW {object_name} MODIFY ({column_name} ANNOTATIONS({annotations}));"
                 stmt_type = "annotate_view_column"
+                sql_template = "ALTER VIEW {object_name} MODIFY ({column_name} ANNOTATIONS({clause}));"
             else:
-                sql = f"ALTER TABLE {object_name} MODIFY {column_name} ANNOTATIONS({annotations});"
                 stmt_type = "annotate_table_column"
-            statements.append({
-                "type": stmt_type,
-                "sql": sql,
-                "name": f"{object_name}.{column_name}",
-            })
+                sql_template = "ALTER TABLE {object_name} MODIFY {column_name} ANNOTATIONS({clause});"
+            for operation, clause in statement_specs:
+                sql = sql_template.format(
+                    object_name=object_name,
+                    column_name=column_name,
+                    clause=clause,
+                )
+                statements.append({
+                    "type": stmt_type,
+                    "sql": sql,
+                    "name": f"{object_name}.{column_name}",
+                    "annotation_operation": operation,
+                })
         return statements
 
-    def _build_property_annotation_items(
+    def _build_property_annotation_operations(
         self,
         prop: SysOntologyProperty,
         property_path_by_id: Dict[str, str],
-    ) -> str:
+    ) -> tuple[List[str], List[tuple[str, str]]]:
         annotations: List[tuple[str, str]] = []
         if (prop.unit or "").strip():
             annotations.append(("ONTOLOGY_UNIT", (prop.unit or "").strip()))
@@ -562,16 +587,7 @@ class DDLService:
         ref_label = property_path_by_id.get(str(getattr(prop, "ref_property_id", "") or "").strip())
         if ref_label:
             annotations.append(("ONTOLOGY_REF", ref_label))
-
-        if not annotations:
-            return ""
-
-        parts: List[str] = []
-        for name, value in annotations:
-            safe_value = self._escape_oracle_comment(value)
-            parts.append(f"DROP IF EXISTS {name}")
-            parts.append(f"ADD {name} '{safe_value}'")
-        return ", ".join(parts)
+        return list(MANAGED_ONTOLOGY_ANNOTATION_NAMES), annotations
 
     def _parse_property_usage_codes(self, prop: SysOntologyProperty) -> List[str]:
         raw_value = getattr(prop, "usage_codes_json", None)

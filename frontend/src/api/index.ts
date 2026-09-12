@@ -406,6 +406,7 @@ export const businessRuleApi = {
 
 // ====== System API ======
 export const systemApi = {
+  getSystemInfo: () => api.get('/system/info'),
   getUsers: () => api.get('/system/users'),
   createUser: (data: any) => api.post('/system/users', data),
   updateUser: (id: string, data: any) => api.put(`/system/users/${id}`, data),

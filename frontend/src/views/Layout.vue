@@ -139,6 +139,10 @@
             <el-icon><Tickets /></el-icon>
             <span>操作日志</span>
           </el-menu-item>
+          <el-menu-item index="/system/info">
+            <el-icon><InfoFilled /></el-icon>
+            <span>系统信息</span>
+          </el-menu-item>
         </el-sub-menu>
       </el-menu>
     </el-aside>

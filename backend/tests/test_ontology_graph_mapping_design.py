@@ -556,14 +556,23 @@ class OntologyGraphMappingDesignTest(unittest.TestCase):
 
         statements = self.ddl_service._generate_column_annotations_ddl(entity, [entity, ref_entity])
 
-        self.assertEqual(1, len(statements))
+        self.assertEqual(2, len(statements))
         self.assertEqual("annotate_table_column", statements[0]["type"])
+        self.assertEqual("drop", statements[0]["annotation_operation"])
         self.assertIn("ALTER TABLE ONTO_NODE_ORDER MODIFY TOTAL_AMOUNT ANNOTATIONS(", statements[0]["sql"])
-        self.assertIn("DROP IF EXISTS ONTOLOGY_UNIT, ADD ONTOLOGY_UNIT 'CNY'", statements[0]["sql"])
-        self.assertIn("DROP IF EXISTS ONTOLOGY_VALUE_CONSTRAINT, ADD ONTOLOGY_VALUE_CONSTRAINT '>= 0'", statements[0]["sql"])
-        self.assertIn("DROP IF EXISTS ONTOLOGY_USAGE, ADD ONTOLOGY_USAGE '[\"analyze\"]'", statements[0]["sql"])
-        self.assertIn("DROP IF EXISTS ONTOLOGY_REQUIRED_FILTER, ADD ONTOLOGY_REQUIRED_FILTER 'Y'", statements[0]["sql"])
-        self.assertIn("DROP IF EXISTS ONTOLOGY_REF, ADD ONTOLOGY_REF 'Store.store_id'", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_UNIT", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_VALUE_CONSTRAINT", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_USAGE", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_REQUIRED_FILTER", statements[0]["sql"])
+        self.assertIn("DROP IF EXISTS ONTOLOGY_REF", statements[0]["sql"])
+        self.assertNotIn("ADD ONTOLOGY_REF", statements[0]["sql"])
+        self.assertEqual("annotate_table_column", statements[1]["type"])
+        self.assertEqual("add", statements[1]["annotation_operation"])
+        self.assertIn("ADD ONTOLOGY_UNIT 'CNY'", statements[1]["sql"])
+        self.assertIn("ADD ONTOLOGY_VALUE_CONSTRAINT '>= 0'", statements[1]["sql"])
+        self.assertIn("ADD ONTOLOGY_USAGE '[\"analyze\"]'", statements[1]["sql"])
+        self.assertIn("ADD ONTOLOGY_REQUIRED_FILTER 'Y'", statements[1]["sql"])
+        self.assertIn("ADD ONTOLOGY_REF 'Store.store_id'", statements[1]["sql"])
 
     def test_generates_view_column_annotations_only_for_projected_columns(self) -> None:
         entity = SysOntologyEntity(
@@ -594,11 +603,46 @@ class OntologyGraphMappingDesignTest(unittest.TestCase):
 
         statements = self.ddl_service._generate_column_annotations_ddl(entity, [entity])
 
-        self.assertEqual(1, len(statements))
+        self.assertEqual(2, len(statements))
         self.assertEqual("annotate_view_column", statements[0]["type"])
         self.assertIn("ALTER VIEW ONTO_NODE_ORDERVIEW_V MODIFY (TOTAL_AMOUNT ANNOTATIONS(", statements[0]["sql"])
-        self.assertIn("ONTOLOGY_USAGE '[\"fetch\", \"analyze\"]'", statements[0]["sql"])
+        self.assertEqual("drop", statements[0]["annotation_operation"])
+        self.assertEqual("add", statements[1]["annotation_operation"])
+        self.assertIn("ONTOLOGY_USAGE '[\"fetch\", \"analyze\"]'", statements[1]["sql"])
         self.assertNotIn("HIDDEN_COL", statements[0]["sql"])
+        self.assertNotIn("HIDDEN_COL", statements[1]["sql"])
+
+    def test_column_annotation_drop_and_add_are_emitted_in_separate_statements(self) -> None:
+        entity = SysOntologyEntity(
+            entity_id="ent_order",
+            domain_id="dm_test",
+            entity_name="Order",
+            table_name="ONTO_NODE_ORDER",
+            build_type="TABLE",
+        )
+        entity.properties = [
+            SysOntologyProperty(
+                property_id="prop_total",
+                property_name="total_amount",
+                ref_property_id="prop_store_id",
+            )
+        ]
+        ref_entity = SysOntologyEntity(
+            entity_id="ent_store",
+            entity_name="Store",
+            table_name="ONTO_NODE_STORE",
+        )
+        ref_entity.properties = [
+            SysOntologyProperty(property_id="prop_store_id", property_name="store_id"),
+        ]
+
+        statements = self.ddl_service._generate_column_annotations_ddl(entity, [entity, ref_entity])
+
+        self.assertEqual(2, len(statements))
+        self.assertIn("DROP IF EXISTS ONTOLOGY_REF", statements[0]["sql"])
+        self.assertNotIn("ADD ONTOLOGY_REF", statements[0]["sql"])
+        self.assertIn("ADD ONTOLOGY_REF 'Store.store_id'", statements[1]["sql"])
+        self.assertNotIn("DROP IF EXISTS ONTOLOGY_REF", statements[1]["sql"])
 
 
 class DDLExecutionScriptTest(unittest.IsolatedAsyncioTestCase):

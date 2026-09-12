@@ -166,6 +166,12 @@ const routes = [
         meta: { title: '系统管理', icon: 'Setting', isGroup: true },
         children: [
           {
+            path: 'info',
+            name: 'SystemInfo',
+            component: () => import('../views/system/SystemManage.vue'),
+            meta: { title: '系统信息', icon: 'InfoFilled', parentMenu: '系统管理' }
+          },
+          {
             path: 'datasource',
             name: 'SystemDataSource',
             component: () => import('../views/system/DataSource.vue'),

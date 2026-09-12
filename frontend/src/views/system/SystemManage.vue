@@ -1,5 +1,95 @@
 <template>
   <div class="system-page">
+    <div v-if="activeTab === 'info'" class="section">
+      <div class="section-header">
+        <h4>系统信息</h4>
+        <el-button type="primary" size="small" @click="loadSystemInfo">刷新</el-button>
+      </div>
+      <div class="info-card-grid">
+        <div class="info-stat-card">
+          <div class="info-stat-label">当前版本</div>
+          <div class="info-stat-value">{{ systemInfo.application?.version || '-' }}</div>
+          <div class="info-stat-sub">{{ systemInfo.application?.name || '-' }}</div>
+        </div>
+        <div class="info-stat-card">
+          <div class="info-stat-label">最新提交</div>
+          <div class="info-stat-value">{{ systemInfo.git?.short_commit_hash || '-' }}</div>
+          <div class="info-stat-sub">{{ systemInfo.git?.commit_time ? formatDateTime(systemInfo.git.commit_time) : '-' }}</div>
+        </div>
+        <div class="info-stat-card">
+          <div class="info-stat-label">当前 Tag</div>
+          <div class="info-stat-value">{{ systemInfo.git?.tag || systemInfo.git?.nearest_tag || '-' }}</div>
+          <div class="info-stat-sub">{{ systemInfo.git?.branch || '-' }}</div>
+        </div>
+        <div class="info-stat-card">
+          <div class="info-stat-label">运行时长</div>
+          <div class="info-stat-value">{{ formatUptime(systemInfo.application?.uptime_seconds) }}</div>
+          <div class="info-stat-sub">{{ systemInfo.application?.started_at ? formatDateTime(systemInfo.application.started_at) : '-' }}</div>
+        </div>
+      </div>
+
+      <div class="info-panels">
+        <el-card shadow="never" class="info-panel">
+          <template #header>应用信息</template>
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="系统名称">{{ systemInfo.application?.name || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="版本号">{{ systemInfo.application?.version || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="API 前缀">{{ systemInfo.application?.api_prefix || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="当前时间">{{ formatDateTime(systemInfo.application?.current_time) }}</el-descriptions-item>
+            <el-descriptions-item label="调试模式">{{ formatBoolean(systemInfo.application?.debug) }}</el-descriptions-item>
+            <el-descriptions-item label="SQL Echo">{{ formatBoolean(systemInfo.application?.sql_echo) }}</el-descriptions-item>
+            <el-descriptions-item label="日志级别">{{ systemInfo.application?.log_level || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="启动时间">{{ formatDateTime(systemInfo.application?.started_at) }}</el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+
+        <el-card shadow="never" class="info-panel">
+          <template #header>代码版本</template>
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="分支">{{ systemInfo.git?.branch || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="工作区状态">
+              <el-tag :type="systemInfo.git?.worktree_dirty ? 'warning' : 'success'" size="small">
+                {{ systemInfo.git?.worktree_dirty ? '有未提交修改' : '干净' }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="Commit Hash">{{ systemInfo.git?.commit_hash || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="短 SHA">{{ systemInfo.git?.short_commit_hash || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="提交时间">{{ formatDateTime(systemInfo.git?.commit_time) }}</el-descriptions-item>
+            <el-descriptions-item label="当前 Tag">{{ systemInfo.git?.tag || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="最近 Tag">{{ systemInfo.git?.nearest_tag || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="提交摘要">{{ systemInfo.git?.commit_subject || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+
+        <el-card shadow="never" class="info-panel">
+          <template #header>运行环境</template>
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="Python">{{ systemInfo.runtime?.python_version || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="主机名">{{ systemInfo.runtime?.hostname || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="平台" :span="2">{{ systemInfo.runtime?.platform || '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+
+        <el-card shadow="never" class="info-panel">
+          <template #header>数据库与资源</template>
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="数据库方言">{{ systemInfo.database?.dialect || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="驱动">{{ systemInfo.database?.driver || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="主机">{{ systemInfo.database?.host || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="数据库">{{ systemInfo.database?.database || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="连接串" :span="2">{{ systemInfo.database?.masked_url || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="用户数">{{ systemInfo.resources?.user_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="启用用户数">{{ systemInfo.resources?.active_user_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="分析域数">{{ systemInfo.resources?.domain_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="数据源数">{{ systemInfo.resources?.data_source_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="模型配置数">{{ systemInfo.resources?.llm_config_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="启用模型数">{{ systemInfo.resources?.active_llm_config_count ?? '-' }}</el-descriptions-item>
+            <el-descriptions-item label="操作日志数" :span="2">{{ systemInfo.resources?.operation_log_count ?? '-' }}</el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+      </div>
+    </div>
+
     <!-- LLM Config -->
     <div v-if="activeTab === 'llm'" class="section">
       <div class="section-header">
@@ -154,7 +244,7 @@ import { domainApi, systemApi } from '../../api'
 
 const route = useRoute()
 
-const tabRouteMap: Record<string, string> = { '/system/llm': 'llm', '/system/users': 'users', '/system/logs': 'logs' }
+const tabRouteMap: Record<string, string> = { '/system/info': 'info', '/system/llm': 'llm', '/system/users': 'users', '/system/logs': 'logs' }
 const activeTab = ref(tabRouteMap[route.path] || 'llm')
 
 // 路由变化 → 切换显示区
@@ -167,11 +257,20 @@ watch(() => route.path, (path) => {
 })
 
 const loadDataForTab = (tab: string) => {
-  if (tab === 'llm') loadLLMConfigs()
+  if (tab === 'info') loadSystemInfo()
+  else if (tab === 'llm') loadLLMConfigs()
   else if (tab === 'users') loadUsers()
   else if (tab === 'logs') loadOperationLogs()
 }
 const saving = ref(false)
+
+const systemInfo = ref<any>({
+  application: {},
+  git: {},
+  runtime: {},
+  database: {},
+  resources: {}
+})
 
 // LLM Config
 const llmConfigs = ref<any[]>([])
@@ -203,6 +302,13 @@ const editUserId = ref('')
 // Logs
 const operationLogs = ref<any[]>([])
 
+const loadSystemInfo = async () => {
+  try {
+    const res = await systemApi.getSystemInfo()
+    systemInfo.value = res.data || {}
+  } catch (e) {}
+}
+
 const loadLLMConfigs = async () => {
   try { const res = await systemApi.getLLMConfigs(); llmConfigs.value = res.data || [] } catch (e) {}
 }
@@ -216,6 +322,30 @@ const loadDomains = async () => {
 const domainNameById = (domainId: string) => domains.value.find(item => item.domain_id === domainId)?.domain_name || domainId
 const loadOperationLogs = async () => {
   try { const res = await systemApi.getOperationLogs(); operationLogs.value = res.data || [] } catch (e) {}
+}
+
+const formatDateTime = (value?: string | null) => {
+  if (!value) return '-'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString('zh-CN', { hour12: false })
+}
+
+const formatBoolean = (value: boolean | null | undefined) => value ? '是' : '否'
+
+const formatUptime = (seconds?: number | null) => {
+  const total = Number(seconds || 0)
+  if (!total) return '-'
+  const days = Math.floor(total / 86400)
+  const hours = Math.floor((total % 86400) / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secs = total % 60
+  const parts: string[] = []
+  if (days) parts.push(`${days}天`)
+  if (hours || days) parts.push(`${hours}小时`)
+  if (minutes || hours || days) parts.push(`${minutes}分`)
+  parts.push(`${secs}秒`)
+  return parts.join(' ')
 }
 
 const showCreateLLMConfig = () => {
@@ -364,4 +494,21 @@ onMounted(() => {
 .section-header h4 { margin: 0; font-size: 16px; color: #1a3a5c; }
 .form-tip { margin-top: 4px; color: #909399; font-size: 12px; line-height: 1.4; }
 .domain-tag { margin: 2px 4px 2px 0; }
+.info-card-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.info-stat-card { padding: 16px; border-radius: 14px; border: 1px solid #d7e3f0; background: linear-gradient(135deg, #f8fbff 0%, #eef5ff 100%); }
+.info-stat-label { color: #67809a; font-size: 12px; }
+.info-stat-value { margin-top: 8px; color: #214a7a; font-size: 22px; font-weight: 700; word-break: break-all; }
+.info-stat-sub { margin-top: 8px; color: #6f8192; font-size: 12px; line-height: 1.5; }
+.info-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.info-panel { border-radius: 14px; }
+
+@media (max-width: 1100px) {
+  .info-card-grid,
+  .info-panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 768px) {
+  .info-card-grid,
+  .info-panels { grid-template-columns: 1fr; }
+}
 </style>
